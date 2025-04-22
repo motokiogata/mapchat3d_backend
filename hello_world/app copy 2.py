@@ -6,9 +6,6 @@ import logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Memory for storing chat history while Lambda is warm
-chat_histories = {}
-
 region = os.environ.get("AWS_REGION", "us-east-1")
 bedrock = boto3.client("bedrock-runtime", region_name=region)
 
@@ -35,8 +32,6 @@ def handle_send_message(event):
     try:
         connection_id = event['requestContext']['connectionId']
         body = json.loads(event.get('body', '{}'))
-        user_msg = body.get('message', 'Hello')
-
         instruction = (
             "Your name is Mariko and you work for Tokio Marine Nichido, "
             "the insurance company, as a helpful operator handling claims "
@@ -47,18 +42,12 @@ def handle_send_message(event):
             "If the user asks something outside of this task, politely decline to answer."
         )
 
-        # Initialize chat history for this connection if it doesn't exist
-        if connection_id not in chat_histories:
-            # Claude expects the instruction as the first user message
-            chat_histories[connection_id] = [
-                { "role": "user", "content": instruction }
-            ]
+        user_msg = body.get('message', 'Hello')
 
-        # Add the actual user message next
-        chat_histories[connection_id].append({ "role": "user", "content": user_msg })
-        print(f"Chat history for {connection_id}: {chat_histories[connection_id]}")
+        messages = [
+            {"role": "user", "content": f"{instruction}\n\n{user_msg}"}
+        ]
 
-        # Call Claude with full message history
         response = bedrock.invoke_model(
             modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
             contentType="application/json",
@@ -67,34 +56,33 @@ def handle_send_message(event):
                 "anthropic_version": "bedrock-2023-05-31",
                 "max_tokens": 1000,
                 "temperature": 0.1,
-                "messages": chat_histories[connection_id]
+                "messages": messages
             })
         )
 
         response_body = json.loads(response["body"].read())
         completion = response_body["content"][0]["text"]
 
-        # Add Claude's reply to the chat history
-        chat_histories[connection_id].append({ "role": "assistant", "content": completion })
-
-        # Send back to frontend via WebSocket
+        # Post response back to client
         domain = event["requestContext"]["domainName"]
         stage = event["requestContext"]["stage"]
         apig = get_apig_client(domain, stage)
 
-        apig.post_to_connection(
-            ConnectionId=connection_id,
-            Data=json.dumps({ "response": completion }).encode("utf-8")
-        )
+        try:
+            apig.post_to_connection(
+                ConnectionId=connection_id,
+                Data=json.dumps({"response": completion}).encode("utf-8")
+            )
+        except apig.exceptions.GoneException:
+            logger.warning(f"⚠️ Connection {connection_id} is gone. Cannot send message.")
+            return {"statusCode": 410, "body": "Connection no longer available."}
 
-        return { "statusCode": 200 }
+        return {"statusCode": 200}
 
     except Exception as e:
         logger.error(f"Unhandled error: {e}")
-        return { "statusCode": 500, "body": "Internal Server Error" }
+        return {"statusCode": 500, "body": "Internal Server Error"}
 
-# Main Lambda handler
-# This function routes the incoming WebSocket events to the appropriate handler
 def lambda_handler(event, context):
     route_key = event.get("requestContext", {}).get("routeKey")
 
