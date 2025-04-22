@@ -1,0 +1,2 @@
+# requirements.txt
+urllib3==1.26.18  # or any version below 2.0
