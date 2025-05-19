@@ -4,7 +4,7 @@ Description: WebSocket-based Bedrock Chatbot using AWS Lambda & API Gateway
 
 Globals:
   Function:
-    Timeout: 30
+    Timeout: 60
     Runtime: python3.11
     MemorySize: 256
 
@@ -106,6 +106,8 @@ Resources:
           - Effect: Allow
             Action:
               - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
             Resource: !GetAtt AccidentDataTable.Arn
 
   WebSocketConnectIntegration:
