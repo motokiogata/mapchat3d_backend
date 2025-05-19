@@ -10,6 +10,18 @@ Globals:
 
 Resources:
 
+  AccidentDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: AccidentDataTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connection_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connection_id
+          KeyType: HASH
+
   WebSocketApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:
@@ -91,6 +103,10 @@ Resources:
             Action:
             - bedrock:InvokeModel
             Resource: arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+            Resource: !GetAtt AccidentDataTable.Arn
 
   WebSocketConnectIntegration:
     Type: AWS::ApiGatewayV2::Integration
