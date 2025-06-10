@@ -96,17 +96,22 @@ def handle_send_message(event):
         chat_histories[connection_id].append({"role": "assistant", "content": completion})
 
         # Step 1: Extract datetime and location
-        #datetime_str = extract_datetime(user_msg)
-        #location_data = extract_location(user_msg)
-
         full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
         datetime_str = extract_datetime(full_context)
         location_data = extract_location(full_context)
         similar_case = find_similar_case(full_context)
 
+        # Log similar case for debugging
+        if similar_case:
+            logger.info(f"🔍 Found similar cases: {len(similar_case)} cases")
+            for i, case in enumerate(similar_case[:3]):  # Log top 3
+                logger.info(f"Case {i+1}: ID={case['case_id']}, Similarity={case['similarity']:.3f}")
+        else:
+            logger.info("🔍 No similar cases found")
+
         # Step 2: Save to DynamoDB if valid
         if datetime_str != "unknown" and location_data:
-            store_to_dynamodb(connection_id, datetime_str, location_data)
+            store_to_dynamodb(connection_id, datetime_str, location_data, similar_case)
             logger.info(f"✅ Stored to DynamoDB: {datetime_str}, {location_data}")
         else:
             logger.info("ℹ️ Datetime or location not available for storage.")
@@ -195,21 +200,40 @@ def extract_location(full_context):
     return None
 
 
-def store_to_dynamodb(connection_id, datetime_str, location):
+def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None):
     response = table.get_item(Key={"connection_id": connection_id})
     item = response.get("Item")
 
+    # Prepare similar cases data for storage
+    similar_cases_data = None
+    if similar_cases and len(similar_cases) > 0:
+        # Store top 3 similar cases
+        similar_cases_data = []
+        for case in similar_cases[:3]:
+            similar_cases_data.append({
+                "case_id": str(case["case_id"]),
+                "similarity": float(case["similarity"]),
+                "summary": case["summary"][:500]  # Limit length for DynamoDB
+            })
+
     if item:
         # Update the existing item
+        update_expression = "SET #ts = :ts, lat = :lat, lon = :lon"
+        expression_values = {
+            ":ts": datetime_str,
+            ":lat": Decimal(str(location["lat"])),
+            ":lon": Decimal(str(location["lon"]))
+        }
+        
+        if similar_cases_data:
+            update_expression += ", similar_cases = :similar"
+            expression_values[":similar"] = similar_cases_data
+            
         table.update_item(
             Key={"connection_id": connection_id},
-            UpdateExpression="SET #ts = :ts, lat = :lat, lon = :lon",
+            UpdateExpression=update_expression,
             ExpressionAttributeNames={"#ts": "timestamp"},
-            ExpressionAttributeValues={
-                ":ts": datetime_str,
-                ":lat": Decimal(str(location["lat"])),
-                ":lon": Decimal(str(location["lon"]))
-            }
+            ExpressionAttributeValues=expression_values
         )
     else:
         # Insert new item
@@ -219,59 +243,64 @@ def store_to_dynamodb(connection_id, datetime_str, location):
             "lat": Decimal(str(location["lat"])),
             "lon": Decimal(str(location["lon"]))
         }
+        
+        if similar_cases_data:
+            new_item["similar_cases"] = similar_cases_data
+            
         table.put_item(Item=new_item)
 
 
-import csv
-import numpy as np
-
-def get_text_embedding(text):
-    response = bedrock.invoke_model(
-        modelId="amazon.titan-embed-text-v1",
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps({
-            "inputText": text
-        })
-    )
-    embedding = json.loads(response["body"].read())["embedding"]
-    return np.array(embedding)
-
-def find_similar_case(full_context, csv_path="cases.csv"):
+def find_similar_case(full_context):
+    """
+    Call the similarity search Lambda function to find similar cases
+    """
     try:
-        # Embed the user's full chat context
-        context_embedding = get_text_embedding(full_context)
-
-        most_similar = None
-        highest_similarity = -1
-
-        with open(csv_path, newline='', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                case_text = row.get("description", "")
-                case_embedding = get_text_embedding(case_text)
-                similarity = cosine_similarity(context_embedding, case_embedding)
-                if similarity > highest_similarity:
-                    highest_similarity = similarity
-                    most_similar = row
-
-        return most_similar
+        # Get function name from environment
+        function_name = os.environ.get('SIMILARITY_FUNCTION_NAME')
+        if not function_name:
+            logger.warning("SIMILARITY_FUNCTION_NAME not set")
+            return None
+            
+        # Invoke similarity search Lambda
+        lambda_client = boto3.client('lambda')
+        
+        response = lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType='RequestResponse',
+            Payload=json.dumps({
+                'user_text': full_context,
+                'top_k': 5  # Get top 5 similar cases
+            })
+        )
+        
+        result = json.loads(response['Payload'].read())
+        if result['statusCode'] == 200:
+            response_data = json.loads(result['body'])
+            similar_cases = response_data['similar_cases']
+            logger.info(f"✅ Found {len(similar_cases)} similar cases from {response_data['total_cases_checked']} total cases")
+            
+            # Log similarity scores for debugging
+            for i, case in enumerate(similar_cases[:3]):
+                logger.info(f"Top case {i+1}: Case {case['case_id']} - Similarity: {case['similarity']:.4f}")
+            
+            return similar_cases
+        else:
+            logger.error(f"Similarity search failed: {result}")
+            return None
+            
     except Exception as e:
-        logger.error(f"Error finding similar case: {e}")
+        logger.error(f"Error calling similarity search: {e}")
         return None
 
-def cosine_similarity(vec1, vec2):
-    return float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
-        
 
 # ---------- Entry Point ----------
 
 def lambda_handler(event, context):
     route_key = event.get("requestContext", {}).get("routeKey")
 
-    if route_key == "$connect":
+    if route_key == "\$connect":
         return handle_connect(event)
-    elif route_key == "$disconnect":
+    elif route_key == "\$disconnect":
         return handle_disconnect(event)
     elif route_key == "sendMessage":
         return handle_send_message(event)
