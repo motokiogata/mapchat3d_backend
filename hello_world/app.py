@@ -50,7 +50,8 @@ def handle_send_message(event):
         # Instruction prompt for Claude
         instruction = (
             f"Your name is Mariko, and you work for Tokio Marine Nichido, an insurance company, "
-            f"as a kind and helpful operator handling traffic accident claims. "
+            f"as a kind and helpful operator handling traffic accident claims in English."
+            f"You only handle cases involving car-to-car collisions that occur at intersections. You not able to accept reports for other types of accidents, such as those involving motorcycles, pedestrians, or incidents that occur on straight roads, highways, or in parking lots."
             f"Please ask the following two questions to gather information about the accident:\n\n"
             f"1. When did the accident occur? It is important to know the date and time of the accident. "
             f"FYI, today is \"{jst_time}\". "
@@ -58,7 +59,12 @@ def handle_send_message(event):
             f"but please reconfirm the exact date to the user and make sure the guess is correct. "
             f"If the user said 'I don't know', confirm that they don't remember the time.\n\n"
             f"2. Where did the accident happen? Please gather detailed location information.\n\n"
-            f"After you have received answers to both questions, say:\n"
+            f"3. Then Please ask the customer to describe the details of the accident."
+            f"Ask where their vehicle was coming from and where it was heading."
+            f"Also ask which direction the other vehicle came from."
+            f"If possible, gather information about the traffic signals and the speed of both vehicles."
+            f"Let the customer know that it's fine to share only what they can remember.\n\n"
+            f"After you have received answers to those questions above, say:\n"
             f"'I will now display the map in the area below. Please wait a moment.'\n"
             f"Then, end the conversation.\n\n"
             f"If the user asks anything outside of this task, politely decline to answer."
@@ -96,6 +102,7 @@ def handle_send_message(event):
         full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
         datetime_str = extract_datetime(full_context)
         location_data = extract_location(full_context)
+        similar_case = find_similar_case(full_context)
 
         # Step 2: Save to DynamoDB if valid
         if datetime_str != "unknown" and location_data:
@@ -213,6 +220,49 @@ def store_to_dynamodb(connection_id, datetime_str, location):
             "lon": Decimal(str(location["lon"]))
         }
         table.put_item(Item=new_item)
+
+
+import csv
+import numpy as np
+
+def get_text_embedding(text):
+    response = bedrock.invoke_model(
+        modelId="amazon.titan-embed-text-v1",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "inputText": text
+        })
+    )
+    embedding = json.loads(response["body"].read())["embedding"]
+    return np.array(embedding)
+
+def find_similar_case(full_context, csv_path="cases.csv"):
+    try:
+        # Embed the user's full chat context
+        context_embedding = get_text_embedding(full_context)
+
+        most_similar = None
+        highest_similarity = -1
+
+        with open(csv_path, newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                case_text = row.get("description", "")
+                case_embedding = get_text_embedding(case_text)
+                similarity = cosine_similarity(context_embedding, case_embedding)
+                if similarity > highest_similarity:
+                    highest_similarity = similarity
+                    most_similar = row
+
+        return most_similar
+    except Exception as e:
+        logger.error(f"Error finding similar case: {e}")
+        return None
+
+def cosine_similarity(vec1, vec2):
+    return float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+        
 
 # ---------- Entry Point ----------
 

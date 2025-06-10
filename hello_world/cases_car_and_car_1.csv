@@ -1,0 +1,63 @@
+Case Number,Analysis,Easy Summary
+98,"**Accident Scenario:**
+Car A (A): Entered intersection following green signal
+Car B (B): Entered intersection violating red signal
+
+**Basic Fault Ratio:**
+A 0% : B 100%
+
+**Reasoning:**
+This represents the fundamental principle that signal compliance creates near-absolute priority. Red signal violation is considered such a serious offense that it typically results in full liability. However, the green signal car can still bear some fault (up to 10%) if they failed to exercise basic caution that could have easily avoided the collision - such as not performing normal forward safety checks or failing to take avoidance measures after spotting the red signal violator. The standard assumes signal-compliant drivers should follow signals but still maintain basic situational awareness.","You entered intersection on green light, other driver ran red light"
+99,"**Accident Scenario:**
+Car A (A): Entered intersection on yellow signal
+Car B (B): Entered intersection violating red signal
+
+**Basic Fault Ratio:**
+A 20% : B 80%
+
+**Reasoning:**
+Yellow signal violations are treated as less severe than red signal violations, but both are still signal violations. The 20:80 ratio reflects that while both drivers violated traffic signals, red signal violation carries greater danger and culpability than yellow signal violation. The yellow signal car gets some consideration because yellow signals create more ambiguous situations (drivers may be too close to stop safely), while red signals provide clear prohibition. This ratio balances the comparative severity of the two types of signal violations.","You entered intersection on yellow light, other driver ran red light"
+100,"**Accident Scenario:**
+Car A (A): Entered intersection violating red signal
+Car B (B): Entered intersection violating red signal
+
+**Basic Fault Ratio:**
+A 50% : B 50%
+
+**Reasoning:**
+When both vehicles violate red signals, they share equal fault because both committed the same serious traffic violation. Neither driver can claim priority or legitimacy in their intersection entry. The 50:50 split reflects that both actions were equally dangerous and equally prohibited. Modifications can adjust this based on factors like clear prior entry, where the second car could have more easily avoided the collision by observing the first car already in the intersection.","You ran red light, other driver also ran red light"
+101,"**Accident Scenario:**
+Car A (A): Left vehicle at unsignalized intersection
+Car B (B): Right vehicle at unsignalized intersection
+Head-on collision at intersection of equal-width roads
+
+**Basic Fault Ratio:**
+Varies by speed conditions:
+- AB same speed: A 40% : B 60%
+- A no deceleration, B deceleration: A 60% : B 40%
+- A deceleration, B no deceleration: A 20% : B 80%
+
+**Reasoning:**
+Based on left vehicle priority principle, but heavily modified by actual driving behavior. The key insight is that in poor visibility intersections, the left priority rule has limited practical value because drivers cannot easily determine their priority status without slowing down. Speed/deceleration becomes more important than geometric priority. A left-priority vehicle that fails to slow down may bear more fault than a right vehicle that does slow down, because deceleration enables better safety confirmation and collision avoidance.","Head-on collision at intersection with no traffic signals. You approached from left side, other from right side"
+102,"**Accident Scenario:**
+Car A (A): Vehicle following one-way traffic rules correctly
+Car B (B): Vehicle violating one-way traffic restrictions
+
+**Basic Fault Ratio:**
+A 20% : B 80%
+
+**Reasoning:**
+One-way violations are considered more serious than stop sign violations because they represent clear, unambiguous rule violations. The 20:80 ratio reflects that while the compliant vehicle still has some duty to watch for unexpected traffic (even from prohibited directions), the violating vehicle bears primary responsibility. The violation is so fundamental that it creates a strong presumption of fault. However, the compliant vehicle retains some obligation for basic situational awareness, hence the 20% allocation rather than 0%.","You were driving correctly on one-way street, other driver was going wrong direction"
+103,"**Accident Scenario:**
+Car A (A): Vehicle on wider road (broad road)
+Car B (B): Vehicle on narrower road
+Collision at intersection of roads with clearly different widths
+
+**Basic Fault Ratio:**
+Varies by speed conditions:
+- AB same speed: A 30% : B 70%
+- A no deceleration, B deceleration: A 40% : B 60%
+- A deceleration, B no deceleration: A 20% : B 80%
+
+**Reasoning:**
+The wider road vehicle has priority, but both vehicles have duty
