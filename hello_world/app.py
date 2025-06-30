@@ -188,30 +188,30 @@ def extract_location(full_context):
 
 def should_run_similarity_search(full_context):
     prompt = (
-            f"Analyze this conversation and determine if the user has provided enough details "
-            f"about their traffic accident to run a similarity search against a database of accident cases.\n\n"
-            f"The user should have provided:\n"
-            f"1. Basic accident details (what happened, intersection collision)\n"
-            f"2. Vehicle movements (which direction each car was going, turning, straight, etc.)\n"
-            f"3. Traffic conditions (signals, signs, right of way, etc.)\n\n"
-            f"Conversation:\n{full_context}\n\n"
-            f"Respond with only 'YES' if there are enough accident details for similarity search, "
-            f"or 'NO' if more details are needed. Don't include any other text."
-        )
-        
-        response = bedrock.invoke_model(
-            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 10,
-                "temperature": 0.1,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            })
-        )
+        f"Analyze this conversation and determine if the user has provided enough details "
+        f"about their traffic accident to run a similarity search against a database of accident cases.\n\n"
+        f"The user should have provided:\n"
+        f"1. Basic accident details (what happened, intersection collision)\n"
+        f"2. Vehicle movements (which direction each car was going, turning, straight, etc.)\n"
+        f"3. Traffic conditions (signals, signs, right of way, etc.)\n\n"
+        f"Conversation:\n{full_context}\n\n"
+        f"Respond with only 'YES' if there are enough accident details for similarity search, "
+        f"or 'NO' if more details are needed. Don't include any other text."
+    )
+    
+    response = bedrock.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 10,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        })
+    )
     reply = json.loads(response["body"].read())["content"][0]["text"].strip().upper()
     return reply == "YES"
 
