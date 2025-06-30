@@ -187,53 +187,155 @@ def extract_location(full_context):
 
 
 def should_run_similarity_search(full_context):
-    prompt = f"Analyze this conversation and determine ..."
-    response = bedrock.invoke_model(...)
+    prompt = (
+            f"Analyze this conversation and determine if the user has provided enough details "
+            f"about their traffic accident to run a similarity search against a database of accident cases.\n\n"
+            f"The user should have provided:\n"
+            f"1. Basic accident details (what happened, intersection collision)\n"
+            f"2. Vehicle movements (which direction each car was going, turning, straight, etc.)\n"
+            f"3. Traffic conditions (signals, signs, right of way, etc.)\n\n"
+            f"Conversation:\n{full_context}\n\n"
+            f"Respond with only 'YES' if there are enough accident details for similarity search, "
+            f"or 'NO' if more details are needed. Don't include any other text."
+        )
+        
+        response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 10,
+                "temperature": 0.1,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            })
+        )
     reply = json.loads(response["body"].read())["content"][0]["text"].strip().upper()
     return reply == "YES"
 
 # --- CSV Similarity Logic ---
 def categorize_accident_type(full_context):
-    prompt = "..."
-    response = bedrock.invoke_model(...)
-    return json.loads(response["body"].read())["content"][0]["text"].strip()
+    prompt = (
+        f"Categorize this accident description into one of the following categories:\n"
+        f"{list(CATEGORY_CSV_MAPPING.keys())}\n"
+        f"Description:\n\"{full_context}\"\n"
+        f"Reply only the category string exactly as above."
+    )
+    response = bedrock.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
+    category = json.loads(response["body"].read())["content"][0]["text"].strip()
+    logger.info(f"Accident category: {category}")
+    return category
 
 def load_csv_from_s3(csv_filename):
     response = s3.get_object(Bucket=CSV_BUCKET, Key=csv_filename)
     return pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
 
 def format_cases_for_analysis(cases):
-    return "\n\n".join([f"Case {c['case_number']}: Situation: {c['situation']} ..." for c in cases[:20]])
+    return "\n\n".join([
+        f"Case {c['case_number']}:\n"
+        f"Situation: {c['situation']}\n"
+        f"Base Fault Ratio: {c['fault_ratio']}\n"
+        f"Modification Factors: {c['modification_factors']}\n"
+        f"Source File: {c['source_file']}"
+        for c in cases[:20]
+    ])
 
 def find_matching_pattern(category, full_context):
     all_cases = []
     for file in CATEGORY_CSV_MAPPING.get(category, []):
         df = load_csv_from_s3(file)
         for _, row in df.iterrows():
-            all_cases.append({"case_number": row["Case Number"], ...})
-    prompt = f"Based on this accident description, find the MOST SIMILAR case ..."
-    response = bedrock.invoke_model(...)
+            all_cases.append({
+                "case_number": row.get("Case Number"),
+                "situation": row.get("Accident Situation"),
+                "fault_ratio": row.get("Fault Ratio"),
+                "modification_factors": row.get("Modification Factors"),
+                "source_file": file
+            })
+
+    # Prepare prompt with formatted cases + user context
+    cases_text = format_cases_for_analysis(all_cases)
+    prompt = (
+        f"Given the following accident cases:\n{cases_text}\n\n"
+        f"Based on the accident description:\n{full_context}\n"
+        f"Find the MOST SIMILAR case among above cases and provide a JSON with keys:\n"
+        f"best_match_case_number, confidence_score (0-10), reasoning, applicable_modifications (list).\n"
+        f"Output ONLY the JSON object."
+    )
+
+    response = bedrock.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 400,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
+
     result_text = json.loads(response["body"].read())["content"][0]["text"]
-    json_match = re.search(r'\{.*\}', result_text)
-    return json.loads(json_match.group(0)) if json_match else None
+    logger.info(f"Similarity match response: {result_text}")
+
+    json_match = re.search(r"\{.*\}", result_text, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(0))
+        except Exception as e:
+            logger.warning(f"Failed to parse similarity JSON: {e}")
+    return None
 
 def calculate_final_fault_ratio(base_ratio, modifications, accident_context):
-    prompt = f"Calculate the final fault ratio ..."
-    response = bedrock.invoke_model(...)
-    return json.loads(response["body"].read())["content"][0]["text"].strip()
+    prompt = (
+        f"Given a base fault ratio: {base_ratio}, and the following modification factors: {modifications},\n"
+        f"and the accident description:\n{accident_context}\n"
+        f"Calculate the final fault ratio as a numeric value between 0 and 1.\n"
+        f"Output only the numeric value as a string."
+    )
+    response = bedrock.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 20,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
+    ratio_text = json.loads(response["body"].read())["content"][0]["text"].strip()
+    logger.info(f"Calculated final fault ratio: {ratio_text}")
+    return ratio_text
 
 def find_similar_case(full_context):
     category = categorize_accident_type(full_context)
     match = find_matching_pattern(category, full_context)
     if match:
-        final = calculate_final_fault_ratio(match["fault_ratio"], match.get("applicable_modifications", []), full_context)
+        final_fault_ratio = calculate_final_fault_ratio(
+            match.get("fault_ratio", "unknown"),
+            match.get("applicable_modifications", []),
+            full_context
+        )
         return [{
-            "case_id": match["best_match_case_number"],
+            "case_id": match.get("best_match_case_number"),
             "category": category,
-            "similarity": float(match["confidence_score"]) / 10.0,
-            "summary": match["reasoning"],
-            "fault_ratio": final,
-            "base_fault_ratio": match["fault_ratio"],
+            "similarity": float(match.get("confidence_score", 0)) / 10.0,
+            "summary": match.get("reasoning", ""),
+            "fault_ratio": final_fault_ratio,
+            "base_fault_ratio": match.get("fault_ratio", "unknown"),
             "modifications": match.get("applicable_modifications", [])
         }]
     return None
@@ -251,6 +353,7 @@ def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None)
             "base_fault_ratio": case.get("base_fault_ratio", "unknown"),
             "modifications": case.get("modifications", [])[:5]
         } for case in similar_cases[:3]]
+
     values = {
         ":ts": datetime_str,
         ":lat": Decimal(str(location["lat"])),
@@ -260,14 +363,35 @@ def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None)
         values[":similar"] = similar_data
 
     if item:
+        # Update existing record
+        update_expr = "SET #ts = :ts, lat = :lat, lon = :lon"
+        expr_attr_names = {"#ts": "timestamp"}
+        expr_attr_values = {
+            ":ts": datetime_str,
+            ":lat": Decimal(str(location["lat"])),
+            ":lon": Decimal(str(location["lon"]))
+        }
+        if similar_data:
+            update_expr += ", similar_cases = :similar"
+            expr_attr_values[":similar"] = similar_data
+
         table.update_item(
             Key={"connection_id": connection_id},
-            UpdateExpression="SET #ts = :ts, lat = :lat, lon = :lon, similar_cases = :similar",
-            ExpressionAttributeNames={"#ts": "timestamp"},
-            ExpressionAttributeValues=values
+            UpdateExpression=update_expr,
+            ExpressionAttributeNames=expr_attr_names,
+            ExpressionAttributeValues=expr_attr_values
         )
     else:
-        table.put_item(Item={"connection_id": connection_id, "timestamp": datetime_str, "lat": values[":lat"], "lon": values[":lon"], "similar_cases": values.get(":similar")})
+        # Create new record
+        item = {
+            "connection_id": connection_id,
+            "timestamp": datetime_str,
+            "lat": Decimal(str(location["lat"])),
+            "lon": Decimal(str(location["lon"]))
+        }
+        if similar_data:
+            item["similar_cases"] = similar_data
+        table.put_item(Item=item)
 
 # --- Lambda Entrypoint ---
 def lambda_handler(event, context):
