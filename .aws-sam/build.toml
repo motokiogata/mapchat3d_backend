@@ -9,4 +9,22 @@ manifest_hash = "9340ec67db9e2f858181dd314ab89d89"
 packagetype = "Zip"
 functions = ["ConnectFunction", "DisconnectFunction", "SendMessageFunction"]
 
+[function_build_definitions.75b3c4d4-c60e-4e1b-81e0-913fa6f373b9]
+codeuri = "/home/tokiomarine/Downloads/sam-app/sam-app/similarity_search"
+runtime = "python3.11"
+architecture = "x86_64"
+handler = "similarity_search.lambda_handler"
+manifest_hash = "acf13fa2da50794ff1a4988885aa3449"
+packagetype = "Zip"
+functions = ["SimilaritySearchFunction"]
+
+[function_build_definitions.ab26f195-264f-4d3a-8fca-1f1fc762a204]
+codeuri = "/home/tokiomarine/Downloads/sam-app/sam-app/upload_embeddings"
+runtime = "python3.11"
+architecture = "x86_64"
+handler = "upload_embeddings.lambda_handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["UploadEmbeddingsFunction"]
+
 [layer_build_definitions]

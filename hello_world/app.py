@@ -2,44 +2,53 @@ import json
 import boto3
 import os
 import logging
+import re
+import pandas as pd
+from io import StringIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 
+# --- Setup ---
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-# Chat history memory (keeps history while Lambda is warm)
-chat_histories = {}
 
 # AWS clients
 region = os.environ.get("AWS_REGION", "us-east-1")
 bedrock = boto3.client("bedrock-runtime", region_name=region)
 dynamodb = boto3.resource("dynamodb", region_name=region)
-table = dynamodb.Table("AccidentDataTable")  # Replace with your actual table name
+table = dynamodb.Table("AccidentDataTable")
+s3 = boto3.client("s3")
+CSV_BUCKET = os.environ.get('CSV_BUCKET_NAME', 'your-csv-bucket')
 
-# Optional: Reuse API Gateway client
+chat_histories = {}
 apig_clients = {}
 
+CATEGORY_CSV_MAPPING = {
+    "Vehicle(car_or_motorcycle)_accident_against_pedestrian": ["1-25.csv", "26-50.csv"],
+    "Bycicle_accident_against_pedestrian": ["51-74.csv", "75-97.csv"],
+    "Vehicle_to_vehicle_(car_accidents_against_motorcycle)": ["98-113.csv", "114-138.csv", "139-159.csv"],
+    "Vehicle_to_vehicle_(car_accidents_against_car)": ["160-204.csv", "205-234.csv"],
+    "Vehicle(car_or_motorcycle)_accident_against_bycicle": ["235-280.csv", "281-310.csv"],
+    "Accidents_in_highways_or_Accidents_in_park": ["311-338.csv"]
+}
+
+# --- Connection handlers ---
 def get_apig_client(domain, stage):
     endpoint = f"https://{domain}/{stage}"
     if endpoint not in apig_clients:
         apig_clients[endpoint] = boto3.client("apigatewaymanagementapi", endpoint_url=endpoint)
     return apig_clients[endpoint]
 
-
 def handle_connect(event):
-    connection_id = event["requestContext"]["connectionId"]
-    logger.info(f"✅ Client connected: {connection_id}")
+    logger.info(f"✅ Client connected: {event['requestContext']['connectionId']}")
     return {"statusCode": 200}
-
 
 def handle_disconnect(event):
-    connection_id = event["requestContext"]["connectionId"]
-    logger.info(f"❌ Client disconnected: {connection_id}")
+    logger.info(f"❌ Client disconnected: {event['requestContext']['connectionId']}")
     return {"statusCode": 200}
 
-
+# --- Main Message Handler ---
 def handle_send_message(event):
     try:
         connection_id = event["requestContext"]["connectionId"]
@@ -47,7 +56,6 @@ def handle_send_message(event):
         user_msg = body.get("message", "Hello")
         jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
 
-        # Instruction prompt for Claude
         instruction = (
             f"Your name is Mariko, and you work for Tokio Marine Nichido, an insurance company, "
             f"as a kind and helpful operator handling traffic accident claims in English."
@@ -65,15 +73,14 @@ def handle_send_message(event):
             f"If possible, gather information about the traffic signals and the speed of both vehicles."
             f"Let the customer know that it's fine to share only what they can remember.\n\n"
             f"After you have received answers to those questions above, say:\n"
-            f"'I will now display the map in the area below. Please wait a moment.'\n"
+            f"'I will now display the accident description below. Please wait a moment.'\n"
             f"Then, end the conversation.\n\n"
             f"If the user asks anything outside of this task, politely decline to answer."
         )
-        
-        # Initialize chat history if new
+
         if connection_id not in chat_histories:
             chat_histories[connection_id] = [{"role": "user", "content": instruction}]
-
+        
         # Append current user message
         chat_histories[connection_id].append({"role": "user", "content": user_msg})
         logger.info(f"📜 Chat history for {connection_id}: {chat_histories[connection_id]}")
@@ -91,40 +98,23 @@ def handle_send_message(event):
             })
         )
 
-        response_body = json.loads(response["body"].read())
-        completion = response_body["content"][0]["text"]
+        completion = json.loads(response["body"].read())["content"][0]["text"]
         chat_histories[connection_id].append({"role": "assistant", "content": completion})
 
-        # Step 1: Extract datetime and location
+        # Step 1: Extract datetime and location (always run these)
         full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
         datetime_str = extract_datetime(full_context)
         location_data = extract_location(full_context)
-        similar_case = find_similar_case(full_context)
 
-        # Log similar case for debugging
-        if similar_case:
-            logger.info(f"🔍 Found similar cases: {len(similar_case)} cases")
-            for i, case in enumerate(similar_case[:3]):  # Log top 3
-                logger.info(f"Case {i+1}: ID={case['case_id']}, Similarity={case['similarity']:.3f}")
-        else:
-            logger.info("🔍 No similar cases found")
+        similar_case = None
+        if should_run_similarity_search(full_context):
+            similar_case = find_similar_case(full_context)
 
-        # Step 2: Save to DynamoDB if valid
         if datetime_str != "unknown" and location_data:
             store_to_dynamodb(connection_id, datetime_str, location_data, similar_case)
-            logger.info(f"✅ Stored to DynamoDB: {datetime_str}, {location_data}")
-        else:
-            logger.info("ℹ️ Datetime or location not available for storage.")
 
-        # Step 3: Send Claude's reply back to frontend
-        domain = event["requestContext"]["domainName"]
-        stage = event["requestContext"]["stage"]
-        apig = get_apig_client(domain, stage)
-
-        apig.post_to_connection(
-            ConnectionId=connection_id,
-            Data=json.dumps({"response": completion}).encode("utf-8")
-        )
+        apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+        apig.post_to_connection(ConnectionId=connection_id, Data=json.dumps({"response": completion}).encode("utf-8"))
 
         return {"statusCode": 200}
 
@@ -132,9 +122,7 @@ def handle_send_message(event):
         logger.error(f"❗ Unhandled error: {e}")
         return {"statusCode": 500, "body": "Internal Server Error"}
 
-
-# ---------- Helper Functions ----------
-
+# --- Helpers ---
 def extract_datetime(full_context):
     prompt = f"Generate the exact datetime (format: yyyy/mm/dd hh:mm) from this accident description: \"{full_context}\". If the user provides a relative date expression such as yesterday, today, or three days ago, instead of a specific date, estimate the exact date by refferring today's date. Just output yyyy/mm/dd hh:mm directly and Don't include any other messages. If not you can't do it, return 'unknown'."
     response = bedrock.invoke_model(
@@ -154,8 +142,6 @@ def extract_datetime(full_context):
     print("Datetime Response:", reply)
     return reply
 
-
-import re
 
 def extract_location(full_context):
     prompt = (
@@ -200,110 +186,97 @@ def extract_location(full_context):
     return None
 
 
-def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None):
-    response = table.get_item(Key={"connection_id": connection_id})
-    item = response.get("Item")
+def should_run_similarity_search(full_context):
+    prompt = f"Analyze this conversation and determine ..."
+    response = bedrock.invoke_model(...)
+    reply = json.loads(response["body"].read())["content"][0]["text"].strip().upper()
+    return reply == "YES"
 
-    # Prepare similar cases data for storage
-    similar_cases_data = None
-    if similar_cases and len(similar_cases) > 0:
-        # Store top 3 similar cases
-        similar_cases_data = []
-        for case in similar_cases[:3]:
-            similar_cases_data.append({
-                "case_id": str(case["case_id"]),
-                "similarity": float(case["similarity"]),
-                "summary": case["summary"][:500]  # Limit length for DynamoDB
-            })
+# --- CSV Similarity Logic ---
+def categorize_accident_type(full_context):
+    prompt = "..."
+    response = bedrock.invoke_model(...)
+    return json.loads(response["body"].read())["content"][0]["text"].strip()
 
-    if item:
-        # Update the existing item
-        update_expression = "SET #ts = :ts, lat = :lat, lon = :lon"
-        expression_values = {
-            ":ts": datetime_str,
-            ":lat": Decimal(str(location["lat"])),
-            ":lon": Decimal(str(location["lon"]))
-        }
-        
-        if similar_cases_data:
-            update_expression += ", similar_cases = :similar"
-            expression_values[":similar"] = similar_cases_data
-            
-        table.update_item(
-            Key={"connection_id": connection_id},
-            UpdateExpression=update_expression,
-            ExpressionAttributeNames={"#ts": "timestamp"},
-            ExpressionAttributeValues=expression_values
-        )
-    else:
-        # Insert new item
-        new_item = {
-            "connection_id": connection_id,
-            "timestamp": datetime_str,
-            "lat": Decimal(str(location["lat"])),
-            "lon": Decimal(str(location["lon"]))
-        }
-        
-        if similar_cases_data:
-            new_item["similar_cases"] = similar_cases_data
-            
-        table.put_item(Item=new_item)
+def load_csv_from_s3(csv_filename):
+    response = s3.get_object(Bucket=CSV_BUCKET, Key=csv_filename)
+    return pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
 
+def format_cases_for_analysis(cases):
+    return "\n\n".join([f"Case {c['case_number']}: Situation: {c['situation']} ..." for c in cases[:20]])
+
+def find_matching_pattern(category, full_context):
+    all_cases = []
+    for file in CATEGORY_CSV_MAPPING.get(category, []):
+        df = load_csv_from_s3(file)
+        for _, row in df.iterrows():
+            all_cases.append({"case_number": row["Case Number"], ...})
+    prompt = f"Based on this accident description, find the MOST SIMILAR case ..."
+    response = bedrock.invoke_model(...)
+    result_text = json.loads(response["body"].read())["content"][0]["text"]
+    json_match = re.search(r'\{.*\}', result_text)
+    return json.loads(json_match.group(0)) if json_match else None
+
+def calculate_final_fault_ratio(base_ratio, modifications, accident_context):
+    prompt = f"Calculate the final fault ratio ..."
+    response = bedrock.invoke_model(...)
+    return json.loads(response["body"].read())["content"][0]["text"].strip()
 
 def find_similar_case(full_context):
-    """
-    Call the similarity search Lambda function to find similar cases
-    """
-    try:
-        # Get function name from environment
-        function_name = os.environ.get('SIMILARITY_FUNCTION_NAME')
-        if not function_name:
-            logger.warning("SIMILARITY_FUNCTION_NAME not set")
-            return None
-            
-        # Invoke similarity search Lambda
-        lambda_client = boto3.client('lambda')
-        
-        response = lambda_client.invoke(
-            FunctionName=function_name,
-            InvocationType='RequestResponse',
-            Payload=json.dumps({
-                'user_text': full_context,
-                'top_k': 5  # Get top 5 similar cases
-            })
+    category = categorize_accident_type(full_context)
+    match = find_matching_pattern(category, full_context)
+    if match:
+        final = calculate_final_fault_ratio(match["fault_ratio"], match.get("applicable_modifications", []), full_context)
+        return [{
+            "case_id": match["best_match_case_number"],
+            "category": category,
+            "similarity": float(match["confidence_score"]) / 10.0,
+            "summary": match["reasoning"],
+            "fault_ratio": final,
+            "base_fault_ratio": match["fault_ratio"],
+            "modifications": match.get("applicable_modifications", [])
+        }]
+    return None
+
+def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None):
+    item = table.get_item(Key={"connection_id": connection_id}).get("Item")
+    similar_data = None
+    if similar_cases:
+        similar_data = [{
+            "case_id": case["case_id"],
+            "category": case.get("category", "unknown"),
+            "similarity": Decimal(str(case["similarity"])),
+            "summary": case["summary"][:500],
+            "fault_ratio": case.get("fault_ratio", "unknown"),
+            "base_fault_ratio": case.get("base_fault_ratio", "unknown"),
+            "modifications": case.get("modifications", [])[:5]
+        } for case in similar_cases[:3]]
+    values = {
+        ":ts": datetime_str,
+        ":lat": Decimal(str(location["lat"])),
+        ":lon": Decimal(str(location["lon"]))
+    }
+    if similar_data:
+        values[":similar"] = similar_data
+
+    if item:
+        table.update_item(
+            Key={"connection_id": connection_id},
+            UpdateExpression="SET #ts = :ts, lat = :lat, lon = :lon, similar_cases = :similar",
+            ExpressionAttributeNames={"#ts": "timestamp"},
+            ExpressionAttributeValues=values
         )
-        
-        result = json.loads(response['Payload'].read())
-        if result['statusCode'] == 200:
-            response_data = json.loads(result['body'])
-            similar_cases = response_data['similar_cases']
-            logger.info(f"✅ Found {len(similar_cases)} similar cases from {response_data['total_cases_checked']} total cases")
-            
-            # Log similarity scores for debugging
-            for i, case in enumerate(similar_cases[:3]):
-                logger.info(f"Top case {i+1}: Case {case['case_id']} - Similarity: {case['similarity']:.4f}")
-            
-            return similar_cases
-        else:
-            logger.error(f"Similarity search failed: {result}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error calling similarity search: {e}")
-        return None
+    else:
+        table.put_item(Item={"connection_id": connection_id, "timestamp": datetime_str, "lat": values[":lat"], "lon": values[":lon"], "similar_cases": values.get(":similar")})
 
-
-# ---------- Entry Point ----------
-
+# --- Lambda Entrypoint ---
 def lambda_handler(event, context):
     route_key = event.get("requestContext", {}).get("routeKey")
-
-    if route_key == "\$connect":
+    if route_key == "$connect":
         return handle_connect(event)
-    elif route_key == "\$disconnect":
+    elif route_key == "$disconnect":
         return handle_disconnect(event)
     elif route_key == "sendMessage":
         return handle_send_message(event)
     else:
-        logger.error(f"Unknown route: {route_key}")
         return {"statusCode": 400, "body": "Unsupported route"}

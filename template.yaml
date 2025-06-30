@@ -10,6 +10,19 @@ Globals:
 
 Resources:
 
+  # S3 Bucket for storing CSV files
+  CsvFilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-csv-files-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
   # S3 Bucket for storing embeddings
   EmbeddingsBucket:
     Type: AWS::S3::Bucket
@@ -50,13 +63,38 @@ Resources:
           - Effect: Allow
             Action:
               - s3:GetObject
-            Resource: !Sub "${EmbeddingsBucket}/*"
+            Resource: !Sub "${EmbeddingsBucket.Arn}/*"
           - Effect: Allow
             Action:
               - bedrock:InvokeModel
             Resource: 
               - arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1
               - arn:aws:bedrock:ap-northeast-1::foundation-model/amazon.titan-embed-text-v1
+
+  # Custom resource to upload embeddings
+  UploadEmbeddingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-upload-embeddings"
+      Handler: upload_embeddings.lambda_handler
+      CodeUri: upload_embeddings/
+      Runtime: python3.11
+      Timeout: 300
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub "${EmbeddingsBucket.Arn}/*"
+
+  # Custom resource that triggers the upload - simple, no timestamp needed
+  UploadEmbeddingsResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt UploadEmbeddingsFunction.Arn
+      BucketName: !Ref EmbeddingsBucket
 
   WebSocketApi:
     Type: AWS::ApiGatewayV2::Api
@@ -131,8 +169,11 @@ Resources:
       Environment:
         Variables:
           SIMILARITY_FUNCTION_NAME: !Ref SimilaritySearchFunction
+          CSV_BUCKET_NAME: !Ref CsvFilesBucket
       Policies:
         - AWSLambdaBasicExecutionRole
+        - S3ReadPolicy:
+            BucketName: !Ref CsvFilesBucket
         - Statement:
           - Effect: Allow
             Action:            
@@ -224,6 +265,16 @@ Outputs:
     Description: WebSocket Endpoint
     Value: !Sub "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/production"
   
+  CsvFilesBucket:
+    Description: S3 Bucket for storing CSV files
+    Value: !Ref CsvFilesBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CsvFilesBucket"
+  
+  CsvFilesBucketName:
+    Description: S3 Bucket Name for CSV files
+    Value: !Ref CsvFilesBucket
+
   EmbeddingsBucketName:
     Description: S3 Bucket for storing embeddings
     Value: !Ref EmbeddingsBucket
@@ -235,28 +286,3 @@ Outputs:
     Value: !Ref SimilaritySearchFunction
     Export:
       Name: !Sub "${AWS::StackName}-SimilarityFunction"
-
-  # Custom resource to upload embeddings
-  UploadEmbeddingsFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${AWS::StackName}-upload-embeddings"
-      Handler: upload_embeddings.lambda_handler
-      CodeUri: upload_embeddings/
-      Runtime: python3.11
-      Timeout: 300
-      Policies:
-        - AWSLambdaBasicExecutionRole
-        - Statement:
-          - Effect: Allow
-            Action:
-              - s3:PutObject
-              - s3:PutObjectAcl
-            Resource: !Sub "${EmbeddingsBucket}/*"
-
-  # Custom resource that triggers the upload - simple, no timestamp needed
-  UploadEmbeddingsResource:
-    Type: AWS::CloudFormation::CustomResource
-    Properties:
-      ServiceToken: !GetAtt UploadEmbeddingsFunction.Arn
-      BucketName: !Ref EmbeddingsBucket

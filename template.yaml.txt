@@ -105,9 +105,9 @@ Resources:
             Resource: arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0
           - Effect: Allow
             Action:
-              - dynamodb:PutItem
-              - dynamodb:GetItem
-              - dynamodb:UpdateItem
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
             Resource: !GetAtt AccidentDataTable.Arn
 
   WebSocketConnectIntegration:
