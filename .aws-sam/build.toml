@@ -5,7 +5,7 @@ codeuri = "/home/tokiomarine/Downloads/sam-app/sam-app/hello_world"
 runtime = "python3.11"
 architecture = "x86_64"
 handler = "app.lambda_handler"
-manifest_hash = "9340ec67db9e2f858181dd314ab89d89"
+manifest_hash = "e62dedfb7c0e2c6706d8fb380637f9d5"
 packagetype = "Zip"
 functions = ["ConnectFunction", "DisconnectFunction", "SendMessageFunction"]
 

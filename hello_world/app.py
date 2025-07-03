@@ -27,9 +27,9 @@ apig_clients = {}
 CATEGORY_CSV_MAPPING = {
     "Vehicle(car_or_motorcycle)_accident_against_pedestrian": ["1-25.csv", "26-50.csv"],
     "Bycicle_accident_against_pedestrian": ["51-74.csv", "75-97.csv"],
-    "Vehicle_to_vehicle_(car_accidents_against_motorcycle)": ["98-113.csv", "114-138.csv", "139-159.csv"],
-    "Vehicle_to_vehicle_(car_accidents_against_car)": ["160-204.csv", "205-234.csv"],
-    "Vehicle(car_or_motorcycle)_accident_against_bycicle": ["235-280.csv", "281-310.csv"],
+    "Vehicle_to_vehicle_(car_accidents_against_car)": ["98-113.csv", "114-138.csv", "139-159.csv"],
+    "Vehicle_to_vehicle_(car_accidents_against_motorcycle)": ["160-204.csv", "205-234.csv"],
+    "Vehicle(car_or_motorcycle)_accident_against_bicycle": ["235-280.csv", "281-310.csv"],
     "Accidents_in_highways_or_Accidents_in_park": ["311-338.csv"]
 }
 
@@ -87,7 +87,7 @@ def handle_send_message(event):
 
         # Call Claude
         response = bedrock.invoke_model(
-            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
             contentType="application/json",
             accept="application/json",
             body=json.dumps({
@@ -126,7 +126,7 @@ def handle_send_message(event):
 def extract_datetime(full_context):
     prompt = f"Generate the exact datetime (format: yyyy/mm/dd hh:mm) from this accident description: \"{full_context}\". If the user provides a relative date expression such as yesterday, today, or three days ago, instead of a specific date, estimate the exact date by refferring today's date. Just output yyyy/mm/dd hh:mm directly and Don't include any other messages. If not you can't do it, return 'unknown'."
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
@@ -153,7 +153,7 @@ def extract_location(full_context):
     )
 
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
@@ -200,7 +200,7 @@ def should_run_similarity_search(full_context):
     )
     
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
@@ -224,7 +224,7 @@ def categorize_accident_type(full_context):
         f"Reply only the category string exactly as above."
     )
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
@@ -276,7 +276,7 @@ def find_matching_pattern(category, full_context):
     )
 
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
@@ -306,7 +306,7 @@ def calculate_final_fault_ratio(base_ratio, modifications, accident_context):
         f"Output only the numeric value as a string."
     )
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
