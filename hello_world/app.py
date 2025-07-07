@@ -59,21 +59,20 @@ def handle_send_message(event):
         instruction = (
             f"Your name is Mariko, and you work for Tokio Marine Nichido, an insurance company, "
             f"as a kind and helpful operator handling traffic accident claims in English."
-            f"You only handle cases involving car-to-car collisions that occur at intersections. You not able to accept reports for other types of accidents, such as those involving motorcycles, pedestrians, or incidents that occur on straight roads, highways, or in parking lots."
             f"Please ask the following two questions to gather information about the accident:\n\n"
             f"1. When did the accident occur? It is important to know the date and time of the accident. "
             f"FYI, today is \"{jst_time}\". "
             f"If the user just said an abstract time like 'today' or 'yesterday', you can guess it with the current date above."
-            f"but please reconfirm the exact date to the user and make sure the guess is correct. "
             f"If the user said 'I don't know', confirm that they don't remember the time.\n\n"
             f"2. Where did the accident happen? Please gather detailed location information.\n\n"
             f"3. Then Please ask the customer to describe the details of the accident."
             f"Ask where their vehicle was coming from and where it was heading."
-            f"Also ask which direction the other vehicle came from."
-            f"If possible, gather information about the traffic signals and the speed of both vehicles."
+            f"Also ask the type of the other party and which direction the other party came from and headed for"
+            f"If possible, gather information about the traffic signals and the speed of both vehicles, or anyother thing"
             f"Let the customer know that it's fine to share only what they can remember.\n\n"
-            f"After you have received answers to those questions above, say:\n"
-            f"'I will now display the accident description below. Please wait a moment.'\n"
+            f"After you have received answers to those questions, The other LLM will be invoked automatically."
+            f"The other LLM will ask user about the accidents' details. so don't say nothing as long as the other LLM will be satisfied.\n\n"
+            f"After the other LLM has finished asking questions, Say 'I will now display the accident description below. Please wait a moment.'\n\n"
             f"Then, end the conversation.\n\n"
             f"If the user asks anything outside of this task, politely decline to answer."
         )
@@ -106,15 +105,55 @@ def handle_send_message(event):
         datetime_str = extract_datetime(full_context)
         location_data = extract_location(full_context)
 
-        similar_case = None
+        similar_cases = None
         if should_run_similarity_search(full_context):
-            similar_case = find_similar_case(full_context)
+            similar_cases = find_similar_cases(full_context)
+
+            # Collect all unique modifiers from similar cases
+            modifiers = set()
+            for case in similar_cases:
+                modifiers.update(case.get("modifications", []))
+
+            modifiers = list(modifiers)[:5]  # Limit to top 5 for sanity
+
+            # Generate user-friendly questions based on modifiers
+            if modifiers:
+                apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+                apig.post_to_connection(
+                    ConnectionId=connection_id,
+                    Data=json.dumps({
+                        "response": "Thanks. I'm analyzing your accident and comparing with past cases. Please wait a moment..."
+                    }).encode("utf-8")
+                )
+                try:
+                    mod_questions = generate_modifier_questions(modifiers)
+                except Exception as e:
+                    logger.warning(f"❗ Failed to generate modifier questions: {e}")
+                    mod_questions = []
+
+                if mod_questions:
+                    # Store in session (optional)
+                    # chat_sessions[connection_id]["mod_questions"] = mod_questions
+
+                    # Build follow-up message
+                    followup_msg = (
+                        "Thank you. Based on similar accident cases, I have a few more questions to clarify the situation:\n\n"
+                        + "\n".join(f"- {q}" for q in mod_questions)
+                        + "\n\nYou can answer as much as you remember."
+                    )
+
+                    combined_reply = completion + "\n\n" + followup_msg
+                    chat_histories[connection_id].append({"role": "assistant", "content": combined_reply})
+                    completion = combined_reply  # ← overwrite for final post
 
         if datetime_str != "unknown" and location_data:
-            store_to_dynamodb(connection_id, datetime_str, location_data, similar_case)
+            store_to_dynamodb(connection_id, datetime_str, location_data, similar_cases)
 
         apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
-        apig.post_to_connection(ConnectionId=connection_id, Data=json.dumps({"response": completion}).encode("utf-8"))
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({"response": completion}).encode("utf-8")
+        )
 
         return {"statusCode": 200}
 
@@ -123,6 +162,37 @@ def handle_send_message(event):
         return {"statusCode": 500, "body": "Internal Server Error"}
 
 # --- Helpers ---
+def generate_modifier_questions(modifiers: list[str]) -> list[str]:
+    prompt = (
+        "You are Mariko, an empathetic insurance claim operator for Tokio Marine Nichido. "
+        "Given the following internal legal or traffic modifiers that affect accident fault ratio, "
+        "please turn each into a clear and friendly question you can ask a customer involved in the accident. "
+        "The goal is to confirm whether each modifier applies or not.\n\n"
+        "Example modifier: 'A's 30km+ speed violation +20 to A'\n"
+        "Example question: 'Were you driving more than 30km/h over the speed limit at the time of the accident?'\n\n"
+        f"Modifiers:\n" + "\n".join(f"- {m}" for m in modifiers[:5]) +
+        "\n\nOutput ONLY the list of questions, each on a new line. No explanations."
+    )
+
+    response = bedrock.invoke_model(
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 500,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
+
+    raw_text = json.loads(response["body"].read())["content"][0]["text"]
+    questions = [line.strip("- ").strip() for line in raw_text.strip().split("\n") if line.strip()]
+    return questions
+
+
+
+
 def extract_datetime(full_context):
     prompt = f"Generate the exact datetime (format: yyyy/mm/dd hh:mm) from this accident description: \"{full_context}\". If the user provides a relative date expression such as yesterday, today, or three days ago, instead of a specific date, estimate the exact date by refferring today's date. Just output yyyy/mm/dd hh:mm directly and Don't include any other messages. If not you can't do it, return 'unknown'."
     response = bedrock.invoke_model(
@@ -245,11 +315,13 @@ def load_csv_from_s3(csv_filename):
 def format_cases_for_analysis(cases):
     return "\n\n".join([
         f"Case {c['case_number']}:\n"
-        f"Situation: {c['situation']}\n"
-        f"Base Fault Ratio: {c['fault_ratio']}\n"
-        f"Modification Factors: {c['modification_factors']}\n"
+        f"road_infrastructure: {c['road_infrastructure']}\n"
+        f"traffic_control_systems: {c['traffic_control_systems']}\n"
+        f"vehicle_information: {c['vehicle_information']}\n"
+        f"basic_fault_ratio: {c['basic_fault_ratio']}\n"
+        f"key_modifiers: {c['key_modifiers']}\n"
         f"Source File: {c['source_file']}"
-        for c in cases[:20]
+        for c in cases
     ])
 
 def find_matching_pattern(category, full_context):
@@ -259,9 +331,11 @@ def find_matching_pattern(category, full_context):
         for _, row in df.iterrows():
             all_cases.append({
                 "case_number": row.get("Case Number"),
-                "situation": row.get("Accident Situation"),
-                "fault_ratio": row.get("Fault Ratio"),
-                "modification_factors": row.get("Modification Factors"),
+                "road_infrastructure": row.get("Road Infrastructure"),
+                "traffic_control_systems": row.get("Traffic Control Systems"),
+                "vehicle_information": row.get("Vehicle Information"),
+                "basic_fault_ratio": row.get("Basic Fault Ratio"),
+                "key_modifiers": row.get("Key Modifiers"),
                 "source_file": file
             })
 
@@ -270,9 +344,11 @@ def find_matching_pattern(category, full_context):
     prompt = (
         f"Given the following accident cases:\n{cases_text}\n\n"
         f"Based on the accident description:\n{full_context}\n"
-        f"Find the MOST SIMILAR case among above cases and provide a JSON with keys:\n"
-        f"best_match_case_number, confidence_score (0-10), reasoning, applicable_modifications (list).\n"
-        f"Output ONLY the JSON object."
+        f"Identify the TOP 5 MOST SIMILAR cases from the list above.\n"
+        f"For each similar case, provide a JSON object with the following keys:\n"
+        f"case_number, confidence_score (0-10), reasoning_details, applicable_modifications (list).\n"
+        f"Output a JSON array of 5 objects, sorted by descending confidence_score.\n"
+        f"Output ONLY a plain JSON array.Do not wrap it in Markdown or any other formatting like ```json."
     )
 
     response = bedrock.invoke_model(
@@ -281,7 +357,7 @@ def find_matching_pattern(category, full_context):
         accept="application/json",
         body=json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 400,
+            "max_tokens": 1000,
             "temperature": 0.1,
             "messages": [{"role": "user", "content": prompt}]
         })
@@ -290,12 +366,13 @@ def find_matching_pattern(category, full_context):
     result_text = json.loads(response["body"].read())["content"][0]["text"]
     logger.info(f"Similarity match response: {result_text}")
 
-    json_match = re.search(r"\{.*\}", result_text, re.DOTALL)
+    json_match = re.search(r"\[\s*\{.*?\}\s*\]", result_text, re.DOTALL)
     if json_match:
         try:
             return json.loads(json_match.group(0))
         except Exception as e:
             logger.warning(f"Failed to parse similarity JSON: {e}")
+            logger.warning(f"Claude output: {result_text}")
     return None
 
 def calculate_final_fault_ratio(base_ratio, modifications, accident_context):
@@ -320,47 +397,46 @@ def calculate_final_fault_ratio(base_ratio, modifications, accident_context):
     logger.info(f"Calculated final fault ratio: {ratio_text}")
     return ratio_text
 
-def find_similar_case(full_context):
+def find_similar_cases(full_context):
     category = categorize_accident_type(full_context)
-    match = find_matching_pattern(category, full_context)
-    if match:
-        final_fault_ratio = calculate_final_fault_ratio(
-            match.get("fault_ratio", "unknown"),
-            match.get("applicable_modifications", []),
-            full_context
-        )
-        return [{
-            "case_id": match.get("best_match_case_number"),
-            "category": category,
-            "similarity": float(match.get("confidence_score", 0)) / 10.0,
-            "summary": match.get("reasoning", ""),
-            "fault_ratio": final_fault_ratio,
-            "base_fault_ratio": match.get("fault_ratio", "unknown"),
-            "modifications": match.get("applicable_modifications", [])
-        }]
+    matches = find_matching_pattern(category, full_context)  # should return a list of 5 dicts
+
+    if matches:
+        results = []
+        for match in matches:
+            final_fault_ratio = calculate_final_fault_ratio(
+                match.get("fault_ratio", "unknown"),
+                match.get("applicable_modifications", []),
+                full_context
+            )
+            results.append({
+                "case_id": match.get("case_number"),
+                "category": category,
+                "similarity": float(match.get("confidence_score", 0)) / 10.0,
+                "summary": match.get("reasoning_details", ""),
+                "fault_ratio": final_fault_ratio,
+                "base_fault_ratio": match.get("fault_ratio", "unknown"),
+                "modifications": match.get("applicable_modifications", [])
+            })
+        return results
     return None
+
+from decimal import Decimal
 
 def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None):
     item = table.get_item(Key={"connection_id": connection_id}).get("Item")
+    
     similar_data = None
     if similar_cases:
         similar_data = [{
             "case_id": case["case_id"],
             "category": case.get("category", "unknown"),
             "similarity": Decimal(str(case["similarity"])),
-            "summary": case["summary"][:500],
+            "summary": case["summary"][:500],  # truncate to avoid size limit
             "fault_ratio": case.get("fault_ratio", "unknown"),
             "base_fault_ratio": case.get("base_fault_ratio", "unknown"),
             "modifications": case.get("modifications", [])[:5]
-        } for case in similar_cases[:3]]
-
-    values = {
-        ":ts": datetime_str,
-        ":lat": Decimal(str(location["lat"])),
-        ":lon": Decimal(str(location["lon"]))
-    }
-    if similar_data:
-        values[":similar"] = similar_data
+        } for case in similar_cases[:5]]  # ← store top 5
 
     if item:
         # Update existing record
@@ -383,15 +459,17 @@ def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None)
         )
     else:
         # Create new record
-        item = {
+        new_item = {
             "connection_id": connection_id,
             "timestamp": datetime_str,
             "lat": Decimal(str(location["lat"])),
             "lon": Decimal(str(location["lon"]))
         }
         if similar_data:
-            item["similar_cases"] = similar_data
-        table.put_item(Item=item)
+            new_item["similar_cases"] = similar_data
+
+        table.put_item(Item=new_item)
+
 
 # --- Lambda Entrypoint ---
 def lambda_handler(event, context):
