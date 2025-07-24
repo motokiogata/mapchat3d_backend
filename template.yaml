@@ -89,6 +89,38 @@ Resources:
               - s3:PutObjectAcl
             Resource: !Sub "${EmbeddingsBucket.Arn}/*"
 
+  # Generate the field SVG from lng/lat coordinates invoking google maps API
+  GenerateFieldSvgFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-generate-field-svg"
+      Handler: generate_svg.lambda_handler
+      Runtime: python3.11
+      CodeUri: generate_svg/
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          GOOGLE_MAPS_API_KEY: "AIzaSyBgynW3uwnrvXopTghrP10Nht2B-s2WoJ0"
+      Events:
+        # ✅ Simple way - let SAM handle the integration
+        RestApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /generate-field
+            Method: POST
+
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Name: FieldSvgApi
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+
   # Custom resource that triggers the upload - simple, no timestamp needed
   UploadEmbeddingsResource:
     Type: AWS::CloudFormation::CustomResource
@@ -126,6 +158,14 @@ Resources:
       RouteKey: "sendMessage"
       AuthorizationType: NONE
       Target: !Sub "integrations/${WebSocketSendMessageIntegration}"
+
+  WebSocketInitConversationRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: "initConversation"
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${WebSocketInitConversationIntegration}"
 
   ConnectFunction:
     Type: AWS::Serverless::Function
@@ -227,14 +267,28 @@ Resources:
       IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations"
       IntegrationMethod: POST
 
+  WebSocketInitConversationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations"
+      IntegrationMethod: POST
+
   Deployment:
     Type: AWS::ApiGatewayV2::Deployment
     DependsOn:
       - WebSocketConnectRoute
       - WebSocketDisconnectRoute
       - WebSocketSendMessageRoute
+      - WebSocketInitConversationRoute
+      - WebSocketConnectIntegration      # Add these
+      - WebSocketDisconnectIntegration   # Add these
+      - WebSocketSendMessageIntegration  # Add these
+      - WebSocketInitConversationIntegration  # Add this 
     Properties:
       ApiId: !Ref WebSocketApi
+      Description: !Sub "Deployment at {AWS::StackName}-{AWS::AccountId}"  # This forces new deployment
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
@@ -242,6 +296,10 @@ Resources:
       ApiId: !Ref WebSocketApi
       StageName: production
       DeploymentId: !Ref Deployment
+      DefaultRouteSettings:
+        LoggingLevel: INFO
+        DataTraceEnabled: true
+        DetailedMetricsEnabled: true
 
   ConnectFunctionPermission:
     Type: AWS::Lambda::Permission
@@ -266,6 +324,14 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/production/sendMessage
+
+  InitConversationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SendMessageFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*
 
 Outputs:
   WebSocketURL:
@@ -293,3 +359,7 @@ Outputs:
     Value: !Ref SimilaritySearchFunction
     Export:
       Name: !Sub "${AWS::StackName}-SimilarityFunction"
+
+  RestApiUrl:
+    Description: "REST API Gateway endpoint URL"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/generate-field"

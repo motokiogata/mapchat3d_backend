@@ -10,6 +10,19 @@ Globals:
 
 Resources:
 
+  # S3 Bucket for storing CSV files
+  CsvFilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-csv-files-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
   # S3 Bucket for storing embeddings
   EmbeddingsBucket:
     Type: AWS::S3::Bucket
@@ -50,13 +63,89 @@ Resources:
           - Effect: Allow
             Action:
               - s3:GetObject
-            Resource: !Sub "${EmbeddingsBucket}/*"
+            Resource: !Sub "${EmbeddingsBucket.Arn}/*"
           - Effect: Allow
             Action:
               - bedrock:InvokeModel
             Resource: 
               - arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1
               - arn:aws:bedrock:ap-northeast-1::foundation-model/amazon.titan-embed-text-v1
+
+  # Custom resource to upload embeddings
+  UploadEmbeddingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-upload-embeddings"
+      Handler: upload_embeddings.lambda_handler
+      CodeUri: upload_embeddings/
+      Runtime: python3.11
+      Timeout: 300
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub "${EmbeddingsBucket.Arn}/*"
+
+  #Generate the field SVG from lng/lat coordinates involking google maps API
+  GenerateFieldSvgFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-generate-field-svg"
+      Handler: generate_svg.lambda_handler
+      Runtime: python3.11
+      CodeUri: generate_svg/
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          GOOGLE_MAPS_API_KEY: "REPLACE_ME"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: FieldSvgHttpApi
+      CorsConfiguration:
+        AllowMethods: ["POST"]
+        AllowOrigins: ["*"]
+
+  HttpApiRoute:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Name: FieldSvgApi
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: Field SVG API
+          version: 1.0
+        paths:
+          /generate-field:
+            post:
+              x-amazon-apigateway-integration:
+                uri:
+                  Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateFieldSvgFunction.Arn}/invocations
+                httpMethod: POST
+                type: aws_proxy
+
+  GenerateFieldSvgPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GenerateFieldSvgFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*/POST/generate-field
+
+  # Custom resource that triggers the upload - simple, no timestamp needed
+  UploadEmbeddingsResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt UploadEmbeddingsFunction.Arn
+      BucketName: !Ref EmbeddingsBucket
 
   WebSocketApi:
     Type: AWS::ApiGatewayV2::Api
@@ -89,6 +178,14 @@ Resources:
       AuthorizationType: NONE
       Target: !Sub "integrations/${WebSocketSendMessageIntegration}"
 
+  WebSocketInitConversationRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: "initConversation"
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${WebSocketInitConversationIntegration}"
+
   ConnectFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -104,7 +201,10 @@ Resources:
           - Effect: Allow
             Action:
             - bedrock:InvokeModel
-            Resource: arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0
+            Resource: 
+              - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-sonnet-4-20250514-v1:0
+              - arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0
+              - arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1
 
   DisconnectFunction:
     Type: AWS::Serverless::Function
@@ -121,7 +221,10 @@ Resources:
           - Effect: Allow
             Action:
             - bedrock:InvokeModel
-            Resource: arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0
+            Resource: 
+              - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-sonnet-4-20250514-v1:0
+              - arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0
+              - arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1
 
   SendMessageFunction:
     Type: AWS::Serverless::Function
@@ -131,8 +234,11 @@ Resources:
       Environment:
         Variables:
           SIMILARITY_FUNCTION_NAME: !Ref SimilaritySearchFunction
+          CSV_BUCKET_NAME: !Ref CsvFilesBucket
       Policies:
         - AWSLambdaBasicExecutionRole
+        - S3ReadPolicy:
+            BucketName: !Ref CsvFilesBucket
         - Statement:
           - Effect: Allow
             Action:            
@@ -141,8 +247,9 @@ Resources:
           - Effect: Allow
             Action:
             - bedrock:InvokeModel
-            Resource: 
-              - arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0
+            Resource:     
+              - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-sonnet-4-20250514-v1:0
+              - arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0
               - arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1
           - Effect: Allow
             Action:
@@ -179,12 +286,22 @@ Resources:
       IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations"
       IntegrationMethod: POST
 
+  WebSocketInitConversationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations"
+      IntegrationMethod: POST
+
+
   Deployment:
     Type: AWS::ApiGatewayV2::Deployment
     DependsOn:
       - WebSocketConnectRoute
       - WebSocketDisconnectRoute
       - WebSocketSendMessageRoute
+      - WebSocketInitConversationRoute 
     Properties:
       ApiId: !Ref WebSocketApi
 
@@ -194,6 +311,10 @@ Resources:
       ApiId: !Ref WebSocketApi
       StageName: production
       DeploymentId: !Ref Deployment
+      DefaultRouteSettings:
+        LoggingLevel: ERROR
+        DataTraceEnabled: true
+        DetailedMetricsEnabled: true
 
   ConnectFunctionPermission:
     Type: AWS::Lambda::Permission
@@ -219,44 +340,37 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/production/sendMessage
 
+  InitConversationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SendMessageFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/production/initConversation
+
 Outputs:
   WebSocketURL:
     Description: WebSocket Endpoint
     Value: !Sub "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/production"
   
-EmbeddingsBucketName:
-  Description: S3 Bucket for storing embeddings
-  Value: !Ref EmbeddingsBucket
-  Export:
-    Name: !Sub "${AWS::StackName}-EmbeddingsBucket"
+  CsvFilesBucket:
+    Description: S3 Bucket for storing CSV files
+    Value: !Ref CsvFilesBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CsvFilesBucket"
+  
+  CsvFilesBucketName:
+    Description: S3 Bucket Name for CSV files
+    Value: !Ref CsvFilesBucket
 
-SimilarityFunctionName:
-  Description: Similarity Search Lambda Function Name
-  Value: !Ref SimilaritySearchFunction
-  Export:
-    Name: !Sub "${AWS::StackName}-SimilarityFunction"
+  EmbeddingsBucketName:
+    Description: S3 Bucket for storing embeddings
+    Value: !Ref EmbeddingsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-EmbeddingsBucket"
 
-# Custom resource to upload embeddings
-UploadEmbeddingsFunction:
-  Type: AWS::Serverless::Function
-  Properties:
-    FunctionName: !Sub "${AWS::StackName}-upload-embeddings"
-    Handler: upload_embeddings.lambda_handler
-    CodeUri: upload_embeddings/
-    Runtime: python3.11
-    Timeout: 300
-    Policies:
-      - AWSLambdaBasicExecutionRole
-      - Statement:
-        - Effect: Allow
-          Action:
-            - s3:PutObject
-            - s3:PutObjectAcl
-          Resource: !Sub "${EmbeddingsBucket}/*"
-
-# Custom resource that triggers the upload - simple, no timestamp needed
-UploadEmbeddingsResource:
-  Type: AWS::CloudFormation::CustomResource
-  Properties:
-    ServiceToken: !GetAtt UploadEmbeddingsFunction.Arn
-    BucketName: !Ref EmbeddingsBucket
+  SimilarityFunctionName:
+    Description: Similarity Search Lambda Function Name
+    Value: !Ref SimilaritySearchFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-SimilarityFunction"
