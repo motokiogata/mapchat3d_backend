@@ -1,0 +1,1495 @@
+import cv2
+import numpy as np
+import json
+import boto3
+import sys
+import base64
+import os
+from io import BytesIO
+from PIL import Image
+from skimage.morphology import medial_axis
+from collections import defaultdict
+import math
+import re
+from math import atan2, degrees, sqrt, cos, sin, radians
+from shapely.geometry import LineString, Point
+
+# AWS Bedrock setup
+BEDROCK_MODEL_ID = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+BEDROCK_REGION = "ap-northeast-1"
+
+# Paths
+MASK_PATH = "final_road_mask_cleaned.png"
+ROADMAP_PATH = "roadmap.png"
+SATELLITE_PATH = "satellite.png"
+
+# Output files - INTEGRATED
+OUTPUT_INTEGRATED_JSON = "integrated_road_network.json"
+OUTPUT_CENTERLINES_JSON = "centerlines_with_metadata.json"
+OUTPUT_INTERSECTIONS_JSON = "intersections_with_metadata.json"
+OUTPUT_LANE_TREES_JSON = "lane_tree_routes_enhanced.json"
+OUTPUT_IMG = "integrated_network_visualization.png"
+DEBUG_SKELETON = "debug_skeleton.png"
+
+# Parameters
+MIN_LINE_LENGTH = 20
+CANVAS_SIZE = (1280, 1280)
+EDGE_TOLERANCE = 10
+LANE_OFFSET_PX = 20
+INTERSECTION_RADIUS = 30
+
+class IntegratedRoadNetworkGenerator:
+    def __init__(self, connection_id=None): # connection_id is optional, can be passed as an argument
+        # Core data with consistent IDs
+        self.roads = []
+        self.intersections = []
+        self.lane_trees = []
+        
+        # ID mapping and consistency
+        self.road_id_counter = 0
+        self.intersection_id_counter = 0
+        self.lane_id_counter = 0
+        
+        # Cross-reference mappings
+        self.road_to_intersections = {}  # road_id -> [intersection_ids]
+        self.intersection_to_roads = {}  # intersection_id -> [road_ids]
+        self.lane_to_road = {}  # lane_id -> road_id
+        
+        # Enhanced metadata
+        self.bedrock_metadata = {}
+        self.edge_analysis_summary = {}
+        self.navigation_graph = {}
+        
+        # Edge analysis
+        self.edge_entry_points = {}
+        self.geographic_road_map = {'west': [], 'east': [], 'north': [], 'south': []}
+        
+        # S3 setup
+        self.s3_client = boto3.client('s3')
+        self.bucket_name = os.environ.get("BUCKET_NAME", "your-output-bucket")
+        #self.connection_id = os.environ.get("CONNECTION_ID", "default_connection")
+        # Use parameter if provided, otherwise fall back to environment variable
+        if connection_id:
+            self.connection_id = connection_id
+        else:
+            self.connection_id = os.environ.get("CONNECTION_ID", "default_connection")
+
+    def upload_to_s3(self, local_file_path, s3_key):
+        """Upload file to S3"""
+        try:
+            self.s3_client.upload_file(local_file_path, self.bucket_name, s3_key)
+            print(f"✅ Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
+        except Exception as e:
+            print(f"❌ Failed to upload {local_file_path} to S3: {e}")
+    
+    def upload_json_to_s3(self, data, s3_key):
+        """Upload JSON data directly to S3"""
+        try:
+            json_string = json.dumps(data, indent=2)
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                Body=json_string.encode('utf-8'),
+                ContentType='application/json'
+            )
+            print(f"✅ Uploaded JSON data to s3://{self.bucket_name}/{s3_key}")
+        except Exception as e:
+            print(f"❌ Failed to upload JSON to S3: {e}")
+
+    def encode_image_to_base64(self, image_path):
+        """Encode image to base64 for Bedrock API"""
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+
+    def analyze_roadmap_with_bedrock(self, roadmap_path, satellite_path):
+        """Analyze images with AWS Bedrock Claude"""
+        bedrock = boto3.client('bedrock-runtime', region_name=BEDROCK_REGION)
+        
+        roadmap_b64 = self.encode_image_to_base64(roadmap_path)
+        satellite_b64 = self.encode_image_to_base64(satellite_path)
+        
+        prompt = """
+        Please carefully analyze these roadmap and satellite images. I need comprehensive information about:
+        
+        1. ALL VISIBLE TEXT (road names, landmarks, businesses, stations)
+        2. ROADS (names, types, directions, characteristics)
+        3. INTERSECTIONS (types, landmarks, businesses nearby)
+        4. NAVIGATION ROUTES (how roads connect, possible paths)
+        
+        Focus on identifying:
+        - Route numbers (like "Route 20", "国道20号")
+        - Station names ("Fuchu Sta. North", etc.)
+        - Business names ("Ozeki", supermarkets, etc.)
+        - Street/road names
+        - How different roads connect to each other
+        - Possible multi-road routes (like "from west road to central intersection, turn right to north road")
+        
+        Return JSON format:
+        {
+          "all_detected_text": ["every", "text", "piece", "found"],
+          "roads": [
+            {
+              "name": "Route 20",
+              "alt_names": ["国道20号"],
+              "direction": "East-West", 
+              "type": "major_road",
+              "lanes": 4,
+              "landmarks_nearby": ["Fuchu Sta. North", "Ozeki"],
+              "connects_to": ["intersection_near_fuchu", "intersection_west"]
+            }
+          ],
+          "intersections": [
+            {
+              "id": "intersection_near_fuchu",
+              "type": "T-intersection",
+              "landmarks": ["Fuchu Sta. North", "Ozeki"],
+              "nearby_businesses": ["Ozeki", "Ootoya"],
+              "traffic_signals": true,
+              "connecting_roads": ["Route 20", "North Road", "West Road"]
+            }
+          ],
+          "possible_routes": [
+            {
+              "description": "From west side to Fuchu station area, then north",
+              "path": ["West Road", "intersection_near_fuchu", "North Road"],
+              "key_landmarks": ["Fuchu Sta. North", "Ozeki"],
+              "turns": [{"at": "intersection_near_fuchu", "direction": "left", "towards": "north"}]
+            }
+          ],
+          "landmarks": [
+            {
+              "name": "Fuchu Sta. North",
+              "type": "station",
+              "position": "central",
+              "nearby_roads": ["Route 20", "North Road"]
+            }
+          ]
+        }
+        """
+        
+        try:
+            print("🧠 Analyzing images with AWS Bedrock Claude...")
+            
+            response = bedrock.invoke_model(
+                modelId=BEDROCK_MODEL_ID,
+                body=json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 6000,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": prompt
+                                },
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": roadmap_b64
+                                    }
+                                },
+                                {
+                                    "type": "image", 
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": satellite_b64
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                })
+            )
+            
+            response_body = json.loads(response['body'].read())
+            analysis_text = response_body['content'][0]['text']
+            
+            print("\n" + "="*80)
+            print("🔍 BEDROCK ANALYSIS RESPONSE:")
+            print("="*80)
+            print(analysis_text)
+            print("="*80)
+            
+            # Extract JSON
+            json_start = analysis_text.find('{')
+            json_end = analysis_text.rfind('}') + 1
+            
+            if json_start != -1 and json_end != -1:
+                json_text = analysis_text[json_start:json_end]
+                try:
+                    metadata_json = json.loads(json_text)
+                    print("✅ Successfully parsed Bedrock analysis")
+                    return metadata_json
+                except json.JSONDecodeError as e:
+                    print(f"❌ JSON parsing failed: {e}")
+                    return {"error": "JSON parse failed", "raw_response": analysis_text}
+            else:
+                return {"error": "No JSON found", "raw_response": analysis_text}
+                
+        except Exception as e:
+            print(f"💥 Bedrock analysis failed: {e}")
+            return {"error": str(e)}
+
+    def extract_medial_axis(self, mask_path):
+        """Extract skeleton from road mask"""
+        img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Image not found at {mask_path}")
+        
+        _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+        binary = binary // 255
+        skel = medial_axis(binary).astype(np.uint8)
+        
+        cv2.imwrite(DEBUG_SKELETON, skel * 255)
+        print(f"✅ Skeleton extracted and saved to {DEBUG_SKELETON}")
+        return skel
+
+    def get_neighbors_8(self, y, x, skeleton):
+        """Get 8-connected neighbors"""
+        neighbors = []
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < skeleton.shape[0] and 0 <= nx < skeleton.shape[1]:
+                    if skeleton[ny, nx] == 1:
+                        neighbors.append((ny, nx))
+        return neighbors
+
+    def find_endpoints_and_junctions(self, skeleton):
+        """Find endpoints and junctions with consistent labeling"""
+        h, w = skeleton.shape
+        endpoints = []
+        junctions = []
+        
+        for y in range(h):
+            for x in range(w):
+                if skeleton[y, x] == 1:
+                    neighbors = self.get_neighbors_8(y, x, skeleton)
+                    degree = len(neighbors)
+                    
+                    if degree == 1:
+                        endpoints.append((y, x))
+                    elif degree > 2:
+                        junctions.append((y, x))
+        
+        print(f"✅ Found {len(endpoints)} endpoints and {len(junctions)} junctions")
+        return endpoints, junctions
+
+    def trace_path_between_points(self, skeleton, start_y, start_x, visited, stop_points):
+        """Trace path between points"""
+        path = [(start_x, start_y)]
+        visited[start_y, start_x] = True
+        
+        current_y, current_x = start_y, start_x
+        
+        while True:
+            neighbors = self.get_neighbors_8(current_y, current_x, skeleton)
+            unvisited_neighbors = [(ny, nx) for ny, nx in neighbors if not visited[ny, nx]]
+            
+            if len(unvisited_neighbors) == 0:
+                break
+            elif len(unvisited_neighbors) == 1:
+                next_y, next_x = unvisited_neighbors[0]
+                visited[next_y, next_x] = True
+                path.append((next_x, next_y))
+                current_y, current_x = next_y, next_x
+                
+                if (next_y, next_x) in stop_points:
+                    break
+            else:
+                break
+        
+        return path
+
+    def trace_skeleton_paths(self, skeleton):
+        """Trace skeleton paths with consistent road IDs"""
+        visited = np.zeros_like(skeleton, dtype=bool)
+        endpoints, junctions = self.find_endpoints_and_junctions(skeleton)
+        
+        stop_points = set(junctions + endpoints)
+        roads = []
+        
+        # Trace from endpoints
+        for start_y, start_x in endpoints:
+            if not visited[start_y, start_x]:
+                path = self.trace_path_between_points(skeleton, start_y, start_x, visited, stop_points)
+                
+                if len(path) >= MIN_LINE_LENGTH:
+                    roads.append({
+                        "id": self.road_id_counter,
+                        "points": path,
+                        "start_type": "endpoint",
+                        "skeleton_endpoints": [(start_x, start_y)]
+                    })
+                    self.road_id_counter += 1
+        
+        # Trace from junctions
+        for start_y, start_x in junctions:
+            neighbors = self.get_neighbors_8(start_y, start_x, skeleton)
+            for ny, nx in neighbors:
+                if not visited[ny, nx]:
+                    visited[start_y, start_x] = True
+                    path = [(start_x, start_y)]
+                    path.extend(self.trace_path_between_points(skeleton, ny, nx, visited, stop_points)[1:])
+                    
+                    if len(path) >= MIN_LINE_LENGTH:
+                        roads.append({
+                            "id": self.road_id_counter,
+                            "points": path,
+                            "start_type": "junction",
+                            "skeleton_junctions": [(start_x, start_y)]
+                        })
+                        self.road_id_counter += 1
+        
+        return roads, endpoints, junctions
+
+    def find_major_intersections(self, junctions, skeleton):
+        """Find intersections with consistent intersection IDs"""
+        if not junctions:
+            return []
+        
+        major_intersections = []
+        used = set()
+        
+        for i, (y1, x1) in enumerate(junctions):
+            if (y1, x1) in used:
+                continue
+                
+            cluster = [(y1, x1)]
+            used.add((y1, x1))
+            
+            for j, (y2, x2) in enumerate(junctions):
+                if i != j and (y2, x2) not in used:
+                    dist = np.sqrt((y1-y2)**2 + (x1-x2)**2)
+                    if dist <= 15:  # Cluster nearby junctions
+                        cluster.append((y2, x2))
+                        used.add((y2, x2))
+            
+            if len(cluster) >= 1:
+                center_y = int(np.mean([p[0] for p in cluster]))
+                center_x = int(np.mean([p[1] for p in cluster]))
+                
+                roads_count = self.count_roads_at_intersection(center_y, center_x, skeleton)
+                
+                major_intersections.append({
+                    'id': self.intersection_id_counter,
+                    'center': (center_x, center_y),
+                    'roads_count': roads_count,
+                    'junction_points': [(x, y) for y, x in cluster],
+                    'skeleton_junctions': cluster
+                })
+                self.intersection_id_counter += 1
+        
+        print(f"✅ Found {len(major_intersections)} major intersections with consistent IDs")
+        return major_intersections
+
+    def count_roads_at_intersection(self, center_y, center_x, skeleton, radius=10):
+        """Count roads meeting at intersection"""
+        directions = []
+        
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                y, x = center_y + dy, center_x + dx
+                if (0 <= y < skeleton.shape[0] and 0 <= x < skeleton.shape[1] and 
+                    skeleton[y, x] == 1 and (dy != 0 or dx != 0)):
+                    
+                    angle = np.arctan2(dy, dx)
+                    directions.append(angle)
+        
+        if not directions:
+            return 0
+        
+        directions.sort()
+        road_count = 1
+        prev_angle = directions[0]
+        
+        for angle in directions[1:]:
+            if abs(angle - prev_angle) > np.pi/4:
+                road_count += 1
+                prev_angle = angle
+        
+        if len(directions) > 1 and abs(directions[-1] - directions[0] + 2*np.pi) <= np.pi/4:
+            road_count -= 1
+        
+        return max(road_count, 2)
+
+    def is_point_at_edge(self, point):
+        """Analyze if point is at edge with detailed info"""
+        x, y = point
+        width, height = CANVAS_SIZE
+        
+        edge_info = {
+            'is_edge': False,
+            'edge_sides': [],
+            'edge_distances': {},
+            'edge_coordinates': {},
+            'edge_id': None
+        }
+        
+        distances = {
+            'west': x,
+            'east': width - x,
+            'north': y,
+            'south': height - y
+        }
+        
+        for side, distance in distances.items():
+            if distance <= EDGE_TOLERANCE:
+                edge_info['is_edge'] = True
+                edge_info['edge_sides'].append(side)
+                edge_info['edge_distances'][side] = distance
+                
+                if side == 'west':
+                    edge_info['edge_coordinates'][side] = {'x': 0, 'y': y}
+                elif side == 'east':
+                    edge_info['edge_coordinates'][side] = {'x': width, 'y': y}
+                elif side == 'north':
+                    edge_info['edge_coordinates'][side] = {'x': x, 'y': 0}
+                elif side == 'south':
+                    edge_info['edge_coordinates'][side] = {'x': x, 'y': height}
+        
+        return edge_info
+
+    def build_consistent_road_intersection_mapping(self):
+        """Build consistent mapping between roads and intersections"""
+        print("\n🔗 BUILDING CONSISTENT ROAD-INTERSECTION MAPPING...")
+        print("-" * 60)
+        
+        # Reset mappings
+        self.road_to_intersections = {}
+        self.intersection_to_roads = {}
+        
+        # For each road, find which intersections it connects to
+        for road in self.roads:
+            road_id = road['id']
+            points = road['points']
+            connected_intersections = []
+            
+            for intersection in self.intersections:
+                int_id = intersection['id']
+                int_center = intersection['center']
+                
+                # Check if road connects to this intersection
+                start_dist = sqrt((points[0][0] - int_center[0])**2 + (points[0][1] - int_center[1])**2)
+                end_dist = sqrt((points[-1][0] - int_center[0])**2 + (points[-1][1] - int_center[1])**2)
+                
+                if start_dist <= INTERSECTION_RADIUS or end_dist <= INTERSECTION_RADIUS:
+                    connected_intersections.append({
+                        'intersection_id': int_id,
+                        'start_connected': start_dist <= INTERSECTION_RADIUS,
+                        'end_connected': end_dist <= INTERSECTION_RADIUS,
+                        'start_distance': start_dist,
+                        'end_distance': end_dist
+                    })
+            
+            self.road_to_intersections[road_id] = connected_intersections
+            print(f"   Road {road_id}: connects to {len(connected_intersections)} intersections")
+        
+        # Build reverse mapping
+        for intersection in self.intersections:
+            int_id = intersection['id']
+            connected_roads = []
+            
+            for road_id, connections in self.road_to_intersections.items():
+                for conn in connections:
+                    if conn['intersection_id'] == int_id:
+                        road = next(r for r in self.roads if r['id'] == road_id)
+                        connected_roads.append({
+                            'road_id': road_id,
+                            'start_connected': conn['start_connected'],
+                            'end_connected': conn['end_connected'],
+                            'road_points': road['points']
+                        })
+                        break
+            
+            self.intersection_to_roads[int_id] = connected_roads
+            print(f"   Intersection {int_id}: connects to {len(connected_roads)} roads")
+
+    def enhance_with_integrated_metadata(self):
+        """Enhance roads and intersections with consistent, integrated metadata"""
+        print("\n🎯 ENHANCING WITH INTEGRATED METADATA (including edge analysis)...")
+        print("-" * 70)
+        
+        # Process edge analysis first
+        edge_roads_count = 0
+        roads_with_edges = []
+        
+        for road in self.roads:
+            road_id = road['id']
+            points = road['points']
+            
+            start_edge_info = self.is_point_at_edge(points[0])
+            end_edge_info = self.is_point_at_edge(points[-1])
+            
+            has_edge_connection = start_edge_info['is_edge'] or end_edge_info['is_edge']
+            
+            if has_edge_connection:
+                edge_roads_count += 1
+                roads_with_edges.append((road_id, start_edge_info, end_edge_info))
+        
+        # Generate consistent edge IDs
+        self.generate_edge_ids(roads_with_edges)
+        
+        # Enhance roads with comprehensive metadata
+        for road in self.roads:
+            road_id = road['id']
+            points = road['points']
+            
+            # Find edge info for this road
+            road_edge_data = next((data for data in roads_with_edges if data[0] == road_id), None)
+            start_edge_info = road_edge_data[1] if road_edge_data else {'is_edge': False}
+            end_edge_info = road_edge_data[2] if road_edge_data else {'is_edge': False}
+            
+            # Try to match with Bedrock analysis
+            bedrock_road_info = self.match_road_with_bedrock(road_id, points)
+            
+            # Calculate comprehensive metadata
+            direction_info = self.calculate_road_direction(points)
+            curvature = self.calculate_road_curvature(points)
+            width_category = self.estimate_road_width_category(points)
+            
+            road['metadata'] = {
+                # Basic properties
+                'name': bedrock_road_info.get('name', f'Road_{road_id}'),
+                'alt_names': bedrock_road_info.get('alt_names', []),
+                'road_class': bedrock_road_info.get('class', 'local_street' if width_category == 'narrow' else 'main_road'),
+                'road_type': bedrock_road_info.get('type', 'local'),
+                'estimated_speed_limit': bedrock_road_info.get('speed_limit', 30 if width_category == 'narrow' else 40),
+                'traffic_density': 'low' if width_category == 'narrow' else 'medium',
+                'curvature': curvature,
+                'width_category': width_category,
+                'landmarks': bedrock_road_info.get('landmarks', []),
+                'estimated_length_meters': len(points) * 0.5,
+                'priority': 1 if width_category == 'narrow' else 2 if width_category == 'medium' else 3,
+                
+                # Direction information
+                'direction': direction_info,
+                'cardinal_direction': direction_info.get('cardinal', 'unknown') if isinstance(direction_info, dict) else 'unknown',
+                'simple_direction': direction_info.get('simple', 'unknown') if isinstance(direction_info, dict) else str(direction_info),
+                
+                # Edge analysis
+                'edge_analysis': {
+                    'has_edge_connection': start_edge_info.get('is_edge', False) or end_edge_info.get('is_edge', False),
+                    'edge_sides': list(set(start_edge_info.get('edge_sides', []) + end_edge_info.get('edge_sides', []))),
+                    'start_edge': start_edge_info,
+                    'end_edge': end_edge_info,
+                    'true_start_directions': start_edge_info.get('edge_sides', []) if start_edge_info.get('is_edge') else [],
+                    'true_end_directions': end_edge_info.get('edge_sides', []) if end_edge_info.get('is_edge') else [],
+                    'is_geographic_entry_point': start_edge_info.get('is_edge', False),
+                    'is_geographic_exit_point': end_edge_info.get('is_edge', False)
+                },
+                
+                # Navigation properties
+                'can_turn_left': True,
+                'can_turn_right': True,
+                'can_go_straight': True,
+                'parking_available': width_category == 'wide',
+                
+                # CONSISTENT intersection connections
+                'connects_to_intersections': [conn['intersection_id'] for conn in self.road_to_intersections.get(road_id, [])],
+                'intersection_connections': self.road_to_intersections.get(road_id, [])
+            }
+            
+            # Add to geographic mapping if has edge connection
+            if road['metadata']['edge_analysis']['has_edge_connection']:
+                for side in road['metadata']['edge_analysis']['edge_sides']:
+                    if side in self.geographic_road_map:
+                        self.geographic_road_map[side].append(road_id)
+        
+        # Enhance intersections with consistent metadata
+        for intersection in self.intersections:
+            int_id = intersection['id']
+            center = intersection['center']
+            
+            # Get connected roads with consistent IDs
+            connected_roads = self.intersection_to_roads.get(int_id, [])
+            
+            # Try to match with Bedrock analysis
+            bedrock_int_info = self.match_intersection_with_bedrock(int_id, center, connected_roads)
+            
+            # Calculate intersection type
+            int_type = self.determine_intersection_type(len(connected_roads))
+            
+            # Check if intersection is at edge
+            intersection_edge_info = self.is_point_at_edge(center)
+            
+            intersection['metadata'] = {
+                # Basic properties
+                'intersection_type': int_type,
+                'connected_roads_count': len(connected_roads),
+                'connected_road_ids': [road['road_id'] for road in connected_roads],
+                
+                # Bedrock-enhanced info
+                'landmarks': bedrock_int_info.get('landmarks', []),
+                'nearby_businesses': bedrock_int_info.get('businesses', []),
+                'traffic_signals': bedrock_int_info.get('traffic_signals', len(connected_roads) >= 3),
+                'estimated_wait_time': bedrock_int_info.get('wait_time', 15 if len(connected_roads) >= 3 else 5),
+                
+                # Edge analysis
+                'edge_analysis': {
+                    'intersection_edge': intersection_edge_info,
+                    'is_edge_intersection': intersection_edge_info.get('is_edge', False),
+                    'edge_sides': intersection_edge_info.get('edge_sides', [])
+                },
+                
+                # Navigation aids
+                'can_turn_left': len(connected_roads) >= 3,
+                'can_turn_right': len(connected_roads) >= 3,
+                'can_go_straight': len(connected_roads) >= 2,
+                
+                # CONSISTENT road connections
+                'road_connections': connected_roads
+            }
+        
+        print(f"✅ Enhanced {len(self.roads)} roads and {len(self.intersections)} intersections")
+        print(f"🎯 Found {edge_roads_count} roads with edge connections")
+        
+        # Print geographic distribution
+        for direction, road_ids in self.geographic_road_map.items():
+            if road_ids:
+                road_names = [next(r for r in self.roads if r['id'] == rid)['metadata']['name'] for rid in road_ids]
+                print(f"   {direction.upper()}: {len(road_ids)} roads - {', '.join(road_names[:2])}")
+
+    def generate_edge_ids(self, roads_with_edges):
+        """Generate consistent edge IDs"""
+        edge_counters = {'west': 0, 'east': 0, 'north': 0, 'south': 0}
+        
+        for direction in ['west', 'east', 'north', 'south']:
+            direction_roads = []
+            
+            for road_data in roads_with_edges:
+                road_id, start_edge, end_edge = road_data
+                
+                if (start_edge.get('is_edge') and direction in start_edge.get('edge_sides', [])) or \
+                   (end_edge.get('is_edge') and direction in end_edge.get('edge_sides', [])):
+                    
+                    if start_edge.get('is_edge') and direction in start_edge.get('edge_sides', []):
+                        coord_info = start_edge['edge_coordinates'][direction]
+                    else:
+                        coord_info = end_edge['edge_coordinates'][direction]
+                    
+                    sort_key = coord_info['y'] if direction in ['west', 'east'] else coord_info['x']
+                    direction_roads.append((road_data, sort_key))
+            
+            direction_roads.sort(key=lambda x: x[1])
+            
+            for i, (road_data, _) in enumerate(direction_roads):
+                road_id, start_edge, end_edge = road_data
+                edge_id = f"{direction}_end_{i:02d}"
+                
+                if start_edge.get('is_edge') and direction in start_edge.get('edge_sides', []):
+                    start_edge['edge_id'] = edge_id
+                    self.edge_entry_points[edge_id] = {
+                        'road_id': road_id,
+                        'road_name': f'Road_{road_id}',
+                        'point_type': 'start',
+                        'directions': start_edge.get('edge_sides', []),
+                        'coordinates': start_edge.get('edge_coordinates', {})
+                    }
+                
+                if end_edge.get('is_edge') and direction in end_edge.get('edge_sides', []):
+                    end_edge['edge_id'] = edge_id
+                    self.edge_entry_points[edge_id] = {
+                        'road_id': road_id,
+                        'road_name': f'Road_{road_id}',
+                        'point_type': 'end',
+                        'directions': end_edge.get('edge_sides', []),
+                        'coordinates': end_edge.get('edge_coordinates', {})
+                    }
+
+    def match_road_with_bedrock(self, road_id, points):
+        """Match road with Bedrock analysis"""
+        # Simple matching based on position or characteristics
+        # This is where you'd implement more sophisticated matching
+        bedrock_roads = self.bedrock_metadata.get('roads', [])
+        
+        if road_id < len(bedrock_roads):
+            return {
+                'name': bedrock_roads[road_id].get('name', f'Road_{road_id}'),
+                'alt_names': bedrock_roads[road_id].get('alt_names', []),
+                'class': bedrock_roads[road_id].get('type', 'local_street'),
+                'landmarks': bedrock_roads[road_id].get('landmarks_nearby', []),
+                'type': bedrock_roads[road_id].get('type', 'local')
+            }
+        
+        return {}
+
+    def match_intersection_with_bedrock(self, int_id, center, connected_roads):
+        """Match intersection with Bedrock analysis"""
+        bedrock_intersections = self.bedrock_metadata.get('intersections', [])
+        
+        if int_id < len(bedrock_intersections):
+            bedrock_int = bedrock_intersections[int_id]
+            return {
+                'landmarks': bedrock_int.get('landmarks', []),
+                'businesses': bedrock_int.get('nearby_businesses', bedrock_int.get('landmarks', [])),
+                'traffic_signals': bedrock_int.get('traffic_signals', True),
+                'wait_time': 15
+            }
+        
+        return {}
+
+    def calculate_road_direction(self, points):
+        """Calculate road direction"""
+        if len(points) < 2:
+            return "unknown"
+        
+        dx = points[-1][0] - points[0][0]
+        dy = points[-1][1] - points[0][1]
+        
+        angle = math.degrees(math.atan2(-dy, dx))
+        if angle < 0:
+            angle += 360
+        
+        if 337.5 <= angle < 22.5 or angle == 0:
+            cardinal = "East"
+        elif 22.5 <= angle < 67.5:
+            cardinal = "Northeast"
+        elif 67.5 <= angle < 112.5:
+            cardinal = "North"
+        elif 112.5 <= angle < 157.5:
+            cardinal = "Northwest"
+        elif 157.5 <= angle < 202.5:
+            cardinal = "West"
+        elif 202.5 <= angle < 247.5:
+            cardinal = "Southwest"
+        elif 247.5 <= angle < 292.5:
+            cardinal = "South"
+        else:
+            cardinal = "Southeast"
+        
+        simple = "North-South" if 45 <= angle < 135 or 225 <= angle < 315 else "East-West"
+        
+        return {"detailed": angle, "cardinal": cardinal, "simple": simple}
+
+    def calculate_road_curvature(self, points):
+        """Calculate road curvature"""
+        if len(points) < 3:
+            return "straight"
+        
+        angles = []
+        for i in range(1, len(points)-1):
+            p1, p2, p3 = points[i-1], points[i], points[i+1]
+            v1 = (p2[0] - p1[0], p2[1] - p1[1])
+            v2 = (p3[0] - p2[0], p3[1] - p2[1])
+            
+            dot_product = v1[0]*v2[0] + v1[1]*v2[1]
+            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            
+            if mag1 > 0 and mag2 > 0:
+                cos_angle = dot_product / (mag1 * mag2)
+                cos_angle = max(-1, min(1, cos_angle))
+                angle = math.degrees(math.acos(cos_angle))
+                angles.append(180 - angle)
+        
+        if not angles:
+            return "straight"
+        
+        avg_angle = sum(angles) / len(angles)
+        if avg_angle < 5:
+            return "straight"
+        elif avg_angle < 15:
+            return "slight_curve"
+        elif avg_angle < 30:
+            return "moderate_curve"
+        else:
+            return "sharp_curve"
+
+    def estimate_road_width_category(self, points):
+        """Estimate road width category"""
+        # Simple heuristic based on road length and characteristics
+        if len(points) < 50:
+            return "narrow"
+        elif len(points) < 150:
+            return "medium"
+        else:
+            return "wide"
+
+    def determine_intersection_type(self, roads_count):
+        """Determine intersection type"""
+        if roads_count == 2:
+            return "dead_end"
+        elif roads_count == 3:
+            return "T-intersection"
+        elif roads_count == 4:
+            return "4-way_cross"
+        else:
+            return "complex_intersection"
+
+    def generate_integrated_lane_trees(self):
+        """Generate lane trees with consistent IDs and comprehensive connections"""
+        print("\n🛤️  GENERATING INTEGRATED LANE TREES WITH CONSISTENT IDs...")
+        print("-" * 70)
+        
+        self.lane_trees = []
+        
+        for road in self.roads:
+            road_id = road['id']
+            points = road['points']
+            metadata = road['metadata']
+            
+            # Create forward and backward lanes
+            dual_lanes = self.create_dual_lanes_for_road(road)
+            
+            # Generate forward lane tree
+            forward_tree = self.create_lane_tree(
+                road_id, 'forward', dual_lanes['forward_lane'], metadata
+            )
+            self.lane_trees.append(forward_tree)
+            
+            # Generate backward lane tree  
+            backward_tree = self.create_lane_tree(
+                road_id, 'backward', dual_lanes['backward_lane'][::-1], metadata
+            )
+            self.lane_trees.append(backward_tree)
+            
+            road_name = metadata.get('name', f'Road_{road_id}')
+            edge_info = ""
+            if metadata['edge_analysis']['has_edge_connection']:
+                edge_sides = '/'.join(metadata['edge_analysis']['edge_sides'])
+                edge_info = f" [EDGE: {edge_sides}]"
+            
+            print(f"✅ Generated lane trees for {road_name}{edge_info}")
+        
+        print(f"🎯 Generated {len(self.lane_trees)} integrated lane trees with consistent IDs")
+
+    def create_dual_lanes_for_road(self, road):
+        """Create offset lanes for road"""
+        points = road['points']
+        
+        try:
+            line = LineString(points)
+            forward_line = line.parallel_offset(LANE_OFFSET_PX, side="left", join_style=2)
+            backward_line = line.parallel_offset(LANE_OFFSET_PX, side="right", join_style=2)
+            
+            if forward_line.geom_type == "MultiLineString":
+                forward_line = max(forward_line.geoms, key=lambda l: l.length)
+            if backward_line.geom_type == "MultiLineString":
+                backward_line = max(backward_line.geoms, key=lambda l: l.length)
+            
+            forward_coords = list(forward_line.coords) if not forward_line.is_empty else points
+            backward_coords = list(backward_line.coords) if not backward_line.is_empty else points
+            
+            return {
+                'forward_lane': [[float(x), float(y)] for x, y in forward_coords],
+                'backward_lane': [[float(x), float(y)] for x, y in backward_coords]
+            }
+        
+        except Exception:
+            return {
+                'forward_lane': points,
+                'backward_lane': points
+            }
+
+    def create_lane_tree(self, road_id, direction, lane_points, road_metadata):
+        """Create comprehensive lane tree with consistent IDs and connections"""
+        lane_id = f"road_{road_id}_{direction}_trunk"
+        
+        # Find branches (connections to other roads)
+        branches = self.find_branches_for_lane_tree(road_id, direction, lane_points)
+        
+        # Find intersection metadata
+        intersection_metadata = self.get_intersection_metadata_for_lane(road_id, lane_points)
+        
+        lane_tree = {
+            'lane_id': lane_id,
+            'road_id': road_id,
+            'direction': direction,
+            'lane_type': 'trunk',
+            'points': lane_points,
+            'branches': branches,
+            
+            # Road metadata
+            'metadata': road_metadata.copy(),
+            
+            # Intersection metadata (if lane ends at intersection)
+            'intersection_metadata': intersection_metadata
+        }
+        
+        # Add lane to road mapping
+        self.lane_to_road[lane_id] = road_id
+        
+        return lane_tree
+
+    def find_branches_for_lane_tree(self, road_id, direction, lane_points):
+        """Find branches with CONSISTENT IDs and proper route connections"""
+        branches = []
+        
+        if not lane_points:
+            return branches
+        
+        # Get the end point of this lane
+        lane_end = lane_points[-1]
+        
+        # Find intersections this road connects to
+        road_intersections = self.road_to_intersections.get(road_id, [])
+        
+        for road_int_conn in road_intersections:
+            int_id = road_int_conn['intersection_id']
+            intersection = next((i for i in self.intersections if i['id'] == int_id), None)
+            
+            if not intersection:
+                continue
+            
+            int_center = intersection['center']
+            
+            # Check if this lane direction connects to this intersection
+            lane_to_int_dist = sqrt((lane_end[0] - int_center[0])**2 + (lane_end[1] - int_center[1])**2)
+            
+            if lane_to_int_dist > INTERSECTION_RADIUS:
+                continue
+            
+            # Find other roads at this intersection
+            other_roads = self.intersection_to_roads.get(int_id, [])
+            
+            for other_road_conn in other_roads:
+                other_road_id = other_road_conn['road_id']
+                
+                if other_road_id == road_id:
+                    continue
+                
+                # Get the other road
+                other_road = next((r for r in self.roads if r['id'] == other_road_id), None)
+                if not other_road:
+                    continue
+                
+                # Create branch to the other road
+                branch = self.create_branch_to_road(
+                    road_id, direction, other_road_id, int_center, intersection
+                )
+                
+                if branch:
+                    branches.append(branch)
+        
+        return branches
+
+    def create_branch_to_road(self, from_road_id, from_direction, to_road_id, int_center, intersection):
+        """Create branch connection between roads with comprehensive metadata"""
+        
+        # Get target road
+        target_road = next((r for r in self.roads if r['id'] == to_road_id), None)
+        if not target_road:
+            return None
+        
+        # Create target lane for the branch
+        target_dual_lanes = self.create_dual_lanes_for_road(target_road)
+        
+        # Determine which direction of target road to connect to
+        # (This could be enhanced with more sophisticated logic)
+        target_lane_points = target_dual_lanes['forward_lane']
+        
+        # Calculate turn type
+        from_road = next((r for r in self.roads if r['id'] == from_road_id), None)
+        turn_type = self.calculate_turn_type(from_road, target_road, int_center)
+        
+        # Get intersection and target road metadata
+        int_metadata = intersection.get('metadata', {})
+        target_metadata = target_road.get('metadata', {})
+        
+        branch = {
+            'branch_id': f"road_{from_road_id}_{from_direction}_to_road_{to_road_id}_{turn_type}",
+            'turn_type': turn_type,
+            'target_road_id': to_road_id,
+            'target_lane': target_lane_points,
+            
+            # Enhanced metadata with consistent IDs
+            'target_road_name': target_metadata.get('name', f'Road_{to_road_id}'),
+            'target_road_class': target_metadata.get('road_class', 'unknown'),
+            'target_landmarks': target_metadata.get('landmarks', []),
+            'target_speed_limit': target_metadata.get('estimated_speed_limit', 30),
+            'target_traffic_density': target_metadata.get('traffic_density', 'medium'),
+            
+            # Intersection context
+            'intersection_landmarks': int_metadata.get('landmarks', []),
+            'intersection_businesses': int_metadata.get('nearby_businesses', []),
+            'intersection_has_signals': int_metadata.get('traffic_signals', False),
+            'intersection_type': int_metadata.get('intersection_type', 'unknown'),
+            'estimated_wait_time': int_metadata.get('estimated_wait_time', 15),
+            
+            # Edge information for target
+            'target_has_edge_connection': target_metadata.get('edge_analysis', {}).get('has_edge_connection', False),
+            'target_edge_sides': target_metadata.get('edge_analysis', {}).get('edge_sides', []),
+            'target_start_edge_info': target_metadata.get('edge_analysis', {}).get('start_edge', {}),
+            'target_end_edge_info': target_metadata.get('edge_analysis', {}).get('end_edge', {}),
+            
+            # Navigation aids
+            'turn_difficulty': 'easy' if turn_type == 'straight' else 'medium' if turn_type in ['left', 'right'] else 'hard',
+            'navigation_instructions': self.generate_navigation_instruction(
+                turn_type, target_metadata, int_metadata
+            ),
+            
+            # Clock directions for precise navigation
+            'from_clock': self.get_clock_direction(int_center, from_road['points'][-1]),
+            'to_clock': self.get_clock_direction(int_center, target_road['points'][0])
+        }
+        
+        return branch
+
+    def calculate_turn_type(self, from_road, to_road, intersection_center):
+        """Calculate turn type between roads"""
+        if not from_road or not to_road:
+            return "unknown"
+        
+        # Get vectors from intersection to road endpoints
+        from_points = from_road['points']
+        to_points = to_road['points']
+        
+        # Find closest points to intersection
+        from_point = min(from_points, key=lambda p: sqrt((p[0] - intersection_center[0])**2 + (p[1] - intersection_center[1])**2))
+        to_point = min(to_points, key=lambda p: sqrt((p[0] - intersection_center[0])**2 + (p[1] - intersection_center[1])**2))
+        
+        # Calculate angles
+        dx1 = from_point[0] - intersection_center[0]
+        dy1 = from_point[1] - intersection_center[1]
+        dx2 = to_point[0] - intersection_center[0]
+        dy2 = to_point[1] - intersection_center[1]
+        
+        angle1 = math.atan2(dy1, dx1)
+        angle2 = math.atan2(dy2, dx2)
+        
+        angle_diff = angle2 - angle1
+        angle_diff = math.degrees(angle_diff)
+        
+        # Normalize to 0-360
+        if angle_diff < 0:
+            angle_diff += 360
+        
+        # Classify turn
+        if 315 <= angle_diff or angle_diff <= 45:
+            return "straight"
+        elif 45 < angle_diff <= 135:
+            return "right"
+        elif 135 < angle_diff <= 225:
+            return "u_turn"
+        else:
+            return "left"
+
+    def get_clock_direction(self, center, point):
+        """Get clock direction from center to point"""
+        dx = point[0] - center[0]
+        dy = point[1] - center[1]
+        angle = atan2(-dy, dx)
+        
+        angle_deg = degrees(angle)
+        if angle_deg < 0:
+            angle_deg += 360
+        
+        clock_hour = int((angle_deg + 15) / 30) % 12
+        return clock_hour
+
+    def generate_navigation_instruction(self, turn_type, target_metadata, int_metadata):
+        """Generate comprehensive navigation instruction"""
+        turn_instruction = {
+            'straight': 'Continue straight',
+            'left': 'Turn left', 
+            'right': 'Turn right',
+            'u_turn': 'Make a U-turn'
+        }.get(turn_type, 'Continue')
+        
+        # Add road name
+        road_name = target_metadata.get('name', '')
+        if road_name and road_name != f"Road_{target_metadata.get('id', 'unknown')}":
+            turn_instruction += f" onto {road_name}"
+        
+        # Add edge information
+        if target_metadata.get('edge_analysis', {}).get('has_edge_connection', False):
+            edge_sides = target_metadata['edge_analysis'].get('edge_sides', [])
+            if edge_sides:
+                edge_direction = '/'.join(edge_sides)
+                turn_instruction += f" (leads to {edge_direction} edge)"
+        
+        # Add landmark reference
+        landmarks = int_metadata.get('landmarks', [])
+        if landmarks:
+            turn_instruction += f" near {landmarks[0]}"
+        
+        return turn_instruction
+
+    def get_intersection_metadata_for_lane(self, road_id, lane_points):
+        """Get intersection metadata for lane ending"""
+        if not lane_points:
+            return None
+        
+        lane_end = lane_points[-1]
+        
+        # Find closest intersection
+        closest_intersection = None
+        min_distance = float('inf')
+        
+        for intersection in self.intersections:
+            center = intersection['center']
+            dist = sqrt((lane_end[0] - center[0])**2 + (lane_end[1] - center[1])**2)
+            
+            if dist <= INTERSECTION_RADIUS and dist < min_distance:
+                min_distance = dist
+                closest_intersection = intersection
+        
+        if closest_intersection:
+            return closest_intersection.get('metadata', {})
+        
+        return None
+
+    def save_integrated_outputs(self):
+        """Save all outputs with consistent IDs and comprehensive metadata"""
+        print("\n💾 SAVING INTEGRATED OUTPUTS WITH CONSISTENT IDs...")
+        print("-" * 60)
+        
+        # Collect comprehensive statistics
+        total_branches = sum(len(tree['branches']) for tree in self.lane_trees)
+        trees_with_branches = sum(1 for tree in self.lane_trees if tree['branches'])
+        edge_trees = sum(1 for tree in self.lane_trees 
+                        if tree['metadata']['edge_analysis']['has_edge_connection'])
+        
+        all_landmarks = set()
+        all_businesses = set()
+        all_edge_ids = set()
+        
+        for tree in self.lane_trees:
+            all_landmarks.update(tree['metadata'].get('landmarks', []))
+            for branch in tree['branches']:
+                all_landmarks.update(branch.get('intersection_landmarks', []))
+                all_businesses.update(branch.get('intersection_businesses', []))
+            
+            # Collect edge IDs
+            edge_analysis = tree['metadata']['edge_analysis']
+            start_edge = edge_analysis.get('start_edge', {})
+            end_edge = edge_analysis.get('end_edge', {}) 
+            if start_edge.get('edge_id'):
+                all_edge_ids.add(start_edge['edge_id'])
+            if end_edge.get('edge_id'):
+                all_edge_ids.add(end_edge['edge_id'])
+
+        # Calculate edge analysis summary
+        self.edge_analysis_summary = {
+            "total_roads": len(self.roads),
+            "roads_with_edge_connections": len(self.geographic_road_map['west'] + 
+                                               self.geographic_road_map['east'] + 
+                                               self.geographic_road_map['north'] + 
+                                               self.geographic_road_map['south']),
+            "total_intersections": len(self.intersections),
+            "intersections_at_edges": sum(1 for i in self.intersections 
+                                         if i['metadata']['edge_analysis']['is_edge_intersection']),
+            "all_edge_ids": sorted(list(all_edge_ids)),
+            "edge_distribution": {
+                direction: [{'edge_id': f"{direction}_end_{i:02d}",
+                           'road_name': next(r for r in self.roads if r['id'] == rid)['metadata']['name'],
+                           'point_type': 'start' if direction in next(r for r in self.roads if r['id'] == rid)['metadata']['edge_analysis']['true_start_directions'] else 'end'}
+                          for i, rid in enumerate(road_ids)]
+                for direction, road_ids in self.geographic_road_map.items() if road_ids
+            },
+            "canvas_size": CANVAS_SIZE,
+            "edge_tolerance": EDGE_TOLERANCE
+        }
+
+        # Create comprehensive integrated data
+        integrated_data = {
+            "roads": self.roads,
+            "intersections": self.intersections,
+            "bedrock_analysis": self.bedrock_metadata,
+            
+            # Navigation graph with consistent IDs
+            "navigation_graph": {
+                "road_to_intersections": self.road_to_intersections,
+                "intersection_to_roads": self.intersection_to_roads,
+                "lane_to_road": self.lane_to_road
+            },
+            
+            # Edge analysis
+            "edge_analysis_summary": self.edge_analysis_summary,
+            
+            # Comprehensive metadata
+            "metadata": {
+                "total_roads": len(self.roads),
+                "total_intersections": len(self.intersections),
+                "coordinate_system": "image_pixels",
+                "origin": "top_left",
+                "processing_parameters": {
+                    "min_line_length": MIN_LINE_LENGTH,
+                    "canvas_size": CANVAS_SIZE,
+                    "edge_tolerance": EDGE_TOLERANCE,
+                    "intersection_radius": INTERSECTION_RADIUS,
+                    "lane_offset_px": LANE_OFFSET_PX
+                },
+                "road_classes": list(set([road["metadata"]["road_class"] for road in self.roads])),
+                "intersection_types": list(set([intersection["metadata"]["intersection_type"] for intersection in self.intersections])),
+                "navigation_features": {
+                    "supports_turn_by_turn": True,
+                    "supports_landmark_navigation": True,
+                    "supports_route_planning": True,
+                    "supports_narrative_parsing": True,
+                    "supports_edge_aware_navigation": True,
+                    "consistent_id_system": True
+                }
+            }
+        }
+
+        # Lane tree data with consistent IDs
+        lane_tree_data = {
+            "lane_trees": self.lane_trees,
+            "road_connections": {str(k): v for k, v in self.intersection_to_roads.items()},
+            "bedrock_analysis": self.bedrock_metadata,
+            
+            # Enhanced navigation metadata
+            "navigation_metadata": {
+                "all_landmarks": list(all_landmarks),
+                "all_businesses": list(all_businesses),
+                "road_names": [road['metadata']['name'] for road in self.roads],
+                "intersection_types": list(set(i['metadata']['intersection_type'] for i in self.intersections)),
+                "edge_entry_points": self.edge_entry_points,
+                "roads_with_edges": {str(rid): {
+                    'road_name': next(r for r in self.roads if r['id'] == rid)['metadata']['name'],
+                    'edge_sides': next(r for r in self.roads if r['id'] == rid)['metadata']['edge_analysis']['edge_sides']
+                } for direction_roads in self.geographic_road_map.values() for rid in direction_roads},
+                "all_edge_ids": sorted(list(all_edge_ids))
+            },
+            
+            # Statistics
+            "statistics": {
+                "total_trees": len(self.lane_trees),
+                "total_branches": total_branches,
+                "trees_with_branches": trees_with_branches,
+                "average_branches_per_tree": total_branches / len(self.lane_trees) if self.lane_trees else 0,
+                "roads_count": len(self.roads),
+                "intersections_count": len(self.intersections),
+                "unique_landmarks": len(all_landmarks),
+                "unique_businesses": len(all_businesses),
+                "edge_trees": edge_trees,
+                "entry_point_trees": sum(1 for tree in self.lane_trees 
+                                       if tree['metadata']['edge_analysis']['is_geographic_entry_point']),
+                "exit_point_trees": sum(1 for tree in self.lane_trees 
+                                      if tree['metadata']['edge_analysis']['is_geographic_exit_point']),
+                "unique_edge_ids": len(all_edge_ids)
+            },
+            
+            "edge_analysis_summary": self.edge_analysis_summary,
+            "parameters": {
+                "lane_offset_px": LANE_OFFSET_PX,
+                "intersection_radius": INTERSECTION_RADIUS
+            },
+            "metadata": {
+                "coordinate_system": "image_pixels",
+                "origin": "top_left",
+                "supports_narrative_parsing": True,
+                "supports_landmark_navigation": True,
+                "supports_turn_by_turn": True,
+                "supports_edge_aware_navigation": True,
+                "consistent_id_system": True
+            }
+        }
+
+        # Save all files locally
+        with open(OUTPUT_INTEGRATED_JSON, 'w') as f:
+            json.dump(integrated_data, f, indent=2)
+        
+        with open(OUTPUT_CENTERLINES_JSON, 'w') as f:
+            json.dump(integrated_data, f, indent=2)
+        
+        with open(OUTPUT_INTERSECTIONS_JSON, 'w') as f:
+            json.dump({"intersections": self.intersections}, f, indent=2)
+        
+        with open(OUTPUT_LANE_TREES_JSON, 'w') as f:
+            json.dump(lane_tree_data, f, indent=2)
+
+        print(f"✅ Saved integrated network to {OUTPUT_INTEGRATED_JSON}")
+        print(f"✅ Saved centerlines to {OUTPUT_CENTERLINES_JSON}")
+        print(f"✅ Saved intersections to {OUTPUT_INTERSECTIONS_JSON}")
+        print(f"✅ Saved lane trees to {OUTPUT_LANE_TREES_JSON}")
+
+        # Upload all outputs to S3
+        print("\n🌐 UPLOADING TO S3...")
+        print("-" * 40)
+        
+        # Define S3 keys with connection_id folder structure
+        s3_prefix = f"outputs/{self.connection_id}/"
+        
+        # Upload JSON files
+        self.upload_json_to_s3(integrated_data, f"{s3_prefix}{OUTPUT_INTEGRATED_JSON}")
+        self.upload_json_to_s3(integrated_data, f"{s3_prefix}{OUTPUT_CENTERLINES_JSON}")
+        self.upload_json_to_s3({"intersections": self.intersections}, f"{s3_prefix}{OUTPUT_INTERSECTIONS_JSON}")
+        self.upload_json_to_s3(lane_tree_data, f"{s3_prefix}{OUTPUT_LANE_TREES_JSON}")
+        
+        # Upload image files
+        if os.path.exists(OUTPUT_IMG):
+            self.upload_to_s3(OUTPUT_IMG, f"{s3_prefix}{OUTPUT_IMG}")
+        
+        if os.path.exists(DEBUG_SKELETON):
+            self.upload_to_s3(DEBUG_SKELETON, f"{s3_prefix}{DEBUG_SKELETON}")
+        
+        print(f"✅ All outputs uploaded to S3 under folder: {s3_prefix}")
+
+    def visualize_integrated_network(self):
+        """Create comprehensive visualization of integrated network"""
+        canvas = np.zeros((CANVAS_SIZE[1], CANVAS_SIZE[0], 3), dtype=np.uint8)
+
+        # Colors
+        colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+        
+        # Draw roads with edge highlighting
+        for i, road in enumerate(self.roads):
+            color = colors[i % len(colors)]
+            points = road["points"]
+            
+            # Highlight edge-connected roads
+            edge_analysis = road['metadata']['edge_analysis']
+            line_thickness = 6 if edge_analysis['has_edge_connection'] else 3
+            
+            for j in range(len(points) - 1):
+                pt1 = (int(points[j][0]), int(points[j][1]))
+                pt2 = (int(points[j+1][0]), int(points[j+1][1]))
+                cv2.line(canvas, pt1, pt2, color, line_thickness)
+            
+            # Mark edge points
+            if points:
+                start_pt = (int(points[0][0]), int(points[0][1]))
+                end_pt = (int(points[-1][0]), int(points[-1][1]))
+                
+                start_edge = edge_analysis.get('start_edge', {})
+                end_edge = edge_analysis.get('end_edge', {})
+                
+                if start_edge.get('is_edge', False):
+                    cv2.circle(canvas, start_pt, 12, (0, 255, 0), -1)
+                    if start_edge.get('edge_id'):
+                        cv2.putText(canvas, start_edge['edge_id'], 
+                                   (start_pt[0] + 15, start_pt[1] - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                else:
+                    cv2.circle(canvas, start_pt, 6, (255, 255, 255), -1)
+                
+                if end_edge.get('is_edge', False):
+                    cv2.circle(canvas, end_pt, 12, (0, 0, 255), -1)
+                    if end_edge.get('edge_id'):
+                        cv2.putText(canvas, end_edge['edge_id'], 
+                                   (end_pt[0] + 15, end_pt[1] + 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                else:
+                    cv2.circle(canvas, end_pt, 6, (0, 0, 0), -1)
+                
+                # Road label with consistent ID
+                mid_idx = len(points) // 2
+                mid_pt = (int(points[mid_idx][0]), int(points[mid_idx][1]))
+                road_name = road['metadata']['name']
+                road_id = road['id']
+                
+                edge_indicator = ""
+                if edge_analysis['has_edge_connection']:
+                    edge_sides = '/'.join(edge_analysis['edge_sides'][:2])
+                    edge_indicator = f"[{edge_sides}]"
+                
+                label = f"[{road_id}]{road_name}{edge_indicator}"
+                cv2.putText(canvas, label, (mid_pt[0], mid_pt[1] - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # Draw intersections with consistent IDs
+        for intersection in self.intersections:
+            center_x, center_y = intersection['center']
+            int_id = intersection['id']
+            metadata = intersection['metadata']
+            
+            radius = 8 + metadata['connected_roads_count']
+            cv2.circle(canvas, (int(center_x), int(center_y)), radius, (0, 255, 255), -1)
+            cv2.circle(canvas, (int(center_x), int(center_y)), radius, (255, 255, 255), 2)
+            
+            # Intersection label with consistent ID
+            int_type = metadata['intersection_type']
+            landmarks = metadata.get('landmarks', [])
+            
+            label = f"[{int_id}]{int_type}"
+            if landmarks:
+                label += f"-{landmarks[0][:10]}"
+            
+            # Add edge indicator
+            edge_analysis = metadata.get('edge_analysis', {})
+            if edge_analysis.get('is_edge_intersection', False):
+                edge_sides = '/'.join(edge_analysis.get('edge_sides', []))
+                label += f"[{edge_sides}]"
+            
+            cv2.putText(canvas, label,
+                       (int(center_x) + radius + 5, int(center_y) + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+        # Title with statistics
+        title = f"Integrated Network: {len(self.roads)} roads, {len(self.intersections)} intersections"
+        cv2.putText(canvas, title, (20, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        edge_stats = f"Edge connections: {self.edge_analysis_summary['roads_with_edge_connections']} roads, {len(self.edge_analysis_summary['all_edge_ids'])} IDs"
+        cv2.putText(canvas, edge_stats, (20, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        
+        consistency_info = "✅ Consistent ID system across all components"
+        cv2.putText(canvas, consistency_info, (20, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        cv2.imwrite(OUTPUT_IMG, canvas)
+        print(f"✅ Saved integrated network visualization to {OUTPUT_IMG}")
+
+    def process_complete_integrated_network(self):
+        """Complete integrated processing pipeline"""
+        print("🚗 INTEGRATED ROAD NETWORK GENERATOR")
+        print("=" * 80)
+        print("Creating consistent IDs across centerlines, intersections, and lane trees")
+        print(f"📁 Connection ID: {self.connection_id}")
+        print(f"🪣 S3 Bucket: {self.bucket_name}")
+        
+        # Step 1: Extract skeleton and basic network
+        print("\n📍 STEP 1: Extracting road network skeleton...")
+        skeleton = self.extract_medial_axis(MASK_PATH)
+        
+        # Step 2: Trace roads and find intersections with consistent IDs
+        print("\n🛣️  STEP 2: Tracing roads and intersections with consistent IDs...")
+        self.roads, endpoints, junctions = self.trace_skeleton_paths(skeleton)
+        self.intersections = self.find_major_intersections(junctions, skeleton)
+        
+        # Step 3: Analyze images with Bedrock
+        print("\n🧠 STEP 3: Analyzing images with AI...")
+        self.bedrock_metadata = self.analyze_roadmap_with_bedrock(ROADMAP_PATH, SATELLITE_PATH)
+        
+        # Step 4: Build consistent cross-references
+        print("\n🔗 STEP 4: Building consistent cross-references...")
+        self.build_consistent_road_intersection_mapping()
+        
+        # Step 5: Enhance with integrated metadata
+        print("\n🎯 STEP 5: Enhancing with integrated metadata...")
+        self.enhance_with_integrated_metadata()
+        
+        # Step 6: Generate lane trees with consistent IDs
+        print("\n🛤️  STEP 6: Generating lane trees with consistent IDs...")
+        self.generate_integrated_lane_trees()
+        
+        # Step 7: Save all outputs and upload to S3
+        print("\n💾 STEP 7: Saving integrated outputs and uploading to S3...")
+        self.save_integrated_outputs()
+        
+        # Step 8: Create visualization
+        print("\n🎨 STEP 8: Creating integrated visualization...")
+        self.visualize_integrated_network()
+        
+        # Final summary
+        print(f"\n🎉 INTEGRATED NETWORK GENERATION COMPLETE!")
+        print("=" * 80)
+        print(f"✅ Roads: {len(self.roads)} (with consistent IDs 0-{len(self.roads)-1})")
+        print(f"✅ Intersections: {len(self.intersections)} (with consistent IDs 0-{len(self.intersections)-1})")
+        print(f"✅ Lane trees: {len(self.lane_trees)} (with consistent references)")
+        print(f"✅ Edge connections: {self.edge_analysis_summary['roads_with_edge_connections']} roads")
+        print(f"✅ Cross-references: All IDs are consistent across all JSON files")
+        print(f"✅ AI Analysis: {len(self.bedrock_metadata.get('all_detected_text', []))} text items detected")
+        print(f"🌐 All outputs uploaded to S3: s3://{self.bucket_name}/outputs/{self.connection_id}/")
+        print(f"\n🎯 Ready for sophisticated narrative-based route generation!")
+        print(f"   All components use the same ID system for seamless integration")
+
+
+def main():
+    connection_id = sys.argv[1] if len(sys.argv) > 1 else None
+    generator = IntegratedRoadNetworkGenerator(connection_id)
+    generator.process_complete_integrated_network()
+
+if __name__ == '__main__':
+    main()

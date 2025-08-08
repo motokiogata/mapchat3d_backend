@@ -10,6 +10,73 @@ Globals:
 
 Resources:
 
+  ProcessRoadmapFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-process-roadmap"
+      Handler: process_roadmap.lambda_handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 512
+      CodeUri: process_roadmap/
+      Policies:
+        - AmazonECS_FullAccess
+        - AmazonS3ReadOnlyAccess  # 任意：入力をS3から読むなら
+        - AWSLambdaBasicExecutionRole
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref FargateCluster
+          TASK_DEF: !Ref FargateTaskDefinition
+          SUBNET_ID: !Select [0, !Ref PrivateSubnetIds]
+          SECURITY_GROUP: !Ref FargateSecurityGroup
+
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+
+  FargateTaskDefinition:
+  Type: AWS::ECS::TaskDefinition
+  Properties:
+    RequiresCompatibilities:
+      - FARGATE
+    Cpu: "1024"
+    Memory: "2048"
+    NetworkMode: awsvpc
+    ExecutionRoleArn: !GetAtt FargateExecutionRole.Arn
+    ContainerDefinitions:
+      - Name: field-generator
+        Image: 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/field-generator:latest
+        EntryPoint: ["python", "docker-entrypoint.py"]
+        Command: ["Ref::container_argument"]
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref LogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: fargate
+ 
+  FargateExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: FargateFieldGenAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${FieldGenOutputBucket.Arn}/*"
+
   # S3 Bucket for storing CSV files
   CsvFilesBucket:
     Type: AWS::S3::Bucket
@@ -22,6 +89,19 @@ Resources:
         RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
+
+  # S3 Bucket for storing field generation output
+  FieldGenOutputBucket:
+  Type: AWS::S3::Bucket
+  Properties:
+    BucketName: !Sub "${AWS::StackName}-field-output-${AWS::AccountId}"
+    PublicAccessBlockConfiguration:
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
+    VersioningConfiguration:
+      Status: Enabled
 
   # S3 Bucket for storing embeddings
   EmbeddingsBucket:
@@ -89,7 +169,8 @@ Resources:
               - s3:PutObjectAcl
             Resource: !Sub "${EmbeddingsBucket.Arn}/*"
 
-  #Generate the field SVG from lng/lat coordinates involking google maps API
+  # Generate the field SVG from lng/lat coordinates invoking google maps API
+  # UPDATED: Your existing function with added permissions
   GenerateFieldSvgFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -101,44 +182,26 @@ Resources:
       Timeout: 30
       Environment:
         Variables:
-          GOOGLE_MAPS_API_KEY: "REPLACE_ME"
-      Policies:
-        - AWSLambdaBasicExecutionRole
+          GOOGLE_MAPS_API_KEY: "AIzaSyBgynW3uwnrvXopTghrP10Nht2B-s2WoJ0"
+          PROCESS_ROADMAP_FUNCTION: !Sub "${AWS::StackName}-process-roadmap"
+          BUCKET_NAME: !Ref FieldGenOutputBucket
+      Events:
+        RestApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /generate-field
+            Method: POST
 
-  HttpApi:
-    Type: AWS::Serverless::HttpApi
-    Properties:
-      Name: FieldSvgHttpApi
-      CorsConfiguration:
-        AllowMethods: ["POST"]
-        AllowOrigins: ["*"]
-
-  HttpApiRoute:
+  RestApi:
     Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Name: FieldSvgApi
-      DefinitionBody:
-        openapi: 3.0.1
-        info:
-          title: Field SVG API
-          version: 1.0
-        paths:
-          /generate-field:
-            post:
-              x-amazon-apigateway-integration:
-                uri:
-                  Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateFieldSvgFunction.Arn}/invocations
-                httpMethod: POST
-                type: aws_proxy
-
-  GenerateFieldSvgPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt GenerateFieldSvgFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*/POST/generate-field
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
 
   # Custom resource that triggers the upload - simple, no timestamp needed
   UploadEmbeddingsResource:
@@ -261,6 +324,13 @@ Resources:
             Action:
               - lambda:InvokeFunction
             Resource: !GetAtt SimilaritySearchFunction.Arn
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
+              - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
 
   WebSocketConnectIntegration:
     Type: AWS::ApiGatewayV2::Integration
@@ -294,16 +364,20 @@ Resources:
       IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations"
       IntegrationMethod: POST
 
-
   Deployment:
     Type: AWS::ApiGatewayV2::Deployment
     DependsOn:
       - WebSocketConnectRoute
       - WebSocketDisconnectRoute
       - WebSocketSendMessageRoute
-      - WebSocketInitConversationRoute 
+      - WebSocketInitConversationRoute
+      - WebSocketConnectIntegration      # Add these
+      - WebSocketDisconnectIntegration   # Add these
+      - WebSocketSendMessageIntegration  # Add these
+      - WebSocketInitConversationIntegration  # Add this 
     Properties:
       ApiId: !Ref WebSocketApi
+      Description: !Sub "Deployment at {AWS::StackName}-{AWS::AccountId}"  # This forces new deployment
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
@@ -312,7 +386,7 @@ Resources:
       StageName: production
       DeploymentId: !Ref Deployment
       DefaultRouteSettings:
-        LoggingLevel: ERROR
+        LoggingLevel: INFO
         DataTraceEnabled: true
         DetailedMetricsEnabled: true
 
@@ -346,7 +420,7 @@ Resources:
       FunctionName: !GetAtt SendMessageFunction.Arn
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/production/initConversation
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*
 
 Outputs:
   WebSocketURL:
@@ -374,3 +448,13 @@ Outputs:
     Value: !Ref SimilaritySearchFunction
     Export:
       Name: !Sub "${AWS::StackName}-SimilarityFunction"
+
+  RestApiUrl:
+    Description: "REST API Gateway endpoint URL"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/generate-field"
+
+  FieldGenOutputBucketName:
+    Description: S3 Bucket for Fargate output artifacts (road masks, done.flag, etc)
+    Value: !Ref FieldGenOutputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-FieldGenOutputBucket"

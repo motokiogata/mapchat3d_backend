@@ -1,0 +1,7 @@
+opencv-python-headless
+numpy
+matplotlib
+scikit-image
+Pillow
+boto3
+shapely

@@ -8,13 +8,141 @@ Globals:
     Runtime: python3.11
     MemorySize: 256
 
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID to use for Fargate tasks
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID to use for Fargate tasks
+
 Resources:
+
+  ProcessRoadmapFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-process-roadmap"
+      Handler: process_roadmap.lambda_handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 512
+      CodeUri: process_roadmap/
+      Policies:
+        - AmazonECS_FullAccess
+        - AmazonS3ReadOnlyAccess
+        - AWSLambdaBasicExecutionRole
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref FargateCluster
+          TASK_DEF: !Ref FargateTaskDefinition
+          SUBNET_ID: !Ref SubnetId
+          SECURITY_GROUP: !Ref FargateSecurityGroup
+
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+
+  FargateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "1024"
+      Memory: "2048"
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt FargateExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn 
+      ContainerDefinitions:
+        - Name: field-generator
+          Image: 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/field-generator:latest
+          EntryPoint: ["python", "docker-entrypoint.py"]
+          Command: []
+          Environment:
+            - Name: BUCKET_NAME
+              Value: !Ref FieldGenOutputBucket
+            - Name: CONNECTION_ID
+              Value: "will-be-overridden-at-runtime"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: fargate
+ 
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${AWS::StackName}-field-generator"
+      RetentionInDays: 7
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Fargate task
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  #Container Argument Parameter
+  FargateExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"  # ✅ Objects need /*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"    # ✅ Bucket itself, no /*
 
   # S3 Bucket for storing CSV files
   CsvFilesBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "${AWS::StackName}-csv-files-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # S3 Bucket for storing field generation output
+  FieldGenOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-field-output-${AWS::AccountId}"
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -63,7 +191,7 @@ Resources:
           - Effect: Allow
             Action:
               - s3:GetObject
-            Resource: !Sub "${EmbeddingsBucket.Arn}/*"
+            Resource: !Sub "arn:aws:s3:::${EmbeddingsBucket}/*"
           - Effect: Allow
             Action:
               - bedrock:InvokeModel
@@ -87,7 +215,7 @@ Resources:
             Action:
               - s3:PutObject
               - s3:PutObjectAcl
-            Resource: !Sub "${EmbeddingsBucket.Arn}/*"
+            Resource: !Sub "arn:aws:s3:::${EmbeddingsBucket}/*"
 
   # Generate the field SVG from lng/lat coordinates invoking google maps API
   GenerateFieldSvgFunction:
@@ -98,17 +226,67 @@ Resources:
       Runtime: python3.11
       CodeUri: generate_svg/
       MemorySize: 256
-      Timeout: 30
+      Timeout: 120
       Environment:
         Variables:
           GOOGLE_MAPS_API_KEY: "AIzaSyBgynW3uwnrvXopTghrP10Nht2B-s2WoJ0"
+          PROCESS_ROADMAP_FUNCTION: !Sub "${AWS::StackName}-process-roadmap"
+          BUCKET_NAME: !Ref FieldGenOutputBucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt ProcessRoadmapFunction.Arn
       Events:
-        # ✅ Simple way - let SAM handle the integration
         RestApiEvent:
           Type: Api
           Properties:
             RestApiId: !Ref RestApi
             Path: /generate-field
+            Method: POST
+
+  # Function to check if processing is done (note: proper indentation)
+    # Function to check if processing is done (note: proper indentation)
+  CheckProcessingDoneFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-check-processing-done3"
+      Handler: lambda_handler.lambda_handler
+      CodeUri: check_processing/
+      Runtime: python3.11
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref FieldGenOutputBucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource:
+                - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /checkProcessingDone
             Method: POST
 
   RestApi:
@@ -216,6 +394,8 @@ Resources:
         Variables:
           SIMILARITY_FUNCTION_NAME: !Ref SimilaritySearchFunction
           CSV_BUCKET_NAME: !Ref CsvFilesBucket
+          ANALYTICS_FUNCTION_NAME: !Ref AnalyticsFunction          # ← ADD THIS LINE
+          FIELD_OUTPUT_BUCKET: !Ref FieldGenOutputBucket           # ← ADD THIS LINE
       Policies:
         - AWSLambdaBasicExecutionRole
         - S3ReadPolicy:
@@ -241,8 +421,41 @@ Resources:
           - Effect: Allow
             Action:
               - lambda:InvokeFunction
-            Resource: !GetAtt SimilaritySearchFunction.Arn
+            Resource: 
+              - !GetAtt SimilaritySearchFunction.Arn
+              - !GetAtt AnalyticsFunction.Arn  # Add this
 
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
+              - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
+
+  AnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-analytics"
+      Handler: analytics.lambda_handler
+      CodeUri: analytics/
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          FIELD_OUTPUT_BUCKET: !Ref FieldGenOutputBucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
+              - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
+ 
   WebSocketConnectIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
@@ -282,13 +495,13 @@ Resources:
       - WebSocketDisconnectRoute
       - WebSocketSendMessageRoute
       - WebSocketInitConversationRoute
-      - WebSocketConnectIntegration      # Add these
-      - WebSocketDisconnectIntegration   # Add these
-      - WebSocketSendMessageIntegration  # Add these
-      - WebSocketInitConversationIntegration  # Add this 
+      - WebSocketConnectIntegration
+      - WebSocketDisconnectIntegration
+      - WebSocketSendMessageIntegration
+      - WebSocketInitConversationIntegration
     Properties:
       ApiId: !Ref WebSocketApi
-      Description: !Sub "Deployment at {AWS::StackName}-{AWS::AccountId}"  # This forces new deployment
+      Description: !Sub "Deployment at ${AWS::StackName}-${AWS::AccountId}"
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
@@ -363,3 +576,9 @@ Outputs:
   RestApiUrl:
     Description: "REST API Gateway endpoint URL"
     Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/generate-field"
+
+  FieldGenOutputBucketName:
+    Description: S3 Bucket for Fargate output artifacts (road masks, done.flag, etc)
+    Value: !Ref FieldGenOutputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-FieldGenOutputBucket"

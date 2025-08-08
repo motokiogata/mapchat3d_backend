@@ -18,15 +18,6 @@ manifest_hash = ""
 packagetype = "Zip"
 functions = ["UploadEmbeddingsFunction"]
 
-[function_build_definitions.308c3c82-710c-438c-b47d-81af47cb3ad2]
-codeuri = "/home/tokiomarine/trials/sam-app/sam-app/generate_svg"
-runtime = "python3.11"
-architecture = "x86_64"
-handler = "generate_svg.lambda_handler"
-manifest_hash = "c91174f6add5df7bec83a05020c4a114"
-packagetype = "Zip"
-functions = ["GenerateFieldSvgFunction"]
-
 [function_build_definitions.741d0d9e-8877-49ce-9dc8-dc100522d94a]
 codeuri = "/home/tokiomarine/trials/sam-app/sam-app/hello_world"
 runtime = "python3.11"
@@ -35,5 +26,41 @@ handler = "app.lambda_handler"
 manifest_hash = "e62dedfb7c0e2c6706d8fb380637f9d5"
 packagetype = "Zip"
 functions = ["ConnectFunction", "DisconnectFunction", "SendMessageFunction"]
+
+[function_build_definitions.9053f7a0-0d30-43fa-98ba-319511f4a749]
+codeuri = "/home/tokiomarine/trials/sam-app/sam-app/process_roadmap"
+runtime = "python3.11"
+architecture = "x86_64"
+handler = "lambda_function.lambda_handler"
+manifest_hash = "710c996aa3f3e8d99eafa7ca51697e0f"
+packagetype = "Zip"
+functions = ["ProcessRoadmapFunction"]
+
+[function_build_definitions.40ff2efc-e81b-4659-8c6a-f50763786e8c]
+codeuri = "/home/tokiomarine/trials/sam-app/sam-app/check_processing"
+runtime = "python3.11"
+architecture = "x86_64"
+handler = "lambda_handler.lambda_handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["CheckProcessingDoneFunction"]
+
+[function_build_definitions.0cdad489-e863-4e27-82b3-89a8043cff51]
+codeuri = "/home/tokiomarine/trials/sam-app/sam-app/generate_svg"
+runtime = "python3.11"
+architecture = "x86_64"
+handler = "generate_svg.lambda_handler"
+manifest_hash = "c91174f6add5df7bec83a05020c4a114"
+packagetype = "Zip"
+functions = ["GenerateFieldSvgFunction"]
+
+[function_build_definitions.99d90545-8023-4fe9-9fbf-4f105b091aee]
+codeuri = "/home/tokiomarine/trials/sam-app/sam-app/analytics"
+runtime = "python3.11"
+architecture = "x86_64"
+handler = "analytics.lambda_handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["AnalyticsFunction"]
 
 [layer_build_definitions]

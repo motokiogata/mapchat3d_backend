@@ -8,6 +8,7 @@ from io import StringIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from decimal import Decimal
+import time
 
 # --- Setup ---
 logger = logging.getLogger()
@@ -19,7 +20,10 @@ bedrock = boto3.client("bedrock-runtime", region_name=region)
 dynamodb = boto3.resource("dynamodb", region_name=region)
 table = dynamodb.Table("AccidentDataTable")
 s3 = boto3.client("s3")
+lambda_client = boto3.client('lambda')  # ← ADD THIS LINE
 CSV_BUCKET = os.environ.get('CSV_BUCKET_NAME', 'your-csv-bucket')
+BUCKET = os.environ.get("FIELD_OUTPUT_BUCKET", "your-default-bucket-name")
+ANALYTICS_FUNCTION_NAME = os.environ.get('ANALYTICS_FUNCTION_NAME')  # ← ADD THIS LINE
 
 chat_histories = {}
 apig_clients = {}
@@ -80,7 +84,7 @@ def handle_init_conversation(event):
         apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
         apig.post_to_connection(
             ConnectionId=connection_id,
-            Data=json.dumps({"response": completion}).encode("utf-8")
+            Data=json.dumps({"response": completion, "connectionId": connection_id}).encode("utf-8")
         )
 
         return {"statusCode": 200}
@@ -123,9 +127,23 @@ def handle_send_message(event):
         
         # Append current user message
         chat_histories[connection_id].append({"role": "user", "content": user_msg})
+
+        # ✅ ISSUE A FIX: Handle location detection message
+        if user_msg.strip() == "Location was detected. The map analytics will be proccessed.":
+            return handle_location_detected(connection_id, event, chat_histories)
+
+        # ✅ ISSUE B FIX: Handle analytics completion message  
+        if user_msg.strip() == "Processing complete. The map data is ready for LLM":
+            analytics_result = handle_analytics_trigger(connection_id, event, chat_histories)
+            
+            if analytics_result.get("continue_conversation"):
+                return {"statusCode": 200}
+            else:
+                return analytics_result
+
         logger.info(f"📜 Chat history for {connection_id}: {chat_histories[connection_id]}")
 
-        # Call Claude
+        # Continue with normal Claude processing...
         response = bedrock.invoke_model(
             modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
             contentType="application/json",
@@ -141,7 +159,7 @@ def handle_send_message(event):
         completion = json.loads(response["body"].read())["content"][0]["text"]
         chat_histories[connection_id].append({"role": "assistant", "content": completion})
 
-        # Step 1: Extract datetime and location (always run these)
+        # Rest of your existing logic (datetime, location extraction, similarity search, etc.)
         full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
         datetime_str = extract_datetime(full_context)
         location_data = extract_location(full_context)
@@ -150,20 +168,18 @@ def handle_send_message(event):
         if should_run_similarity_search(full_context):
             similar_cases = find_similar_cases(full_context)
 
-            # Collect all unique modifiers from similar cases
             modifiers = set()
             for case in similar_cases:
                 modifiers.update(case.get("modifications", []))
+            modifiers = list(modifiers)[:5]
 
-            modifiers = list(modifiers)[:5]  # Limit to top 5 for sanity
-
-            # Generate user-friendly questions based on modifiers
             if modifiers:
                 apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
                 apig.post_to_connection(
                     ConnectionId=connection_id,
                     Data=json.dumps({
-                        "response": "Thanks. I'm analyzing your accident and comparing with past cases. Please wait a moment..."
+                        "response": "Thanks. I'm analyzing your accident and comparing with past cases. Please wait a moment...",
+                        "connectionId": connection_id
                     }).encode("utf-8")
                 )
                 try:
@@ -173,19 +189,14 @@ def handle_send_message(event):
                     mod_questions = []
 
                 if mod_questions:
-                    # Store in session (optional)
-                    # chat_sessions[connection_id]["mod_questions"] = mod_questions
-
-                    # Build follow-up message
                     followup_msg = (
                         "Thank you. Based on similar accident cases, I have a few more questions to clarify the situation:\n\n"
                         + "\n".join(f"- {q}" for q in mod_questions)
                         + "\n\nYou can answer as much as you remember."
                     )
-
                     combined_reply = completion + "\n\n" + followup_msg
                     chat_histories[connection_id].append({"role": "assistant", "content": combined_reply})
-                    completion = combined_reply  # ← overwrite for final post
+                    completion = combined_reply
 
         if datetime_str != "unknown" and location_data:
             store_to_dynamodb(connection_id, datetime_str, location_data, similar_cases)
@@ -193,7 +204,7 @@ def handle_send_message(event):
         apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
         apig.post_to_connection(
             ConnectionId=connection_id,
-            Data=json.dumps({"response": completion}).encode("utf-8")
+            Data=json.dumps({"response": completion, "connectionId": connection_id}).encode("utf-8")
         )
 
         return {"statusCode": 200}
@@ -203,6 +214,191 @@ def handle_send_message(event):
         return {"statusCode": 500, "body": "Internal Server Error"}
 
 # --- Helpers ---
+def handle_location_detected(connection_id, event, chat_histories):
+    """
+    Handle when location is detected - Issue A fix
+    LLM should acknowledge and say it will collect location info
+    """
+    logger.info(f"📍 Location detected for connection: {connection_id}")
+    
+    try:
+        # Create specific instruction for location detection
+        location_instruction = """
+        The customer has just pinned a location on the map where their accident occurred. 
+        The system is now processing the map data to gather information about the road infrastructure, 
+        traffic signals, intersections, and other relevant details at that location.
+        
+        Please acknowledge this and let the customer know you're analyzing the location. 
+        You should say something like:
+        "Thank you for pinning the location. I'll collect information about the road layout, 
+        traffic signals, and intersection details at that location. Please wait a moment while 
+        I analyze the map data..."
+        
+        Do NOT ask about accident details yet. Just acknowledge and wait.
+        """
+        
+        chat_histories[connection_id].append({"role": "user", "content": location_instruction})
+        
+        # Let Claude generate appropriate response
+        response = bedrock.invoke_model(
+            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 500,
+                "temperature": 0.1,
+                "messages": chat_histories[connection_id]
+            })
+        )
+
+        completion = json.loads(response["body"].read())["content"][0]["text"]
+        chat_histories[connection_id].append({"role": "assistant", "content": completion})
+
+        # Send response to user
+        apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": completion,
+                "connectionId": connection_id,
+                "type": "location_acknowledged"
+            }).encode("utf-8")
+        )
+        
+        return {"statusCode": 200}
+        
+    except Exception as e:
+        logger.error(f"❗ Failed to handle location detection: {e}")
+        error_msg = "Thank you for pinning the location. I'm now analyzing the area. Please wait a moment..."
+        chat_histories[connection_id].append({"role": "assistant", "content": error_msg})
+        
+        apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": error_msg,
+                "connectionId": connection_id
+            }).encode("utf-8")
+        )
+        
+        return {"statusCode": 200}
+
+def handle_analytics_trigger(connection_id, event, chat_histories):
+    """
+    Handle the analytics trigger message and process results - Issue B fix
+    LLM should explain what it sees and ask specific questions
+    """
+    logger.info(f"🚀 Triggering analytics for connection: {connection_id}")
+    
+    try:
+        # Send immediate response
+        apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": "Perfect! I've received the map analysis. Let me review what I can see about the accident location...",
+                "connectionId": connection_id
+            }).encode("utf-8")
+        )
+
+        # Invoke analytics function SYNCHRONOUSLY to get results
+        response = lambda_client.invoke(
+            FunctionName=ANALYTICS_FUNCTION_NAME,
+            InvocationType='RequestResponse',  # Synchronous
+            Payload=json.dumps({
+                'connection_id': connection_id,
+                'bucket_name': BUCKET,
+                'chat_history': chat_histories[connection_id]  # Pass chat context
+            })
+        )
+        
+        # Parse the analytics result
+        result_payload = json.loads(response['Payload'].read())
+        analytics_report = result_payload.get('analytics_report', 'Analytics completed but no report generated.')
+        
+        # Add analytics report to chat history as system context
+        analytics_context = f"[ANALYTICS RESULTS]\n{analytics_report}\n[END ANALYTICS]"
+        chat_histories[connection_id].append({"role": "user", "content": analytics_context})
+        
+        # ✅ ISSUE B FIX: Better instruction for sharing what Mariko sees
+        followup_instruction = f"""
+        Based on the traffic infrastructure analysis above, please:
+        
+        1. **First, explain what you can see about the location** in a conversational way:
+           - "Looking at the map analysis, I can see this accident occurred at [describe intersection/road type]"
+           - "The analysis shows [road names/route numbers if available]"
+           - "I can see there are [traffic signals/stop signs/road configuration]"
+           
+        2. **Then ask specific, targeted questions** based on what you observed:
+           - About their route: "I can see this is where [road A] meets [road B]. Which direction were you coming from?"
+           - About traffic controls: "The analysis shows there's a traffic signal here. What color was it when you approached?"
+           - About their destination: "And where were you heading - which direction were you planning to turn?"
+        
+        3. **Make it conversational and empathetic**:
+           - Show that you understand the location
+           - Ask 2-3 specific questions based on the infrastructure findings
+           - Let them know it's OK to share what they remember
+        
+        The goal is to make the customer feel like you really understand their accident location and are asking informed questions.
+        """
+        
+        chat_histories[connection_id].append({"role": "user", "content": followup_instruction})
+        
+        # Let Claude generate response with analytics context
+        claude_response = bedrock.invoke_model(
+            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1500,
+                "temperature": 0.1,
+                "messages": chat_histories[connection_id]
+            })
+        )
+
+        completion = json.loads(claude_response["body"].read())["content"][0]["text"]
+        chat_histories[connection_id].append({"role": "assistant", "content": completion})
+
+        # Send Claude's response with analytics-based questions
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": completion,
+                "connectionId": connection_id,
+                "type": "analytics_complete"
+            }).encode("utf-8")
+        )
+        
+        return {
+            "statusCode": 200, 
+            "continue_conversation": True,
+            "analytics_completed": True
+        }
+        
+    except Exception as e:
+        logger.error(f"❗ Failed to process analytics: {e}")
+        error_msg = "I can see the location analysis, but let me ask you some questions about what happened. Can you tell me which direction you were coming from and where you were heading?"
+        chat_histories[connection_id].append({"role": "assistant", "content": error_msg})
+        
+        apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": error_msg,
+                "connectionId": connection_id
+            }).encode("utf-8")
+        )
+        
+        return {
+            "statusCode": 200, 
+            "continue_conversation": True,
+            "error": True
+        }
+
+
+
 def generate_modifier_questions(modifiers: list[str]) -> list[str]:
     prompt = (
         "You are Mariko, an empathetic insurance claim operator for Tokio Marine Nichido. "
@@ -512,18 +708,53 @@ def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None)
         table.put_item(Item=new_item)
 
 
+def handle_check_processing_done(event):
+    try:
+        params = event.get("queryStringParameters", {})
+        connection_id = params.get("connectionId")
+        if not connection_id:
+            return {"statusCode": 400, "body": "Missing connectionId parameter"}
+
+        logger.info(f"🔍 Polling for done.flag for {connection_id}")
+        key = f"outputs/{connection_id}/done.flag"
+        found = False
+        try:
+            s3.head_object(Bucket=BUCKET, Key=key)
+            found = True
+        except s3.exceptions.ClientError:
+            found = False
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"status": "done" if found else "processing"})
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error in handle_check_processing_done: {e}")
+        return {"statusCode": 500, "body": "Internal Server Error"}
+
 # --- Lambda Entrypoint ---
 def lambda_handler(event, context):
     logger.info("📦 FULL EVENT: " + json.dumps(event))
     route_key = event.get("requestContext", {}).get("routeKey")
     logger.info(f"🧭 RouteKey: {event.get('requestContext', {}).get('routeKey')}")
-    if route_key == "$connect":
-        return handle_connect(event)
-    elif route_key == "$disconnect":
-        return handle_disconnect(event)
-    elif route_key == "sendMessage":
-        return handle_send_message(event)
-    elif route_key == "initConversation":
-        return handle_init_conversation(event)  # ← add this
+    if route_key:
+        if route_key == "$connect":
+            return handle_connect(event)
+        elif route_key == "$disconnect":
+            return handle_disconnect(event)
+        elif route_key == "sendMessage":
+            return handle_send_message(event)
+        elif route_key == "initConversation":
+            return handle_init_conversation(event)  # ← add this
+        else:
+            return {"statusCode": 400, "body": "Unsupported route"}
+    
+    # REST (polling)
+    path = event.get("resource")
+    http_method = event.get("httpMethod")
+    logger.info(f"🌐 REST API Request: {http_method} {path}")
+    if http_method == "GET" and path == "/checkProcessingDone":
+        return handle_check_processing_done(event)
     else:
-        return {"statusCode": 400, "body": "Unsupported route"}
+        return {"statusCode": 400, "body": "Unsupported request"}
