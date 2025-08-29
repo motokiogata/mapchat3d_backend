@@ -1,0 +1,1 @@
+sam deploy --parameter-overrides VpcId=vpc-1c71077b SubnetId=subnet-02efc25934d31a888

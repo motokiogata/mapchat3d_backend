@@ -6,6 +6,7 @@ ecs = boto3.client("ecs")
 def lambda_handler(event, context):
     base_name = event.get("base_name")  # 例: "00032_35.67326_139.48047"
     
+    # I'm not sure why nothing is passed in the event, so we use environment variables
     response = ecs.run_task(
         cluster=os.environ['CLUSTER_NAME'],
         launchType='FARGATE',

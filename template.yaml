@@ -15,16 +15,20 @@ Parameters:
   SubnetId:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet ID to use for Fargate tasks
+  DeployTime:
+    Type: String
+    Default: "0"
+    Description: Deployment timestamp to force updates
 
 Resources:
-
   ProcessRoadmapFunction:
     Type: AWS::Serverless::Function
+    Description: Lambda function to process the roadmap
     Properties:
       FunctionName: !Sub "${AWS::StackName}-process-roadmap"
       Handler: process_roadmap.lambda_handler
       Runtime: python3.11
-      Timeout: 60
+      Timeout: 120
       MemorySize: 512
       CodeUri: process_roadmap/
       Policies:
@@ -37,17 +41,20 @@ Resources:
           TASK_DEF: !Ref FargateTaskDefinition
           SUBNET_ID: !Ref SubnetId
           SECURITY_GROUP: !Ref FargateSecurityGroup
+    DependsOn:
+      - FargateTaskDefinition
 
   FargateCluster:
     Type: AWS::ECS::Cluster
 
   FargateTaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    Description: Fargate Task Definition for Field Generator
     Properties:
       RequiresCompatibilities:
         - FARGATE
-      Cpu: "1024"
-      Memory: "2048"
+      Cpu: "2048"
+      Memory: "4096"
       NetworkMode: awsvpc
       ExecutionRoleArn: !GetAtt FargateExecutionRole.Arn
       TaskRoleArn: !GetAtt ECSTaskRole.Arn 
@@ -124,6 +131,18 @@ Resources:
                   - s3:ListBucket
                 Resource: 
                   - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"    # ✅ Bucket itself, no /*
+        # ADD THIS NEW POLICY FOR BEDROCK ↓
+        - PolicyName: BedrockAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-sonnet-4-20250514-v1:0
+                  - "arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0"
+
 
   # S3 Bucket for storing CSV files
   CsvFilesBucket:
@@ -343,7 +362,15 @@ Resources:
       ApiId: !Ref WebSocketApi
       RouteKey: "initConversation"
       AuthorizationType: NONE
-      Target: !Sub "integrations/${WebSocketInitConversationIntegration}"
+      Target: !Sub "integrations/${WebSocketSendMessageIntegration}"
+
+  WebSocketDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: "$default"
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${WebSocketSendMessageIntegration}" # or a dedicated default integration
 
   ConnectFunction:
     Type: AWS::Serverless::Function
@@ -390,6 +417,7 @@ Resources:
     Properties:
       Handler: app.lambda_handler
       CodeUri: hello_world/
+      Timeout: 900
       Environment:
         Variables:
           SIMILARITY_FUNCTION_NAME: !Ref SimilaritySearchFunction
@@ -452,10 +480,22 @@ Resources:
             Action:
               - s3:GetObject
               - s3:ListBucket
+              - s3:PutObject  # ← Add this for saving results
+              - s3:DeleteObject  # ← Add this for cleanup
             Resource:
               - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
               - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
- 
+          # ADD THIS BEDROCK PERMISSION ↓
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+            Resource:
+              - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-sonnet-4-20250514-v1:0
+              - arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0
+              # Or use wildcard for all models:
+              # - !Sub "arn:aws:bedrock:\${AWS::Region}:\${AWS::AccountId}:inference-profile/*"
+
+
   WebSocketConnectIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
@@ -480,14 +520,6 @@ Resources:
       IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations"
       IntegrationMethod: POST
 
-  WebSocketInitConversationIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref WebSocketApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations"
-      IntegrationMethod: POST
-
   Deployment:
     Type: AWS::ApiGatewayV2::Deployment
     DependsOn:
@@ -495,10 +527,12 @@ Resources:
       - WebSocketDisconnectRoute
       - WebSocketSendMessageRoute
       - WebSocketInitConversationRoute
+      - WebSocketDefaultRoute
       - WebSocketConnectIntegration
       - WebSocketDisconnectIntegration
       - WebSocketSendMessageIntegration
-      - WebSocketInitConversationIntegration
+      - InitConversationFunctionPermission
+      - DefaultRouteFunctionPermission 
     Properties:
       ApiId: !Ref WebSocketApi
       Description: !Sub "Deployment at ${AWS::StackName}-${AWS::AccountId}"
@@ -544,7 +578,15 @@ Resources:
       FunctionName: !GetAtt SendMessageFunction.Arn
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/production/initConversation
+  
+  DefaultRouteFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SendMessageFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/production/$default
 
 Outputs:
   WebSocketURL:

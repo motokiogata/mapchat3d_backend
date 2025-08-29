@@ -33,7 +33,7 @@ def lambda_handler(event, context):
         bucket = os.environ["BUCKET_NAME"]
         s3 = boto3.client("s3")
 
-        key_to_check = f"outputs/{connection_id}/integrated_road_network.json"
+        key_to_check = f"outputs/{connection_id}/done.flag"
         
         # Debug print for the S3 key being checked
         print(f"DEBUG: Checking S3 key: '{key_to_check}'")

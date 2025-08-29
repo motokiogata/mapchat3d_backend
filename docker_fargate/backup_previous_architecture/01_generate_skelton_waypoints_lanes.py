@@ -1,20 +1,41 @@
 #!/usr/bin/env python3
 # main.py
+# main.py
 import sys
 import json
+import os
+import sys
 from math import sqrt
+from audit_visualizer import JSONAuditVisualizer
+
+# DEBUG CODE FIRST - before any custom imports
+print("🔍 DEBUG: Starting file check...")
+print(f"Current directory: {os.getcwd()}")
+print(f"Files in directory: {os.listdir('.')}")
+
+# Check bedrock_analyzer.py specifically
+if os.path.exists('bedrock_analyzer.py'):
+    print("✅ bedrock_analyzer.py EXISTS")
+    with open('bedrock_analyzer.py', 'r') as f:
+        content = f.read()
+        print(f"File size: {len(content)} characters")
+        print(f"First 200 chars: {content[:200]}")
+        print(f"Contains 'class BedrockAnalyzer': {'class BedrockAnalyzer' in content}")
+else:
+    print("❌ bedrock_analyzer.py MISSING!")
 
 # Import all modules
 from config import *
-from ./components/bedrock_analyzer import BedrockAnalyzer
-from ./components/skeleton_extractor import SkeletonExtractor
-from ./components/geometry_utils import GeometryUtils
-from ./components/common_language import CommonLanguageGenerator
-from ./components/lane_generator import LaneGenerator
-from ./components/s3_handler import S3Handler
-from ./components/visualizer import NetworkVisualizer
+from bedrock_analyzer import BedrockAnalyzer
+from skeleton_extractor import SkeletonExtractor
+from geometry_utils import GeometryUtils
+from common_language import CommonLanguageGenerator
+from lane_generator import LaneGenerator
+from s3_handler import S3Handler
+from visualizer import NetworkVisualizer
 
 class IntegratedRoadNetworkGenerator:
+
     def __init__(self, connection_id=None):
         # Core data with consistent IDs
         self.roads = []
@@ -40,6 +61,21 @@ class IntegratedRoadNetworkGenerator:
         self.skeleton_extractor = SkeletonExtractor()
         self.common_language_generator = CommonLanguageGenerator()
         self.s3_handler = S3Handler(connection_id)
+
+    # Add this method to your IntegratedRoadNetworkGenerator class
+    def create_audit_visualizations(self):
+        """Create audit visualizations for all generated JSON files"""
+        print("\n🎨 CREATING AUDIT VISUALIZATIONS...")
+        print("-" * 50)
+        
+        auditor = JSONAuditVisualizer(self.s3_handler.connection_id)
+        audit_files = auditor.audit_all_jsons()
+        
+        # Upload audit files to S3 if available
+        if hasattr(self.s3_handler, 'upload_audit_files'):
+            self.s3_handler.upload_audit_files(audit_files)
+        
+        return audit_files
 
     def build_consistent_road_intersection_mapping(self):
         """Build consistent mapping between roads and intersections"""
@@ -574,8 +610,12 @@ class IntegratedRoadNetworkGenerator:
             self.roads, self.intersections, self.common_language_vocabulary, self.edge_analysis_summary
         )
         visualizer.visualize_integrated_network()
+
+        # NEW Step 10: Create audit visualizations
+        print("\n📊 STEP 10: Creating audit visualizations for JSON files...")
+        audit_files = self.create_audit_visualizations()
         
-        # Final summary
+        # Final summary (updated)
         print(f"\n🎉 INTEGRATED NETWORK WITH COMMON LANGUAGE COMPLETE!")
         print("=" * 80)
         print(f"✅ Roads: {len(self.roads)} (with user-friendly aliases)")
@@ -590,6 +630,9 @@ class IntegratedRoadNetworkGenerator:
         print(f"    - Landmark details: {len(self.common_language_vocabulary['landmarks'])}")
         print(f"✅ Cross-references: All IDs are consistent across all JSON files")
         print(f"✅ AI Analysis: {len(self.bedrock_metadata.get('user_friendly_roads', []))} user-friendly road descriptions")
+        print(f"📊 Audit Visualizations: {len(audit_files)} PNG files created for human review")
+        for audit_file in audit_files:
+            print(f"    - {audit_file}")
         print(f"🌐 All outputs uploaded to S3: s3://{self.s3_handler.bucket_name}/outputs/{self.s3_handler.connection_id}/")
         print(f"\n🎯 READY FOR NARRATIVE-BASED ROUTE GENERATION!")
         print(f"   ✨ AI and humans can now use the same language to describe:")
@@ -599,9 +642,35 @@ class IntegratedRoadNetworkGenerator:
         print(f"      - Navigation: 'turn right at the station intersection onto the main road'")
         print(f"   📋 Implements PDF Step 0: Structure Analysis and Meaning Co-creation")
         print(f"   🤝 Common vocabulary established between AI and human users")
+        print(f"   📊 All JSON data is now auditable via PNG visualizations")
 
 
 def main():
+    print(f"🔍 Current working directory: {os.getcwd()}")
+    print(f"🔍 Python path: {sys.path}")
+    # Check what files exist in the current directory
+    print("🔍 Files in current directory:")
+    for file in os.listdir('.'):
+        print(f"  - {file}")
+    
+    # Check bedrock_analyzer.py specifically
+    if os.path.exists('bedrock_analyzer.py'):
+        print("✅ bedrock_analyzer.py EXISTS")
+        
+        with open('bedrock_analyzer.py', 'r') as f:
+            content = f.read()
+            print(f"📏 File size: {len(content)} characters")
+            print(f"📄 First 200 characters:")
+            print(content[:200])
+            
+            # Check for the class definition
+            if "class BedrockAnalyzer" in content:
+                print("✅ 'class BedrockAnalyzer' found in file!")
+            else:
+                print("❌ 'class BedrockAnalyzer' NOT found in file!")
+    else:
+        print("❌ bedrock_analyzer.py does NOT exist!")
+    
     connection_id = sys.argv[1] if len(sys.argv) > 1 else None
     generator = IntegratedRoadNetworkGenerator(connection_id)
     generator.process_complete_integrated_network()

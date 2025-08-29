@@ -1,3 +1,4 @@
+#app.py
 import json
 import boto3
 import os
@@ -9,6 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 import time
+import threading
 from enum import Enum
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
@@ -28,11 +30,10 @@ CSV_BUCKET = os.environ.get('CSV_BUCKET_NAME', 'your-csv-bucket')
 BUCKET = os.environ.get("FIELD_OUTPUT_BUCKET", "your-default-bucket-name")
 ANALYTICS_FUNCTION_NAME = os.environ.get('ANALYTICS_FUNCTION_NAME')
 
-# Global state
 chat_histories = {}
 apig_clients = {}
 
-# --- Task Orchestrator ---
+# Task Orchestrator States
 class ConversationPhase(Enum):
     GREETING = "greeting"
     LOCATION_PINNING = "location_pinning"
@@ -127,6 +128,7 @@ class TaskOrchestrator:
     
     def _handle_location_processing(self) -> Dict[str, Any]:
         """Phase 3: Processing location data"""
+        # Check if analytics processing is ready
         return {
             "action": "trigger_analytics",
             "message": "Analyzing road layout, traffic signals, and intersection details...",
@@ -197,7 +199,6 @@ class TaskOrchestrator:
 # Global orchestrators
 orchestrators: Dict[str, TaskOrchestrator] = {}
 
-# --- Categories for CSV mapping ---
 CATEGORY_CSV_MAPPING = {
     "Vehicle(car_or_motorcycle)_accident_against_pedestrian": ["1-25.csv", "26-50.csv"],
     "Bycicle_accident_against_pedestrian": ["51-74.csv", "75-97.csv"],
@@ -207,7 +208,7 @@ CATEGORY_CSV_MAPPING = {
     "Accidents_in_highways_or_Accidents_in_park": ["311-338.csv"]
 }
 
-# --- Connection Handlers ---
+# --- Connection handlers ---
 def get_apig_client(domain, stage):
     endpoint = f"https://{domain}/{stage}"
     if endpoint not in apig_clients:
@@ -253,12 +254,6 @@ def handle_send_message(event):
         body = json.loads(event.get("body", "{}"))
         user_msg = body.get("message", "")
         
-        # Check if in interactive analytics mode (legacy support)
-        interactive_state = get_interactive_state(connection_id)
-        if interactive_state and interactive_state["mode"] == "interactive_analytics":
-            logger.info(f"🕵️ User in interactive analytics mode")
-            return handle_interactive_analytics_response(connection_id, user_msg, interactive_state["conversation_state"], event)
-        
         # Get or create orchestrator
         if connection_id not in orchestrators:
             orchestrators[connection_id] = TaskOrchestrator(connection_id)
@@ -270,10 +265,6 @@ def handle_send_message(event):
         if user_msg and user_msg.strip():
             chat_histories[connection_id].append({"role": "user", "content": user_msg})
         
-        # Handle special messages
-        if user_msg.strip() == "Processing complete. The map data is ready for LLM":
-            orchestrator.state.phase = ConversationPhase.ANALYTICS_PROCESSING
-        
         # Get next action from orchestrator
         action = orchestrator.get_next_action(user_msg)
         
@@ -284,7 +275,6 @@ def handle_send_message(event):
         logger.error(f"❗ Unhandled error in send_message: {e}")
         return {"statusCode": 500, "body": "Internal Server Error"}
 
-# --- Action Executors ---
 def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[str, int]:
     """Execute actions determined by orchestrator"""
     try:
@@ -310,7 +300,7 @@ def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[st
             return handle_similarity_search(connection_id, action, apig)
             
         elif action_type == "finalize_case":
-            return handle_finalize_case(connection_id,action, apig)
+            return handle_finalize_case(connection_id, action, apig)
             
         else:
             logger.error(f"Unknown action type: {action_type}")
@@ -383,8 +373,14 @@ def handle_acknowledge_location(connection_id: str, action: Dict[str, Any], apig
             Data=json.dumps(message_data).encode("utf-8")
         )
         
-        # Move to basic info gathering immediately
-        orchestrators[connection_id].state.phase = ConversationPhase.BASIC_INFO_GATHERING
+        # Move to basic info gathering after short delay
+        def delayed_transition():
+            time.sleep(2)
+            orchestrators[connection_id].state.phase = ConversationPhase.BASIC_INFO_GATHERING
+            next_action = orchestrators[connection_id].get_next_action()
+            execute_action(connection_id, next_action, {"requestContext": {"domainName": "", "stage": ""}})
+        
+        threading.Thread(target=delayed_transition).start()
         
         return {"statusCode": 200}
         
@@ -442,9 +438,6 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
             
             first_question = result.get('message', 'Let me ask you some detailed questions about the accident.')
             
-            # Store interactive state
-            store_interactive_state(connection_id, result.get('conversation_state', 'awaiting_direction'))
-            
             apig.post_to_connection(
                 ConnectionId=connection_id,
                 Data=json.dumps({
@@ -487,18 +480,10 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
         if result.get("statusCode") == 200:
             message = result.get("message", "Thank you for that information.")
             
-            # Update interactive state
-            new_state = result.get("conversation_state")
-            if new_state:
-                store_interactive_state(connection_id, new_state)
-            
             # Check if investigation is complete
             if result.get("animation_ready") or result.get("investigation_complete"):
                 orchestrators[connection_id].state.phase = ConversationPhase.SIMILARITY_ANALYSIS
                 message += "\n\nNow let me find similar accident cases for comparison..."
-                
-                # Clear interactive state
-                clear_interactive_state(connection_id)
                 
                 apig.post_to_connection(
                     ConnectionId=connection_id,
@@ -626,121 +611,8 @@ def handle_finalize_case(connection_id: str, action: Dict[str, Any], apig) -> Di
         logger.error(f"❗ Case finalization error: {e}")
         return {"statusCode": 500}
 
-# --- Interactive Analytics Support (Legacy) ---
-def handle_interactive_analytics_response(connection_id, user_input, current_state, event):
-    """Handle user responses during interactive investigation (legacy support)"""
-    try:
-        logger.info(f"🤖 Processing analytics response: '{user_input}'")
-        
-        # Call analytics function
-        response = lambda_client.invoke(
-            FunctionName=ANALYTICS_FUNCTION_NAME,
-            InvocationType='RequestResponse',
-            Payload=json.dumps({
-                'connection_id': connection_id,
-                'bucket_name': BUCKET,
-                'message_type': 'user_response',
-                'user_input': user_input,
-                'conversation_state': current_state
-            })
-        )
-        
-        result = json.loads(response['Payload'].read())
-        
-        if result.get("statusCode") == 200:
-            # Update state
-            new_state = result.get("conversation_state")
-            if new_state:
-                store_interactive_state(connection_id, new_state)
-            
-            # Send response
-            apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
-            message = result.get("message", "Thank you.")
-            
-            # Add to chat history
-            if connection_id in chat_histories:
-                chat_histories[connection_id].append({"role": "user", "content": user_input})
-                chat_histories[connection_id].append({"role": "assistant", "content": message})
-            
-            # Check if complete
-            if result.get("animation_ready"):
-                message += "\n\n✅ Investigation Complete!"
-                clear_interactive_state(connection_id)
-                
-                # Move orchestrator to similarity analysis
-                if connection_id in orchestrators:
-                    orchestrators[connection_id].state.phase = ConversationPhase.SIMILARITY_ANALYSIS
-            
-            apig.post_to_connection(
-                ConnectionId=connection_id,
-                Data=json.dumps({
-                    "response": message,
-                    "connectionId": connection_id
-                }).encode("utf-8")
-            )
-            
-            return {"statusCode": 200}
-        else:
-            raise Exception(f"Analytics error: {result}")
-            
-    except Exception as e:
-        logger.error(f"❗ Interactive analytics failed: {e}")
-        clear_interactive_state(connection_id)
-        
-        apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
-        apig.post_to_connection(
-            ConnectionId=connection_id,
-            Data=json.dumps({
-                "response": "Let me continue with some general questions about your accident.",
-                "connectionId": connection_id
-            }).encode("utf-8")
-        )
-        
-        return {"statusCode": 200}
+# --- Helper Functions (keeping existing ones) ---
 
-def store_interactive_state(connection_id, conversation_state):
-    """Store that this connection is in interactive analytics mode"""
-    try:
-        state_data = {
-            "mode": "interactive_analytics",
-            "conversation_state": conversation_state,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        state_key = f"interactive-state/{connection_id}/state.json"
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=state_key,
-            Body=json.dumps(state_data),
-            ContentType='application/json'
-        )
-        logger.info(f"💾 Interactive state stored: {state_key}")
-    except Exception as e:
-        logger.error(f"❗ Failed to store interactive state: {e}")
-
-def get_interactive_state(connection_id):
-    """Get interactive state for a connection"""
-    try:
-        state_key = f"interactive-state/{connection_id}/state.json"
-        response = s3.get_object(Bucket=BUCKET, Key=state_key)
-        state_data = json.loads(response['Body'].read().decode('utf-8'))
-        return state_data
-    except s3.exceptions.NoSuchKey:
-        return None
-    except Exception as e:
-        logger.error(f"❗ Failed to get interactive state: {e}")
-        return None
-
-def clear_interactive_state(connection_id):
-    """Clear interactive analytics state"""
-    try:
-        state_key = f"interactive-state/{connection_id}/state.json"
-        s3.delete_object(Bucket=BUCKET, Key=state_key)
-        logger.info(f"🧹 Cleared interactive state for {connection_id}")
-    except Exception as e:
-        logger.error(f"❗ Failed to clear interactive state: {e}")
-
-# --- Helper Functions ---
 def generate_modifier_questions(modifiers: list[str]) -> list[str]:
     prompt = (
         "You are Mariko, an empathetic insurance claim operator for Tokio Marine Nichido. "
@@ -785,6 +657,7 @@ def extract_datetime(full_context):
         })
     )
     reply = json.loads(response["body"].read())["content"][0]["text"].strip()
+    print("Datetime Response:", reply)
     return reply
 
 def extract_location(full_context):
@@ -812,6 +685,7 @@ def extract_location(full_context):
 
     raw_reply = response["body"].read()
     reply_text = json.loads(raw_reply)["content"][0]["text"].strip()
+    print("Location Response:", repr(reply_text))
 
     # Remove Markdown-style formatting (```json ... ```)
     match = re.search(r'\{.*\}', reply_text, re.DOTALL)
@@ -857,7 +731,7 @@ def should_run_similarity_search(full_context):
     reply = json.loads(response["body"].read())["content"][0]["text"].strip().upper()
     return reply == "YES"
 
-# --- CSV Similarity Logic ---
+# --- CSV Similarity Logic (keeping existing functions) ---
 def categorize_accident_type(full_context):
     prompt = (
         f"Categorize this accident description into one of the following categories:\n"
@@ -994,57 +868,52 @@ def find_similar_cases(full_context):
     return None
 
 def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None):
-    try:
-        item = table.get_item(Key={"connection_id": connection_id}).get("Item")
-        
-        similar_data = None
-        if similar_cases:
-            similar_data = [{
-                "case_id": case["case_id"],
-                "category": case.get("category", "unknown"),
-                "similarity": Decimal(str(case["similarity"])),
-                "summary": case["summary"][:500],
-                "fault_ratio": case.get("fault_ratio", "unknown"),
-                "base_fault_ratio": case.get("base_fault_ratio", "unknown"),
-                "modifications": case.get("modifications", [])[:5]
-            } for case in similar_cases[:5]]
+    item = table.get_item(Key={"connection_id": connection_id}).get("Item")
+    
+    similar_data = None
+    if similar_cases:
+        similar_data = [{
+            "case_id": case["case_id"],
+            "category": case.get("category", "unknown"),
+            "similarity": Decimal(str(case["similarity"])),
+            "summary": case["summary"][:500],
+            "fault_ratio": case.get("fault_ratio", "unknown"),
+            "base_fault_ratio": case.get("base_fault_ratio", "unknown"),
+            "modifications": case.get("modifications", [])[:5]
+        } for case in similar_cases[:5]]
 
-        if item:
-            # Update existing record
-            update_expr = "SET #ts = :ts, lat = :lat, lon = :lon"
-            expr_attr_names = {"#ts": "timestamp"}
-            expr_attr_values = {
-                ":ts": datetime_str,
-                ":lat": Decimal(str(location["lat"])),
-                ":lon": Decimal(str(location["lon"]))
-            }
-            if similar_data:
-                update_expr += ", similar_cases = :similar"
-                expr_attr_values[":similar"] = similar_data
+    if item:
+        # Update existing record
+        update_expr = "SET #ts = :ts, lat = :lat, lon = :lon"
+        expr_attr_names = {"#ts": "timestamp"}
+        expr_attr_values = {
+            ":ts": datetime_str,
+            ":lat": Decimal(str(location["lat"])),
+            ":lon": Decimal(str(location["lon"]))
+        }
+        if similar_data:
+            update_expr += ", similar_cases = :similar"
+            expr_attr_values[":similar"] = similar_data
 
-            table.update_item(
-                Key={"connection_id": connection_id},
-                UpdateExpression=update_expr,
-                ExpressionAttributeNames=expr_attr_names,
-                ExpressionAttributeValues=expr_attr_values
-            )
-        else:
-            # Create new record
-            new_item = {
-                "connection_id": connection_id,
-                "timestamp": datetime_str,
-                "lat": Decimal(str(location["lat"])),
-                "lon": Decimal(str(location["lon"]))
-            }
-            if similar_data:
-                new_item["similar_cases"] = similar_data
+        table.update_item(
+            Key={"connection_id": connection_id},
+            UpdateExpression=update_expr,
+            ExpressionAttributeNames=expr_attr_names,
+            ExpressionAttributeValues=expr_attr_values
+        )
+    else:
+        # Create new record
+        new_item = {
+            "connection_id": connection_id,
+            "timestamp": datetime_str,
+            "lat": Decimal(str(location["lat"])),
+            "lon": Decimal(str(location["lon"]))
+        }
+        if similar_data:
+            new_item["similar_cases"] = similar_data
 
-            table.put_item(Item=new_item)
-            
-    except Exception as e:
-        logger.error(f"❗ Failed to store to DynamoDB: {e}")
+        table.put_item(Item=new_item)
 
-# --- REST API Handlers ---
 def handle_check_processing_done(event):
     try:
         params = event.get("queryStringParameters", {})
@@ -1088,19 +957,19 @@ def lambda_handler(event, context):
     logger.info(f"🧭 RouteKey: {route_key}")
     
     if route_key:
-        if route_key == "$connect":
+        if route_key == "\$connect":
             return handle_connect(event)
-        elif route_key == "$disconnect":
+        elif route_key == "\$disconnect":
             return handle_disconnect(event)
         elif route_key == "sendMessage":
             return handle_send_message(event)
         elif route_key == "initConversation":
             return handle_init_conversation(event)
-        elif route_key == "$default":
+        elif route_key == "\$default":
             body = _parse_body(event)
             if body.get("action") == "ping":
                 return {"statusCode": 200}
-            logger.warning(f"Unknown action via default: {body}")
+            logger.warning(f"Unknown action via \$default: {body}")
             return {"statusCode": 200}
         else:
             return {"statusCode": 400, "body": "Unsupported route"}

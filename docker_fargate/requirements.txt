@@ -5,3 +5,6 @@ scikit-image
 Pillow
 boto3
 shapely
+scipy
+scikit-learn
+networkx

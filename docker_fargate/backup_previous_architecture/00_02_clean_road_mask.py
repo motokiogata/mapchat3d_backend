@@ -1,9 +1,13 @@
+#00_02_clean_road_mask.py
+#00_02_clean_road_mask.py
+
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
 import os
 import sys
+from s3_handler import S3Handler
 
 # --- CLI argument ---
 parser = argparse.ArgumentParser()
@@ -20,6 +24,9 @@ if not os.path.exists(input_path):
     sys.exit(1)
 
 try:
+    # Initialize S3 handler with connection_id from CLI argument
+    s3_handler = S3Handler(connection_id=args.connection_id)
+    
     mask = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         print(f"❌ Failed to load image: {input_path}")
@@ -35,11 +42,23 @@ try:
     # Fill small gaps
     closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # --- Step 3: Save cleaned mask ---
+    # --- Step 3: Save cleaned mask locally ---
     cv2.imwrite(output_path, closed * 255)
-    print(f"✅ Cleaned mask saved: {output_path}")
+    print(f"✅ Cleaned mask saved locally: {output_path}")
 
-    # --- Step 4: Optional Visualization ---
+    # --- Step 4: Upload to S3 ---
+    print("\n🌐 UPLOADING TO S3...")
+    print("-" * 40)
+    
+    # Define S3 key with connection_id folder structure
+    s3_key = f"outputs/{s3_handler.connection_id}/{output_path}"
+    
+    # Upload the file to S3
+    s3_handler.upload_to_s3(output_path, s3_key)
+    
+    print(f"✅ Road mask cleaning and upload completed!")
+
+    # --- Step 5: Optional Visualization ---
     if args.visualize:
         plt.figure(figsize=(12, 4))
         plt.subplot(1, 3, 1)
