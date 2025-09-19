@@ -1,5 +1,4 @@
 #s3_handler.py
-
 import boto3
 import json
 import os
@@ -36,6 +35,55 @@ class S3Handler:
         except Exception as e:
             print(f"❌ Failed to upload JSON to S3: {e}")
             return False
+
+    def upload_road_mask_cleaner_outputs(self, connection_id):
+        """Upload road mask cleaner outputs to S3"""
+        print(f"\n🌐 UPLOADING ROAD MASK CLEANER OUTPUTS TO S3...")
+        print("-" * 50)
+        
+        s3_prefix = f"outputs/{connection_id}/"
+        uploaded_files = []
+        failed_uploads = []
+        
+        # Define road mask cleaner output files
+        road_mask_files = [
+            f"{connection_id}_final_road_mask_cleaned.png",
+            "final_road_mask_cleaned.png",  # Generic version
+            f"{connection_id}_debug_before_cleaning.png",
+            f"{connection_id}_debug_before_after_cleaning.png"
+        ]
+        
+        # Upload each file if it exists
+        for filename in road_mask_files:
+            if os.path.exists(filename):
+                s3_key = f"{s3_prefix}road_masks/{filename}"
+                
+                try:
+                    self.s3_client.upload_file(
+                        filename,
+                        self.bucket_name,
+                        s3_key,
+                        ExtraArgs={'ContentType': 'image/png'}
+                    )
+                    uploaded_files.append(filename)
+                    print(f"  ✅ {filename}")
+                except Exception as e:
+                    failed_uploads.append((filename, str(e)))
+                    print(f"  ❌ {filename}: {e}")
+            else:
+                print(f"  ⚠️  {filename}: File not found")
+        
+        print(f"\n📊 ROAD MASK UPLOAD SUMMARY:")
+        print(f"  ✅ Successfully uploaded: {len(uploaded_files)} files")
+        print(f"  ❌ Failed uploads: {len(failed_uploads)} files")
+        print(f"  🌐 S3 location: s3://{self.bucket_name}/{s3_prefix}road_masks/")
+        
+        if failed_uploads:
+            print(f"\n❌ FAILED UPLOADS:")
+            for filename, error in failed_uploads:
+                print(f"  - {filename}: {error}")
+        
+        return len(uploaded_files), len(failed_uploads)
 
     def upload_all_road_network_outputs(self, connection_id):
         """Upload all road network outputs to S3"""

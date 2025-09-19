@@ -291,8 +291,22 @@ class InteractiveTrafficAnalyzer:
             "conversation_state": "collision_point"
         }
 
+
     def generate_time_question(self):
-        """Generate time question"""
+        """Generate time question - skip if already have datetime info"""
+        
+        # Check if we already have datetime from earlier collection
+        if hasattr(self, 'existing_collected_data') and self.existing_collected_data.get('basic_q_0'):
+            # We already have this info, skip this question
+            logger.info("⏭️ Skipping time question - already have datetime info")
+            self.responses['accident_time'] = self.existing_collected_data['basic_q_0']
+            self.user_path["accident_time"] = self.existing_collected_data['basic_q_0']
+            
+            # Move to completion
+            self.current_step += 1
+            return self.get_next_question()
+        
+        # Otherwise ask the question
         question = "What time did this accident occur? You can give me the approximate time if you're not sure of the exact time."
         
         return {
@@ -428,6 +442,9 @@ class InteractiveTrafficAnalyzer:
         
         # Save animation data
         self.save_animation_data(route_json)
+
+        # 🎬 NEW: Trigger SVG animation generation
+        self.trigger_svg_generation(route_json)
         
         return {
             "statusCode": 200,
@@ -871,6 +888,368 @@ class InteractiveTrafficAnalyzer:
             logger.error(f"❗ Bedrock call failed: {e}")
             return f"Error: {str(e)}"
 
+    def calculate_data_completeness(self):
+        """Calculate how complete the collected data is"""
+        total_fields = len(self.investigation_steps)
+        completed_fields = len([k for k, v in self.responses.items() if v and str(v).strip().lower() != "unknown"])
+        
+        return {
+            "total_questions": total_fields,
+            "answered_questions": completed_fields,
+            "completion_percentage": (completed_fields / total_fields) * 100 if total_fields > 0 else 0,
+            "missing_responses": [step for step in self.investigation_steps if step not in self.responses or not self.responses[step]]
+        }
+
+    def extract_intersection_type(self):
+        """Extract intersection type from infrastructure data"""
+        try:
+            # Analyze intersection data to determine type
+            if self.intersections_data:
+                prompt = f"""
+                Based on this intersection data, what type of intersection is this?
+                
+                {json.dumps(self.intersections_data, indent=2)[:1000]}
+                
+                Return one of: "4-way_intersection", "3-way_intersection", "T-intersection", "roundabout", "highway_interchange", "simple_road", "unknown"
+                """
+                return self.call_bedrock(prompt, max_tokens=50).strip()
+            return "unknown"
+        except Exception as e:
+            logger.warning(f"Failed to extract intersection type: {e}")
+            return "unknown"
+
+    def extract_road_names(self):
+        """Extract road names from infrastructure data"""
+        try:
+            road_names = []
+            if self.roads_data:
+                # Try to extract road names from the roads data
+                prompt = f"""
+                Extract all road names from this data:
+                
+                {json.dumps(self.roads_data, indent=2)[:2000]}
+                
+                Return a simple list of road names, one per line. If no names found, return "unknown".
+                """
+                result = self.call_bedrock(prompt, max_tokens=200)
+                road_names = [name.strip() for name in result.split('\n') if name.strip()]
+            
+            return road_names if road_names else ["unknown"]
+        except Exception as e:
+            logger.warning(f"Failed to extract road names: {e}")
+            return ["unknown"]
+
+    def extract_traffic_controls(self):
+        """Extract traffic control information"""
+        try:
+            if self.intersections_data:
+                prompt = f"""
+                What traffic controls are present at this location?
+                
+                {json.dumps(self.intersections_data, indent=2)[:1500]}
+                
+                Return a simple list: traffic_lights, stop_signs, yield_signs, or none
+                """
+                return self.call_bedrock(prompt, max_tokens=100).strip().split(', ')
+            return ["unknown"]
+        except Exception as e:
+            logger.warning(f"Failed to extract traffic controls: {e}")
+            return ["unknown"]
+
+    def extract_lane_config(self):
+        """Extract lane configuration"""
+        try:
+            if self.roads_data:
+                prompt = f"""
+                Describe the lane configuration at this location:
+                
+                {json.dumps(self.roads_data, indent=2)[:1500]}
+                
+                How many lanes in each direction? Return brief description.
+                """
+                return self.call_bedrock(prompt, max_tokens=150).strip()
+            return "unknown"
+        except Exception as e:
+            logger.warning(f"Failed to extract lane config: {e}")
+            return "unknown"
+
+    def extract_location_coordinates(self):
+        """Extract location coordinates from infrastructure data"""
+        try:
+            # Try to find coordinates in the infrastructure data
+            coords = {"lat": "unknown", "lon": "unknown"}
+            
+            # Check all infrastructure data for coordinate information
+            all_data = {**self.intersections_data, **self.roads_data, **self.network_data}
+            
+            # Simple search for coordinate-like data
+            for key, value in all_data.items():
+                if isinstance(value, (int, float)) and "lat" in str(key).lower():
+                    coords["lat"] = value
+                elif isinstance(value, (int, float)) and "lon" in str(key).lower():
+                    coords["lon"] = value
+            
+            return coords
+        except Exception as e:
+            logger.warning(f"Failed to extract coordinates: {e}")
+            return {"lat": "unknown", "lon": "unknown"}
+
+    def generate_user_route_points(self):
+        """Generate route points for user vehicle"""
+        return [
+            {
+                "point_type": "origin",
+                "description": f"Starting from {self.user_path.get('origin_direction', 'unknown')} direction",
+                "coordinates": {"x": 0, "y": -100}  # Placeholder coordinates
+            },
+            {
+                "point_type": "approach",
+                "description": f"Approaching intersection in {self.user_path.get('approach_lane', 'unknown')} lane",
+                "coordinates": {"x": 0, "y": -50}
+            },
+            {
+                "point_type": "collision",
+                "description": f"Collision point: {self.user_path.get('collision_point', 'unknown')}",
+                "coordinates": {"x": 0, "y": 0}
+            }
+        ]
+
+    def generate_other_vehicle_route_points(self):
+        """Generate route points for other vehicle"""
+        return [
+            {
+                "point_type": "origin", 
+                "description": f"Other vehicle from {self.user_path.get('other_vehicle', {}).get('position', 'unknown')}",
+                "coordinates": {"x": -100, "y": 0}  # Placeholder
+            },
+            {
+                "point_type": "collision",
+                "description": f"Other vehicle action: {self.user_path.get('other_vehicle', {}).get('action', 'unknown')}",
+                "coordinates": {"x": 0, "y": 0}
+            }
+        ]
+
+    def estimate_other_vehicle_origin(self):
+        """Estimate where other vehicle came from"""
+        other_pos = self.user_path.get("other_vehicle", {}).get("position", "")
+        if "left" in other_pos.lower():
+            return "left"
+        elif "right" in other_pos.lower():
+            return "right"
+        elif "opposite" in other_pos.lower() or "front" in other_pos.lower():
+            return "opposite"
+        return "unknown"
+
+    def determine_collision_zone(self):
+        """Determine which zone collision occurred in"""
+        collision_point = self.user_path.get("collision_point", "").lower()
+        if "intersection" in collision_point or "middle" in collision_point:
+            return "intersection_center"
+        elif "approach" in collision_point:
+            return "intersection_approach"
+        elif "exit" in collision_point:
+            return "intersection_exit"
+        return "unknown"
+
+    def estimate_precise_time(self):
+        """Estimate more precise time from user input"""
+        accident_time = self.user_path.get("accident_time", "")
+        if accident_time and accident_time != "unknown":
+            return f"Estimated: {accident_time}"
+        return "unknown"
+
+    def extract_user_signal_state(self):
+        """Extract what signal user vehicle had"""
+        return self.responses.get("traffic_signal", "unknown")
+
+    def extract_signal_type(self):
+        """Extract type of traffic control"""
+        signal_response = self.responses.get("traffic_signal", "").lower()
+        if "light" in signal_response or "red" in signal_response or "green" in signal_response or "yellow" in signal_response:
+            return "traffic_light"
+        elif "stop" in signal_response:
+            return "stop_sign"
+        elif "yield" in signal_response:
+            return "yield_sign"
+        return "unknown"
+
+    def estimate_other_signal_state(self):
+        """Estimate what signal other vehicle had"""
+        user_signal = self.extract_user_signal_state().lower()
+        if "green" in user_signal:
+            return "likely_red_or_stop"
+        elif "red" in user_signal:
+            return "likely_green"
+        return "unknown"
+
+    def determine_right_of_way(self, vehicle):
+        """Determine if vehicle had right of way"""
+        signal_state = self.extract_user_signal_state().lower()
+        user_action = self.user_path.get("intended_maneuver", "").lower()
+        
+        if vehicle == "user":
+            if "green" in signal_state and "straight" in user_action:
+                return True
+            elif "red" in signal_state:
+                return False
+            return "unclear"
+        else:  # other vehicle
+            # Opposite of user's right of way
+            user_right = self.determine_right_of_way("user")
+            if user_right is True:
+                return False
+            elif user_right is False:
+                return True
+            return "unclear"
+
+    def extract_right_of_way_rules(self):
+        """Extract applicable right of way rules"""
+        rules = []
+        signal_type = self.extract_signal_type()
+        user_action = self.user_path.get("intended_maneuver", "").lower()
+        
+        if signal_type == "traffic_light":
+            rules.append("traffic_light_control")
+            if "turn" in user_action:
+                rules.append("turning_yields_to_oncoming")
+        elif signal_type == "stop_sign":
+            rules.append("stop_sign_control")
+            rules.append("first_to_stop_has_right_of_way")
+        
+        return rules
+
+    def calculate_completeness_score(self):
+        """Calculate data completeness score"""
+        completion = self.calculate_data_completeness()
+        return completion["completion_percentage"]
+
+    def calculate_confidence_level(self):
+        """Calculate confidence level of analysis"""
+        completeness = self.calculate_completeness_score()
+        if completeness >= 90:
+            return "high"
+        elif completeness >= 70:
+            return "medium"
+        elif completeness >= 50:
+            return "low"
+        return "very_low"
+
+    def identify_missing_data(self):
+        """Identify what data is missing"""
+        completion = self.calculate_data_completeness()
+        return completion["missing_responses"]
+
+    def identify_contributing_factors(self):
+        """Identify factors that may have contributed to accident"""
+        factors = []
+        
+        # Check for potential factors based on responses
+        signal_state = self.extract_user_signal_state().lower()
+        if "red" in signal_state:
+            factors.append("possible_red_light_violation")
+        
+        user_action = self.user_path.get("intended_maneuver", "").lower()
+        if "turn" in user_action:
+            factors.append("turning_maneuver")
+        
+        # Check intersection type
+        intersection_type = self.extract_intersection_type()
+        if "4-way" in intersection_type:
+            factors.append("complex_intersection")
+        
+        return factors
+
+    def identify_potential_violations(self):
+        """Identify potential traffic violations"""
+        violations = []
+        
+        signal_state = self.extract_user_signal_state().lower()
+        if "red" in signal_state:
+            violations.append("red_light_violation")
+        
+        # Add more violation checks based on responses
+        return violations
+
+    def generate_camera_positions(self):
+        """Generate camera positions for visualization"""
+        return [
+            {"name": "overhead", "position": {"x": 0, "y": 0, "z": 100}, "target": {"x": 0, "y": 0, "z": 0}},
+            {"name": "user_vehicle_perspective", "position": {"x": 0, "y": -80, "z": 5}, "target": {"x": 0, "y": 0, "z": 0}},
+            {"name": "intersection_corner", "position": {"x": -50, "y": -50, "z": 20}, "target": {"x": 0, "y": 0, "z": 0}}
+        ]
+
+    def generate_object_positions(self):
+        """Generate positions for objects in visualization"""
+        return {
+            "traffic_lights": [{"position": {"x": 10, "y": 10, "z": 5}, "type": "traffic_light"}],
+            "stop_signs": [],
+            "lane_markings": [{"start": {"x": -20, "y": 0}, "end": {"x": 20, "y": 0}}],
+            "crosswalks": []
+        }
+
+    def generate_highlight_zones(self):
+        """Generate zones to highlight in visualization"""
+        return [
+            {
+                "name": "collision_zone",
+                "type": "circle",
+                "center": {"x": 0, "y": 0},
+                "radius": 5,
+                "color": "red",
+                "opacity": 0.3
+            },
+            {
+                "name": "approach_zone", 
+                "type": "rectangle",
+                "bounds": {"x1": -5, "y1": -50, "x2": 5, "y2": -5},
+                "color": "yellow",
+                "opacity": 0.2
+            }
+        ]            
+
+    def trigger_svg_generation(self, route_json):
+        """Trigger SVG animation generation using ECS Fargate task"""
+        try:
+            # Use ECS client to run Fargate task instead of Lambda invoke
+            ecs_client = boto3.client('ecs')
+            
+            response = ecs_client.run_task(
+                cluster=os.environ['CLUSTER_NAME'],
+                taskDefinition=os.environ['SVG_TASK_DEF'],
+                launchType='FARGATE',
+                networkConfiguration={
+                    'awsvpcConfiguration': {
+                        'subnets': [os.environ['SUBNET_ID']],
+                        'securityGroups': [os.environ['SECURITY_GROUP']],
+                        'assignPublicIp': 'ENABLED'
+                    }
+                },
+                overrides={
+                    'containerOverrides': [
+                        {
+                            'name': 'svg-animation-generator',
+                            'environment': [
+                                {
+                                    'name': 'CONNECTION_ID',
+                                    'value': self.connection_id
+                                },
+                                {
+                                    'name': 'BUCKET_NAME',
+                                    'value': self.bucket_name
+                                }
+                            ]
+                        }
+                    ]
+                }
+            )
+            
+            task_arn = response['tasks'][0]['taskArn']
+            logger.info(f"🎬 SVG animation Fargate task started: {task_arn}")
+            
+        except Exception as e:
+            logger.error(f"❗ Failed to trigger SVG generation: {e}")
+
+
 
 def lambda_handler(event, context):
     """Main handler - supports both initial analysis and interactive conversation"""
@@ -898,12 +1277,23 @@ def handle_initial_analysis(connection_id, bucket_name, event):
     try:
         logger.info(f"🚀 Starting initial analysis for {connection_id}")
         
+        # Get collected data from the event
+        collected_data = event.get('collected_data', {})
+        
         # Load infrastructure data
         infrastructure_data = load_infrastructure_data(connection_id, bucket_name)
         logger.info(f"📁 Loaded {len(infrastructure_data)} infrastructure files")
         
         # Create analyzer
         analyzer = InteractiveTrafficAnalyzer(connection_id, bucket_name, infrastructure_data)
+        
+        # FIXED: Pass the collected data to the analyzer
+        analyzer.existing_collected_data = collected_data
+        
+        # Pre-populate any time/date info we already have
+        if collected_data.get('basic_q_0'):  # datetime question
+            analyzer.responses['accident_time'] = collected_data['basic_q_0']
+            analyzer.user_path["accident_time"] = collected_data['basic_q_0']
         
         # Do heavy analysis first
         logger.info("🔍 Starting infrastructure scene analysis...")
@@ -930,7 +1320,6 @@ def handle_initial_analysis(connection_id, bucket_name, event):
     except Exception as e:
         logger.error(f"❗ Initial analysis failed: {e}")
         return {"statusCode": 500, "error": str(e)}
-
 
 def handle_user_response(connection_id, bucket_name, event):
     """Handle user response in interactive conversation"""

@@ -579,39 +579,51 @@ class IntegratedRoadNetworkGenerator:
 
     ############# INTEGRATED SMART OBSTACLE REMOVAL PIPELINE #############
     def smart_obstacle_removal_pipeline(self, mask_path):
-        """LLM-powered obstacle removal pipeline"""
         print("\n🎯 LLM-POWERED SMART OBSTACLE REMOVAL PIPELINE")
         print("=" * 60)
         
         obstacles = self.find_obstacles_in_roads(mask_path)
         
         if not obstacles:
+            # ... existing code
             cleaned_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            # CRITICAL FIX: Always create the debug file
-            debug_mask_after = self.get_output_filename("debug_mask_after_obstacle_removal.png")
-            cv2.imwrite(debug_mask_after, cleaned_mask)
-            self.upload_output_to_s3(debug_mask_after)
             return cleaned_mask
+    
+        print(f"🧠 Found {len(obstacles)} obstacles, sending to LLM...")
         
         classification = self.analyze_obstacles_with_bedrock(obstacles, mask_path, ROADMAP_PATH, SATELLITE_PATH)
+        
+        # 🔥 DEBUG THE CLASSIFICATION RESULT
+        print(f"🔍 LLM CLASSIFICATION RESULT:")
+        print(f"   Raw classification type: {type(classification)}")
+        print(f"   Raw classification: {classification}")
+        
         self.obstacle_analysis = classification
         
         if "error" in classification:
-            # Fallback approach
+            print("⚠️ LLM FAILED - Using fallback logic")
             ignorable_ids = [obs['id'] for obs in obstacles if obs['area'] < 5000 and obs['is_elongated']]
+            print(f"🔧 Fallback found {len(ignorable_ids)} ignorable obstacles")
             self.ignorable_obstacles = [{"id": obs_id, "reason": "Fallback: small/elongated"} for obs_id in ignorable_ids]
             self.meaningful_obstacles = [{"id": obs['id'], "reason": "Fallback: preserved"} for obs in obstacles if obs['id'] not in ignorable_ids]
         else:
+            print("✅ LLM SUCCESS - Using LLM classification")
             ignorable_ids = [obs['id'] for obs in classification.get('ignorable_obstacles', [])]
+            print(f"🧠 LLM found {len(ignorable_ids)} ignorable obstacles")
+            print(f"🧠 Ignorable obstacle details: {classification.get('ignorable_obstacles', [])}")
             self.ignorable_obstacles = classification.get('ignorable_obstacles', [])
             self.meaningful_obstacles = classification.get('meaningful_obstacles', [])
         
+        print(f"🗑️ FINAL DECISION: Will remove {len(ignorable_ids)} obstacles")
+        print(f"🗑️ Obstacle IDs to remove: {ignorable_ids}")
+        
         if ignorable_ids:
+            print("🧹 Calling remove_ignorable_obstacles...")
             cleaned_mask = self.remove_ignorable_obstacles(mask_path, obstacles, ignorable_ids)
-            # File is created inside remove_ignorable_obstacles
+            print("✅ Obstacle removal completed")
         else:
+            print("⚠️ NO OBSTACLES TO REMOVE - returning original mask")
             cleaned_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            # CRITICAL FIX: Create debug file even when no obstacles are removed
             debug_mask_after = self.get_output_filename("debug_mask_after_obstacle_removal.png")
             cv2.imwrite(debug_mask_after, cleaned_mask)
             self.upload_output_to_s3(debug_mask_after)
@@ -722,9 +734,13 @@ class IntegratedRoadNetworkGenerator:
         """Extract skeleton with better preprocessing"""
         print("📍 EXTRACTING MEDIAL AXIS WITH BETTER PREPROCESSING...")
         
+        # 🔥 FIX: Handle both numpy array and file path inputs
         if isinstance(cleaned_mask_image, str):
             img = cv2.imread(cleaned_mask_image, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                raise FileNotFoundError(f"Image loading failed from {cleaned_mask_image}")
         else:
+            # It's already a numpy array
             img = cleaned_mask_image
             
         if img is None:
@@ -4905,7 +4921,6 @@ class IntegratedRoadNetworkGenerator:
         print(f"  📊 Visualization shows ALL elements: {total_conversational_ids} IDs, {total_user_descriptions} descriptions, {lanes_with_traffic_geometry} traffic-enabled lanes")
 
     # ==================== MAIN INTEGRATION METHOD ====================
-    
     def process_integrated_network_with_comprehensive_metadata_and_clean_trimming(self):
         """INTEGRATED: Best of both approaches - Clean trimming + Comprehensive metadata"""
         print("🚗 INTEGRATED ROAD NETWORK: CLEAN TRIMMING + COMPREHENSIVE METADATA")
@@ -4914,21 +4929,25 @@ class IntegratedRoadNetworkGenerator:
         # STEP 0: Clean obstacle removal (from clean trimming approach)
         print("\n🎯 STEP 0: LLM obstacle removal...")
         cleaned_mask = self.smart_obstacle_removal_pipeline(MASK_PATH)
-    
+
         # STEP 0.5: LLM network structure analysis (from clean trimming approach)
         print("\n🔢 STEP 0.5: LLM network structure analysis...")
-        # Use the SAME filename pattern that was created in the pipeline
-        cleaned_mask_path = self.get_output_filename("debug_mask_after_obstacle_removal.png")
+        
+        # 🔥 FIX: Save the cleaned mask numpy array to a temporary file for LLM analysis
+        temp_cleaned_mask_path = self.get_output_filename("temp_cleaned_mask_for_llm_analysis.png")
+        cv2.imwrite(temp_cleaned_mask_path, cleaned_mask)
+        self.upload_output_to_s3(temp_cleaned_mask_path)
         
         network_analysis = self.analyze_expected_road_and_intersection_count_with_bedrock(
-            cleaned_mask_path, ROADMAP_PATH, SATELLITE_PATH)
+            temp_cleaned_mask_path, ROADMAP_PATH, SATELLITE_PATH)
         expected_roads = network_analysis.get('expected_main_roads', 4)
         expected_intersections = network_analysis.get('expected_major_intersections', 1)
 
         # STEP 1: Clean skeleton processing (from clean trimming approach)
         print("\n📍 STEP 1: Extracting and cleaning skeleton...")
-        initial_skeleton = self.extract_medial_axis(cleaned_mask)
-        cleaned_skeleton = self.smart_fragment_cleanup_pipeline(initial_skeleton, expected_roads)
+        # 🔥 FIX: Use the cleaned_mask numpy array directly instead of file
+        initial_skeleton = self.extract_medial_axis(cleaned_mask)  # Pass numpy array
+        cleaned_skeleton = self.smart_fragment_cleanup_pipeline(initial_skeleton, expected_roads)   
         
         # STEP 2: Clean road tracing (from clean trimming approach)
         print("\n🛣️  STEP 2: Tracing roads from cleaned skeleton...")
@@ -5024,6 +5043,7 @@ class IntegratedRoadNetworkGenerator:
         print(f"   • Rich contextual metadata for navigation")  
         print(f"   • Proper intersection zones and road trimming")
         print(f"   • Enhanced lane trees with comprehensive branches")
+
 
 
 def main():

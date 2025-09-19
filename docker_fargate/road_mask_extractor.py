@@ -4,138 +4,10 @@ import sys
 import os
 from skimage import measure
 
-def remove_crosswalks_and_white_areas(img):
-    """
-    Remove white crosswalk stripes and isolated white areas from road image
-    """
-    print("🧹 Removing crosswalks and white areas...")
-    
-    white_threshold = 240
-    road_color = (102, 102, 102)  # BGR format
-    
-    cleaned_img = img.copy()
-    gray = cv2.cvtColor(cleaned_img, cv2.COLOR_BGR2GRAY)
-    
-    # DEBUG: Save original grayscale
-    cv2.imwrite("debug_00_original_gray.png", gray)
-    print("💾 Saved: debug_00_original_gray.png")
-    
-    # Find white areas
-    white_mask = cv2.inRange(gray, white_threshold, 255)
-    
-    # DEBUG: Save white mask before processing
-    cv2.imwrite("debug_01_white_mask_raw.png", white_mask)
-    print("💾 Saved: debug_01_white_mask_raw.png")
-    
-    # Clean up noise but preserve crosswalk stripes
-    kernel = np.ones((2,2), np.uint8)
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    
-    # DEBUG: Save white mask after morphology
-    cv2.imwrite("debug_02_white_mask_morph.png", white_mask)
-    print("💾 Saved: debug_02_white_mask_morph.png")
-    
-    # Find connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
-    
-    # DEBUG: Create visualization of detected components
-    debug_components = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    
-    crosswalk_areas_removed = 0
-    height, width = cleaned_img.shape[:2]
-    
-    print(f"🔍 Found {num_labels-1} white components to analyze...")
-    
-    # Create mask for areas to remove with padding
-    removal_mask = np.zeros_like(gray, dtype=np.uint8)
-    
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        x = stats[i, cv2.CC_STAT_LEFT]
-        y = stats[i, cv2.CC_STAT_TOP]
-        w = stats[i, cv2.CC_STAT_WIDTH]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-        center_x, center_y = centroids[i]
-        
-        # Check if white area touches image edges (skip if it does)
-        touches_edge = (x <= 1 or y <= 1 or 
-                       (x + w) >= width-1 or 
-                       (y + h) >= height-1)
-        
-        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
-        
-        # DEBUG: Draw bounding box and info for each component
-        color = (0, 255, 0) if not touches_edge else (0, 0, 255)
-        cv2.rectangle(debug_components, (x, y), (x+w, y+h), color, 1)
-        cv2.putText(debug_components, f"A:{area}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
-        cv2.putText(debug_components, f"R:{aspect_ratio:.1f}", (x, y+h+15), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
-        
-        if touches_edge:
-            print(f"   Component {i}: SKIP (touches edge) - Area:{area}, Ratio:{aspect_ratio:.1f}")
-            continue
-        
-        is_crosswalk = False
-        reason = ""
-        
-        # More aggressive crosswalk detection
-        if 15 < area < 15000:
-            is_crosswalk = True
-            reason = "size_filter"
-        
-        if aspect_ratio > 2.0 and area > 50:
-            is_crosswalk = True
-            reason = "stripe_filter"
-            
-        if 0.5 < aspect_ratio < 2.0 and 100 < area < 5000:
-            is_crosswalk = True
-            reason = "square_filter"
-        
-        if area > 200 and aspect_ratio > 1.2:
-            if (0.1 * width < center_x < 0.9 * width and 
-                0.1 * height < center_y < 0.9 * height):
-                is_crosswalk = True
-                reason = "large_crosswalk"
-        
-        # DEBUG: Print decision
-        if is_crosswalk:
-            print(f"   Component {i}: REMOVE ({reason}) - Area:{area}, Ratio:{aspect_ratio:.1f}")
-            cv2.rectangle(debug_components, (x, y), (x+w, y+h), (0, 0, 255), 2)
-            cv2.putText(debug_components, "REMOVE", (x, y-25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-            
-            # Add to removal mask with padding for aggressive removal
-            component_mask = (labels == i).astype(np.uint8) * 255
-            removal_mask = cv2.bitwise_or(removal_mask, component_mask)
-            crosswalk_areas_removed += 1
-        else:
-            print(f"   Component {i}: KEEP - Area:{area}, Ratio:{aspect_ratio:.1f}")
-            cv2.rectangle(debug_components, (x, y), (x+w, y+h), (255, 0, 0), 2)
-            cv2.putText(debug_components, "KEEP", (x, y-25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-    
-    # AGGRESSIVE REMOVAL: Apply morphological dilation to remove fragments
-    kernel_aggressive = np.ones((3,3), np.uint8)
-    removal_mask_dilated = cv2.dilate(removal_mask, kernel_aggressive, iterations=2)
-    
-    # DEBUG: Save removal masks
-    cv2.imwrite("debug_02a_removal_mask.png", removal_mask)
-    cv2.imwrite("debug_02b_removal_mask_dilated.png", removal_mask_dilated)
-    print("💾 Saved: debug_02a_removal_mask.png and debug_02b_removal_mask_dilated.png")
-    
-    # Apply aggressive removal
-    cleaned_img[removal_mask_dilated == 255] = road_color
-    
-    # DEBUG: Save component analysis and final result
-    cv2.imwrite("debug_03_components_analysis.png", debug_components)
-    cv2.imwrite("debug_04_final_cleaned.png", cleaned_img)
-    cv2.imwrite("debug_05_difference.png", cv2.absdiff(img, cleaned_img))
-    print("💾 Saved: debug_03, debug_04, debug_05")
-    
-    print(f"✅ Removed {crosswalk_areas_removed} crosswalk/white areas (with aggressive padding)")
-    return cleaned_img
-
 def is_road_color(img, tolerance=15):
     """
     Detect actual road colors in RGB space more precisely
-    Road colors are blue-gray like #a9b8c8 (169,184,200) or #aab9c9 (170,185,201)
+    IMPORTANT: Explicitly exclude #f8f7f7 (248,247,247)
     """
     print("🛣️ Detecting road colors with RGB analysis...")
     
@@ -143,9 +15,19 @@ def is_road_color(img, tolerance=15):
     rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     r, g, b = rgb_img[:,:,0], rgb_img[:,:,1], rgb_img[:,:,2]
     
-    # Define typical road color characteristics
-    # Road colors: blue-gray with B > G > R pattern
-    road_mask = (
+    # DEBUG: First, let's find where #f8f7f7 pixels are
+    problem_color_mask = (
+        (r >= 247) & (r <= 249) &
+        (g >= 246) & (g <= 248) &
+        (b >= 246) & (b <= 248)
+    )
+    
+    problem_count = np.sum(problem_color_mask)
+    if problem_count > 0:
+        print(f"   ⚠️ Found {problem_count:,} pixels of #f8f7f7 color in the image!")
+    
+    # Your ORIGINAL road detection logic
+    road_mask_original = (
         # Blue channel should be highest
         (b >= g) & (b >= r) &
         # Green should be higher than red (blue-gray characteristic)
@@ -158,23 +40,115 @@ def is_road_color(img, tolerance=15):
         ((r.astype(np.int16) + g.astype(np.int16) + b.astype(np.int16)) < 600)
     )
     
-    # DEBUG: Save road color detection
-    debug_road_rgb = np.zeros_like(rgb_img)
-    debug_road_rgb[road_mask] = rgb_img[road_mask]
-    debug_road_bgr = cv2.cvtColor(debug_road_rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite("debug_06a_road_color_detection.png", debug_road_bgr)
+    # EXPLICITLY exclude the problematic color and similar very light grays
+    exclude_mask = (
+        # Exclude #f8f7f7 and nearby colors
+        ((r >= 245) & (g >= 245) & (b >= 245)) |
+        # Also exclude any very light grays
+        ((r + g + b) >= 735)  # Sum of 245+245+245
+    )
     
-    # Also show what we're excluding
-    non_road_mask = ~road_mask
-    debug_excluded = np.zeros_like(rgb_img)
-    debug_excluded[non_road_mask] = rgb_img[non_road_mask]
-    debug_excluded_bgr = cv2.cvtColor(debug_excluded, cv2.COLOR_RGB2BGR)
-    cv2.imwrite("debug_06b_excluded_colors.png", debug_excluded_bgr)
+    # Final road mask: original logic AND NOT excluded colors
+    road_mask = road_mask_original & (~exclude_mask)
     
     print(f"   🎯 Found {np.sum(road_mask):,} road pixels")
-    print(f"   ❌ Excluded {np.sum(non_road_mask):,} non-road pixels")
+    print(f"   ✅ #f8f7f7 pixels in final road mask: {np.sum(road_mask & problem_color_mask)} (should be 0)")
     
-    return road_mask
+    return road_mask, problem_color_mask
+
+def smart_hole_filling(road_mask, original_img, problem_color_mask, connection_id):
+    """
+    Fill holes in road mask, but AVOID filling areas that contain light colors like #F8F7F7
+    """
+    print("🧠 Smart hole filling (avoiding #F8F7F7 areas)...")
+    
+    # Convert original image to RGB for analysis
+    rgb_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+    r, g, b = rgb_img[:,:,0], rgb_img[:,:,1], rgb_img[:,:,2]
+    
+    # Define "light color areas" that should NEVER be filled as holes
+    light_color_mask = (
+        # #F8F7F7 and similar
+        problem_color_mask |
+        # Any very light colors
+        ((r >= 240) & (g >= 240) & (b >= 240)) |
+        # Light beige/cream colors (common for buildings)
+        ((r >= 240) & (g >= 235) & (b >= 230)) |
+        # Light gray areas
+        ((r + g + b) >= 720)
+    )
+    
+    inverse = ~road_mask
+    labels = measure.label(inverse)
+    props = measure.regionprops(labels)
+    
+    holes_to_remove = np.zeros_like(road_mask, dtype=bool)
+    height, width = road_mask.shape
+    
+    holes_filled = 0
+    holes_skipped_light_color = 0
+    holes_skipped_boundary = 0
+    holes_skipped_too_large = 0
+    
+    for p in props:
+        area = p.area
+        major = p.major_axis_length
+        minor = p.minor_axis_length + 1e-5
+        ratio = major / minor
+        
+        # Get the pixels of this hole
+        hole_mask = (labels == p.label)
+        
+        # Check if this hole contains light colors
+        hole_has_light_colors = np.sum(light_color_mask & hole_mask) > 0
+        light_pixels_in_hole = np.sum(light_color_mask & hole_mask)
+        light_percentage = (light_pixels_in_hole / area) * 100 if area > 0 else 0
+        
+        # Get bounding box
+        bbox = p.bbox
+        min_row, min_col, max_row, max_col = bbox
+        touches_boundary = (min_row <= 2 or min_col <= 2 or 
+                           max_row >= height-2 or max_col >= width-2)
+        
+        # SMART DECISION LOGIC
+        should_fill = True
+        skip_reason = ""
+        
+        # Rule 1: Don't fill if it touches boundaries
+        if touches_boundary:
+            should_fill = False
+            skip_reason = "touches_boundary"
+            holes_skipped_boundary += 1
+        
+        # Rule 2: Don't fill if it's too large
+        elif area >= 8000 or ratio >= 4.0:
+            should_fill = False
+            skip_reason = "too_large"
+            holes_skipped_too_large += 1
+        
+        # Rule 3: DON'T fill if it contains significant light colors
+        elif hole_has_light_colors and (light_percentage > 10 or light_pixels_in_hole > 50):
+            should_fill = False
+            skip_reason = f"contains_light_colors({light_percentage:.1f}%)"
+            holes_skipped_light_color += 1
+        
+        if should_fill:
+            holes_to_remove[hole_mask] = True
+            holes_filled += 1
+            print(f"   ✅ Filling hole: area={area}, ratio={ratio:.1f}")
+        else:
+            print(f"   ❌ Skipping hole ({skip_reason}): area={area}, ratio={ratio:.1f}, light_pixels={light_pixels_in_hole}")
+    
+    print(f"📊 HOLE FILLING SUMMARY:")
+    print(f"   ✅ Holes filled: {holes_filled}")
+    print(f"   ❌ Skipped (boundary): {holes_skipped_boundary}")
+    print(f"   ❌ Skipped (too large): {holes_skipped_too_large}")
+    print(f"   🚫 Skipped (light colors): {holes_skipped_light_color}")
+    
+    # Save debug image
+    cv2.imwrite(f"{connection_id}_debug_smart_holes_to_remove.png", (holes_to_remove.astype(np.uint8)) * 255)
+    
+    return holes_to_remove
 
 def main():
     if len(sys.argv) < 2:
@@ -208,74 +182,23 @@ def main():
         
         cv2.imwrite(f"{connection_id}_debug_original.png", img)
         
-        # --- Step 0.5: Remove remaining crosswalks ---
-        cleaned_img = remove_crosswalks_and_white_areas(img)
-        cv2.imwrite(f"{connection_id}_roadmap_double_cleaned.png", cleaned_img)
-        print(f"💾 Saved double-cleaned roadmap: {connection_id}_roadmap_double_cleaned.png")
-        
         # --- Step 1: Extract road mask with PRECISE road color detection ---
         print("\n🔍 Extracting road mask with precise color detection...")
-        road_mask = is_road_color(cleaned_img)
+        road_mask, problem_color_mask = is_road_color(img)
         
-        cv2.imwrite(f"{connection_id}_debug_06_initial_road_mask.png", (road_mask.astype(np.uint8)) * 255)
+        cv2.imwrite(f"{connection_id}_debug_initial_road_mask.png", (road_mask.astype(np.uint8)) * 255)
         
-        # --- Step 2.5: Remove white labels/icons inside road ---
-        print("🔧 Removing remaining white labels/icons...")
-        white_labels = measure.label(road_mask)
-        white_props = measure.regionprops(white_labels)
+        # --- Step 2: SMART hole filling that avoids #F8F7F7 areas ---
+        holes_to_remove = smart_hole_filling(road_mask, img, problem_color_mask, connection_id)
         
-        label_removal_mask = np.zeros_like(road_mask, dtype=bool)
-        
-        for p in white_props:
-            area = p.area
-            major = p.major_axis_length
-            minor = p.minor_axis_length + 1e-5
-            ratio = major / minor
-        
-            if area < 3000 and ratio < 3.0:
-                label_removal_mask[white_labels == p.label] = True
-        
-        road_mask[label_removal_mask] = False
-        
-        cv2.imwrite(f"{connection_id}_debug_07_after_label_removal.png", (road_mask.astype(np.uint8)) * 255)
-        
-        # --- Step 3: IMPROVED hole filling (fix the boundary issue) ---
-        print("🕳️ Finding and filling holes (avoiding boundaries)...")
-        inverse = ~road_mask
-        labels = measure.label(inverse)
-        props = measure.regionprops(labels)
-        
-        holes_to_remove = np.zeros_like(road_mask, dtype=bool)
-        height, width = road_mask.shape
-        
-        for p in props:
-            area = p.area
-            major = p.major_axis_length
-            minor = p.minor_axis_length + 1e-5
-            ratio = major / minor
-            
-            # Get bounding box of the hole
-            bbox = p.bbox  # (min_row, min_col, max_row, max_col)
-            min_row, min_col, max_row, max_col = bbox
-            
-            # Check if hole touches image boundaries (if so, don't fill it)
-            touches_boundary = (min_row <= 2 or min_col <= 2 or 
-                               max_row >= height-2 or max_col >= width-2)
-            
-            # Only fill small holes that don't touch boundaries
-            if not touches_boundary and area < 8000 and ratio < 4.0:  # Reduced from 12000 to 8000
-                holes_to_remove[labels == p.label] = True
-                print(f"   Filling hole: area={area}, ratio={ratio:.1f}")
-            elif touches_boundary:
-                print(f"   Skipping hole (touches boundary): area={area}")
-            else:
-                print(f"   Skipping hole (too large): area={area}")
-        
-        cv2.imwrite(f"{connection_id}_debug_08_holes_to_remove_fixed.png", (holes_to_remove.astype(np.uint8)) * 255)
-        
-        # --- Step 4: Create final mask ---
+        # --- Step 3: Create final mask ---
         clean_road_mask = road_mask.copy()
         clean_road_mask[holes_to_remove] = True
+        
+        # --- Step 4: Final verification ---
+        f8f7f7_in_final = np.sum(clean_road_mask & problem_color_mask)
+        print(f"\n🎯 FINAL VERIFICATION:")
+        print(f"   #F8F7F7 pixels in final road mask: {f8f7f7_in_final:,} (should be 0!)")
         
         # --- Step 5: Save final result ---
         save_mask = (clean_road_mask.astype(np.uint8)) * 255
@@ -286,13 +209,17 @@ def main():
         cv2.imwrite("final_road_mask.png", save_mask)
         print("✅ Saved: final_road_mask.png (for compatibility)")
         
+        if f8f7f7_in_final == 0:
+            print("🎉 SUCCESS! No #F8F7F7 pixels were converted to road!")
+        else:
+            print(f"⚠️ Still {f8f7f7_in_final:,} #F8F7F7 pixels in road mask - need to adjust light color detection")
+        
         print(f"\n📊 SUMMARY:")
-        print(f"   - Fixed road color detection to exclude #f1f3f4")
-        print(f"   - Added precise RGB-based road detection")
-        print(f"   - Check debug_06a_road_color_detection.png to see detected roads")
-        print(f"   - Check debug_06b_excluded_colors.png to see excluded colors")
+        print(f"   - Used precise RGB-based road detection")
+        print(f"   - Applied smart hole filling that avoids light colors") 
         print(f"   - Road colors: blue-gray pattern (B≥G≥R) in range 160-220")
-        print(f"🏆 ROAD MASK EXTRACTION COMPLETE!")
+        print(f"   - Excluded #F8F7F7 and similar light colors")
+        print(f"🏆 SIMPLIFIED ROAD MASK EXTRACTION COMPLETE!")
         
     except Exception as e:
         print(f"💥 Error during road mask extraction: {e}")

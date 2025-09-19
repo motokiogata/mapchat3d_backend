@@ -50,7 +50,7 @@ codeuri = "/home/tokiomarine/trials/sam-app/sam-app/generate_svg"
 runtime = "python3.11"
 architecture = "x86_64"
 handler = "generate_svg.lambda_handler"
-manifest_hash = "c91174f6add5df7bec83a05020c4a114"
+manifest_hash = "f9a7fdb19f8621258d9c72e1ccb4aaea"
 packagetype = "Zip"
 functions = ["GenerateFieldSvgFunction"]
 
@@ -59,7 +59,7 @@ codeuri = "/home/tokiomarine/trials/sam-app/sam-app/analytics"
 runtime = "python3.11"
 architecture = "x86_64"
 handler = "analytics.lambda_handler"
-manifest_hash = ""
+manifest_hash = "c58b78e843de7a519d4fdd56d80e464b"
 packagetype = "Zip"
 functions = ["AnalyticsFunction"]
 

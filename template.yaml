@@ -143,8 +143,93 @@ Resources:
                   - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-sonnet-4-20250514-v1:0
                   - "arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0"
 
+  # Add this after your existing FargateTaskDefinition
+  SvgAnimationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Description: Fargate Task Definition for SVG Animation Generator
+    Properties:
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "1024"  # Less CPU than field generator
+      Memory: "2048"  # Less memory than field generator
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt FargateExecutionRole.Arn
+      TaskRoleArn: !GetAtt SvgAnimationTaskRole.Arn  # New role with different permissions
+      ContainerDefinitions:
+        - Name: svg-animation-generator
+          Image: 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/svg-animation-generator:latest
+          EntryPoint: ["python", "svg_generator.py"]
+          Command: []
+          Environment:
+            - Name: BUCKET_NAME
+              Value: !Ref FieldGenOutputBucket
+            - Name: CONNECTION_ID
+              Value: "will-be-overridden-at-runtime"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref SvgLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: svg-fargate
 
-  # S3 Bucket for storing CSV files
+  # New log group for SVG container
+  SvgLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${AWS::StackName}-svg-animation"
+      RetentionInDays: 7
+
+  # New task role for SVG container (different permissions)
+  SvgAnimationTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
+        - PolicyName: DynamoDBAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AccidentDataTable.Arn
+        - PolicyName: BedrockAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-sonnet-4-20250514-v1:0"
+                  - "arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0"
+
+
+  # S3 Bucket for storing CSV filesAnalyticsFunction:
   CsvFilesBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -452,11 +537,12 @@ Resources:
             Resource: 
               - !GetAtt SimilaritySearchFunction.Arn
               - !GetAtt AnalyticsFunction.Arn  # Add this
-
           - Effect: Allow
             Action:
               - s3:GetObject
               - s3:ListBucket
+              - s3:PutObject  # ← Add this for saving results
+              - s3:DeleteObject  # ← Add this for cleanup
             Resource:
               - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
               - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
@@ -473,6 +559,10 @@ Resources:
       Environment:
         Variables:
           FIELD_OUTPUT_BUCKET: !Ref FieldGenOutputBucket
+          CLUSTER_NAME: !Ref FargateCluster                    # Add this
+          SVG_TASK_DEF: !Ref SvgAnimationTaskDefinition        # Add this
+          SUBNET_ID: !Ref SubnetId                             # Add this
+          SECURITY_GROUP: !Ref FargateSecurityGroup            # Add this
       Policies:
         - AWSLambdaBasicExecutionRole
         - Statement:
@@ -485,6 +575,13 @@ Resources:
             Resource:
               - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
               - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
+          # ADD DYNAMODB PERMISSIONS ↓
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+            Resource: !GetAtt AccidentDataTable.Arn
           # ADD THIS BEDROCK PERMISSION ↓
           - Effect: Allow
             Action:
@@ -494,6 +591,19 @@ Resources:
               - arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0
               # Or use wildcard for all models:
               # - !Sub "arn:aws:bedrock:\${AWS::Region}:\${AWS::AccountId}:inference-profile/*"
+          - Effect: Allow
+            Action:
+              - ecs:RunTask
+              - ecs:DescribeTasks
+            Resource: 
+              - !Ref SvgAnimationTaskDefinition
+              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${FargateCluster}/*"
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: 
+              - !GetAtt FargateExecutionRole.Arn
+              - !GetAtt SvgAnimationTaskRole.Arn
 
 
   WebSocketConnectIntegration:

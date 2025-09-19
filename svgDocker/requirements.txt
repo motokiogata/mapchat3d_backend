@@ -1,0 +1,11 @@
+# requirements.txt
+boto3
+svgwrite
+numpy
+scipy
+matplotlib
+pillow
+json5
+geopy
+shapely
+pandas

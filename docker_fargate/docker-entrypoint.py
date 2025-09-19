@@ -35,6 +35,9 @@ def main():
 
     print("✅ Downloaded satellite and roadmap images")
 
+    # Initialize S3 handler for uploading intermediate files
+    s3_handler = S3Handler(connection_id, bucket)
+
     # Step 1: Clean the roadmap (remove underground/crosswalk artifacts)
     print("🧹 Starting map cleaning process...")
     subprocess.run(["python3", "map_cleaner.py", connection_id], check=True)
@@ -49,6 +52,10 @@ def main():
     print("🧹 Starting road mask cleaning and gap filling...")
     subprocess.run(["python3", "road_mask_cleaner.py", connection_id], check=True)
     print("✅ Road mask cleaning completed")
+    
+    # Upload road mask cleaner outputs to S3
+    print("🌐 Uploading road mask cleaner outputs to S3...")
+    s3_handler.upload_road_mask_cleaner_outputs(connection_id)
 
     # Step 4: Generate comprehensive road network with lanes (replaces 01_generate_skelton_waypoints_lanes.py)
     print("🚗 Starting comprehensive road network generation...")
@@ -56,14 +63,13 @@ def main():
     print("✅ Road network generation completed")
     
     # Step 5: Upload all outputs to S3
-    #print("🌐 Starting S3 upload process...")
-    #s3_handler = S3Handler(connection_id, bucket)
-    #uploaded_count, failed_count = s3_handler.upload_all_road_network_outputs(connection_id)
+    print("🌐 Starting S3 upload process...")
+    uploaded_count, failed_count = s3_handler.upload_all_road_network_outputs(connection_id)
     
-    #if failed_count == 0:
-    #    print("✅ All outputs successfully uploaded to S3")
-    #else:
-    #    print(f"⚠️  {uploaded_count} files uploaded, {failed_count} failed")
+    if failed_count == 0:
+        print("✅ All outputs successfully uploaded to S3")
+    else:
+        print(f"⚠️  {uploaded_count} files uploaded, {failed_count} failed")
     
     upload_done_flag(connection_id, bucket)
 

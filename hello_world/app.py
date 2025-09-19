@@ -1,3 +1,4 @@
+#app.py
 import json
 import boto3
 import os
@@ -36,6 +37,7 @@ apig_clients = {}
 class ConversationPhase(Enum):
     GREETING = "greeting"
     LOCATION_PINNING = "location_pinning"
+    PARALLEL_INFO_GATHERING = "parallel_info_gathering"  # NEW: Gather info while map processes
     LOCATION_PROCESSING = "location_processing"
     BASIC_INFO_GATHERING = "basic_info_gathering"
     ANALYTICS_PROCESSING = "analytics_processing"
@@ -51,12 +53,17 @@ class TaskState:
     collected_data: Dict[str, Any] = None
     pending_questions: List[str] = None
     analytics_result: Dict[str, Any] = None
+    location_attempts: int = 0
+    map_processing_started: bool = False  # NEW: Track if map processing started
+    questions_asked: Dict[str, bool] = None  # Track which questions have been asked
     
     def __post_init__(self):
         if self.collected_data is None:
             self.collected_data = {}
         if self.pending_questions is None:
             self.pending_questions = []
+        if self.questions_asked is None:
+            self.questions_asked = {"datetime": False, "description": False}
 
 class TaskOrchestrator:
     """Central controller for managing conversation flow and task delegation"""
@@ -73,6 +80,9 @@ class TaskOrchestrator:
             
         elif self.state.phase == ConversationPhase.LOCATION_PINNING:
             return self._handle_location_pinning(user_input)
+            
+        elif self.state.phase == ConversationPhase.PARALLEL_INFO_GATHERING:
+            return self._handle_parallel_info_gathering(user_input)
             
         elif self.state.phase == ConversationPhase.LOCATION_PROCESSING:
             return self._handle_location_processing()
@@ -108,64 +118,177 @@ class TaskOrchestrator:
             ),
             "progress": "Starting claim process (Step 1/6)"
         }
-    
+
     def _handle_location_pinning(self, user_input: str) -> Dict[str, Any]:
         """Phase 2: Waiting for location to be pinned"""
-        if "Location was detected" in user_input:
-            self.state.phase = ConversationPhase.LOCATION_PROCESSING
+        logger.info(f"🗺️ Location pinning - received input: '{user_input}'")
+        
+        # Check for various location indicators
+        location_detected = False
+        if user_input:
+            location_indicators = [
+                "Location was detected",
+                "coordinates",
+                "lat",
+                "longitude",
+                "pinned",
+                "dropped"
+            ]
+            
+            # Check for text indicators
+            for indicator in location_indicators:
+                if indicator.lower() in user_input.lower():
+                    location_detected = True
+                    break
+            
+            # Check for coordinate patterns (decimal numbers) - avoiding regex
+            if not location_detected:
+                # Simple check for decimal numbers without regex
+                words = user_input.split()
+                for word in words:
+                    try:
+                        float_val = float(word)
+                        if '.' in word and len(word) > 3:  # Simple decimal check
+                            location_detected = True
+                            break
+                    except ValueError:
+                        continue
+        
+        if location_detected:
+            logger.info(f"✅ Locations detected for {self.connection_id}")
+            # Move to parallel info gathering instead of waiting for processing
+            self.state.phase = ConversationPhase.PARALLEL_INFO_GATHERING
+            self.state.map_processing_started = True
+            
             return {
-                "action": "acknowledge_location",
-                "message": "Thank you for pinning the location. I'm now analyzing the road infrastructure and traffic conditions at that location. Please wait a moment...",
-                "progress": "Analyzing location (Step 2/6)"
+                "action": "start_parallel_processing",
+                "message": (
+                    "Perfect! Thank you for pinning the location. I'm analyzing the road infrastructure "
+                    "and traffic conditions in the background. While that's processing, let me gather "
+                    "some basic information to move things along quickly."
+                ),
+                "progress": "Processing location & gathering info (Step 2/6)"
             }
         else:
+            # Increment attempts to prevent infinite loops
+            self.state.location_attempts += 1
+            
+            # If too many attempts, move forward anyway
+            if self.state.location_attempts > 3:
+                logger.warning(f"⚠️ Too many location attempts for {self.connection_id}, moving forward")
+                self.state.phase = ConversationPhase.PARALLEL_INFO_GATHERING
+                return {
+                    "action": "claude_response",
+                    "instruction": "Let's proceed without the exact location for now. Ask the user about the basic details of their accident - what happened and when did it occur?",
+                    "progress": "Gathering basic information (Step 3/6)"
+                }
+            
             return {
                 "action": "claude_response", 
-                "instruction": "The user is trying to communicate but hasn't pinned the location yet. Gently redirect them to pin the location on the map first.",
+                "instruction": (
+                    "The user is trying to communicate but hasn't pinned the location yet. "
+                    "Gently redirect them to pin the location on the map first. "
+                    "Be patient and understanding - they might be having trouble with the map interface."
+                ),
                 "progress": "Waiting for location (Step 1/6)"
+            }
+
+
+    def _handle_parallel_info_gathering(self, user_input: str) -> Dict[str, Any]:
+        """NEW Phase: Gather info while map processes in background - FIXED to avoid duplicate questions"""
+        parallel_questions = [
+            ("datetime", "What date and time did the accident occur?"),
+            ("description", "Could you please describe what happened during the accident? Feel free to share as much detail as you remember.")
+        ]
+        
+        # If we have user input (and it's not the initial call), store it
+        if user_input and user_input.strip() and not self.state.map_processing_started:
+            # Find the current question being answered
+            for i, (question_key, _) in enumerate(parallel_questions):
+                if i == self.state.sub_step and not self.state.questions_asked[question_key]:
+                    self.state.collected_data[question_key] = user_input
+                    self.state.questions_asked[question_key] = True
+                    self.state.sub_step += 1
+                    break
+        
+        # Reset the flag after first use
+        if self.state.map_processing_started:
+            self.state.map_processing_started = False
+        
+        # Find next unasked question
+        next_question = None
+        for i, (question_key, question_text) in enumerate(parallel_questions):
+            if not self.state.questions_asked[question_key]:
+                next_question = question_text
+                break
+        
+        if next_question:
+            return {
+                "action": "claude_response",
+                "instruction": f"Ask this question naturally: '{next_question}'. Be conversational and empathetic.",
+                "progress": f"Gathering information (Step 2/6) - Question {sum(self.state.questions_asked.values()) + 1}/{len(parallel_questions)}"
+            }
+        else:
+            # All questions answered, check if map processing is done
+            return {
+                "action": "check_map_processing",
+                "message": "Thank you for that information. Let me check if the location analysis is complete...",
+                "progress": "Finalizing location analysis (Step 3/6)"
             }
     
     def _handle_location_processing(self) -> Dict[str, Any]:
-        """Phase 3: Processing location data"""
+        """Phase 3: Processing location data (now rarely used due to parallel processing)"""
         return {
             "action": "trigger_analytics",
             "message": "Analyzing road layout, traffic signals, and intersection details...",
-            "progress": "Processing location data (Step 2/6)"
+            "progress": "Processing location data (Step 3/6)"
         }
     
     def _handle_basic_info_gathering(self, user_input: str) -> Dict[str, Any]:
-        """Phase 4: Collect basic accident information"""
+        """Phase 4: Collect basic accident information - FIXED to avoid duplicate questions"""
+        # Check if we already have info from parallel gathering
+        if self.state.questions_asked["datetime"] and self.state.questions_asked["description"]:
+            # We already have basic info, move to analytics
+            self.state.phase = ConversationPhase.ANALYTICS_PROCESSING
+            return self._handle_analytics_processing()
+        
         basic_questions = [
-            "What date and time did the accident occur?",
-            "Could you describe what happened during the accident?"
+            ("datetime", "What date and time did the accident occur?"),
+            ("description", "Could you describe what happened during the accident?")
         ]
         
-        if self.state.sub_step < len(basic_questions):
-            if user_input and user_input.strip():
-                # Store the answer
-                question_key = f"basic_q_{self.state.sub_step}"
-                self.state.collected_data[question_key] = user_input
-                self.state.sub_step += 1
-            
-            if self.state.sub_step < len(basic_questions):
-                return {
-                    "action": "claude_response",
-                    "instruction": f"Ask this specific question: '{basic_questions[self.state.sub_step]}'. Be conversational and empathetic. Ask ONLY this question.",
-                    "progress": f"Gathering basic information (Step 3/6) - Question {self.state.sub_step + 1}/{len(basic_questions)}"
-                }
-            else:
-                # Move to analytics processing
-                self.state.phase = ConversationPhase.ANALYTICS_PROCESSING
-                return self._handle_analytics_processing()
+        # Store user input if provided
+        if user_input and user_input.strip():
+            for question_key, _ in basic_questions:
+                if not self.state.questions_asked[question_key]:
+                    self.state.collected_data[question_key] = user_input
+                    self.state.questions_asked[question_key] = True
+                    break
         
-        return {"action": "error", "message": "Basic info gathering error"}
+        # Find next unasked question
+        next_question = None
+        for question_key, question_text in basic_questions:
+            if not self.state.questions_asked[question_key]:
+                next_question = question_text
+                break
+        
+        if next_question:
+            return {
+                "action": "claude_response",
+                "instruction": f"Ask this specific question: '{next_question}'. Be conversational and empathetic. Ask ONLY this question.",
+                "progress": f"Gathering basic information (Step 3/6) - Question {sum(self.state.questions_asked.values()) + 1}/{len(basic_questions)}"
+            }
+        else:
+            # Move to analytics processing
+            self.state.phase = ConversationPhase.ANALYTICS_PROCESSING
+            return self._handle_analytics_processing()
     
     def _handle_analytics_processing(self) -> Dict[str, Any]:
         """Phase 5: Advanced analytics processing"""
         self.state.phase = ConversationPhase.DETAILED_INVESTIGATION
         return {
             "action": "start_detailed_analytics",
-            "message": "Now I'll analyze the specific details of your accident based on the location and your description...",
+            "message": "Perfect! Now I'll analyze the specific details of your accident based on the location and your description...",
             "progress": "Running detailed analysis (Step 4/6)"
         }
     
@@ -272,7 +395,12 @@ def handle_send_message(event):
         
         # Handle special messages
         if user_msg.strip() == "Processing complete. The map data is ready for LLM":
-            orchestrator.state.phase = ConversationPhase.ANALYTICS_PROCESSING
+            # If we're in parallel info gathering, move to detailed investigation
+            # If we're in location processing, move to basic info gathering
+            if orchestrator.state.phase == ConversationPhase.PARALLEL_INFO_GATHERING:
+                orchestrator.state.phase = ConversationPhase.ANALYTICS_PROCESSING
+            else:
+                orchestrator.state.phase = ConversationPhase.BASIC_INFO_GATHERING
         
         # Get next action from orchestrator
         action = orchestrator.get_next_action(user_msg)
@@ -293,6 +421,12 @@ def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[st
         
         if action_type == "claude_response":
             return handle_claude_response(connection_id, action, apig)
+            
+        elif action_type == "start_parallel_processing":
+            return handle_start_parallel_processing(connection_id, action, apig, event)
+            
+        elif action_type == "check_map_processing":
+            return handle_check_map_processing(connection_id, action, apig, event)
             
         elif action_type == "acknowledge_location":
             return handle_acknowledge_location(connection_id, action, apig)
@@ -320,14 +454,82 @@ def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[st
         logger.error(f"❗ Error executing action: {e}")
         return {"statusCode": 500}
 
+
+def handle_start_parallel_processing(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
+    """NEW: Handle parallel processing start - trigger map analysis and ask first question"""
+    try:
+        message = action.get("message")
+        progress = action.get("progress", "")
+        
+        # Send the acknowledgment message
+        chat_histories[connection_id].append({"role": "assistant", "content": message})
+        
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": message,
+                "connectionId": connection_id,
+                "progress": progress,
+                "type": "parallel_processing_started"
+            }).encode("utf-8")
+        )
+        
+        # TODO: Here you would trigger the map processing in the background
+        
+        # Immediately ask the first question
+        orchestrator = orchestrators[connection_id]
+        next_action = orchestrator.get_next_action()
+        
+        # Execute the next action (which should ask the first question)
+        if next_action:
+            return execute_action(connection_id, next_action, event)
+        
+        return {"statusCode": 200}
+        
+    except Exception as e:
+        logger.error(f"❗ Parallel processing start error: {e}")
+        return {"statusCode": 500}
+
+def handle_check_map_processing(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
+    """NEW: Check if map processing is complete and proceed accordingly"""
+    try:
+        # Check if map processing is done (you can implement actual checking logic here)
+        # For now, we'll assume it's ready and move to detailed analytics
+        
+        message = action.get("message", "Location analysis is complete! Now I'll ask some specific questions based on the road layout.")
+        progress = action.get("progress", "")
+        
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": message,
+                "connectionId": connection_id,
+                "progress": progress
+            }).encode("utf-8")
+        )
+        
+        # Move to analytics processing
+        orchestrators[connection_id].state.phase = ConversationPhase.ANALYTICS_PROCESSING
+        
+        return {"statusCode": 200}
+        
+    except Exception as e:
+        logger.error(f"❗ Map processing check error: {e}")
+        return {"statusCode": 500}
+
 def handle_claude_response(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
-    """Handle Claude responses with orchestrator instructions"""
+    """Handle Claude responses with orchestrator instructions - FIXED to include JST time context"""
     try:
         instruction = action.get("instruction", "Continue the conversation naturally.")
         progress = action.get("progress", "")
         
-        # Add instruction to chat history
-        chat_histories[connection_id].append({"role": "user", "content": instruction})
+        # FIXED: Add JST time context
+        jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
+        time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
+        
+        # Add instruction with time context to chat history
+        full_instruction = time_context + instruction
+        chat_histories[connection_id].append({"role": "user", "content": full_instruction})
         
         # Get Claude response
         response = bedrock.invoke_model(
@@ -419,6 +621,22 @@ def handle_trigger_analytics(connection_id: str, action: Dict[str, Any], apig, e
 def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
     """Start detailed analytics with interactive investigation"""
     try:
+        # Prepare collected data - get data from either parallel or basic gathering
+        collected_data = {}
+        orchestrator_data = orchestrators[connection_id].state.collected_data
+        
+        # Map the collected data to consistent keys
+        if "datetime" in orchestrator_data:
+            collected_data["basic_q_0"] = orchestrator_data["datetime"]
+        if "description" in orchestrator_data:
+            collected_data["basic_q_1"] = orchestrator_data["description"]
+        
+        # Fallback to old keys if they exist
+        if "parallel_q_0" in orchestrator_data:
+            collected_data["basic_q_0"] = orchestrator_data["parallel_q_0"]
+        if "parallel_q_1" in orchestrator_data:
+            collected_data["basic_q_1"] = orchestrator_data["parallel_q_1"]
+        
         # Call analytics function
         response = lambda_client.invoke(
             FunctionName=ANALYTICS_FUNCTION_NAME,
@@ -427,7 +645,7 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
                 'connection_id': connection_id,
                 'bucket_name': BUCKET,
                 'message_type': 'initial_analysis',
-                'collected_data': orchestrators[connection_id].state.collected_data
+                'collected_data': collected_data
             })
         )
         
@@ -440,7 +658,7 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
             # Move to detailed investigation
             orchestrators[connection_id].state.phase = ConversationPhase.DETAILED_INVESTIGATION
             
-            first_question = result.get('message', 'Let me ask you some detailed questions about the accident.')
+            first_question = result.get('message', 'Based on the location analysis, let me ask you some detailed questions about the accident.')
             
             # Store interactive state
             store_interactive_state(connection_id, result.get('conversation_state', 'awaiting_direction'))
@@ -495,7 +713,7 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
             # Check if investigation is complete
             if result.get("animation_ready") or result.get("investigation_complete"):
                 orchestrators[connection_id].state.phase = ConversationPhase.SIMILARITY_ANALYSIS
-                message += "\n\nNow let me find similar accident cases for comparison..."
+                message += "\n\nExcellent! Now let me find similar accident cases for comparison..."
                 
                 # Clear interactive state
                 clear_interactive_state(connection_id)
@@ -628,7 +846,7 @@ def handle_finalize_case(connection_id: str, action: Dict[str, Any], apig) -> Di
 
 # --- Interactive Analytics Support (Legacy) ---
 def handle_interactive_analytics_response(connection_id, user_input, current_state, event):
-    """Handle user responses during interactive investigation (legacy support)"""
+    """Handle user responses during interactive investigation (legacy support) - IMPROVED error handling"""
     try:
         logger.info(f"🤖 Processing analytics response: '{user_input}'")
         
@@ -681,17 +899,46 @@ def handle_interactive_analytics_response(connection_id, user_input, current_sta
             
             return {"statusCode": 200}
         else:
-            raise Exception(f"Analytics error: {result}")
+            # Analytics function returned an error
+            error_msg = result.get("errorMessage", "Unknown error")
+            logger.error(f"❗ Analytics function returned error for {connection_id}: {error_msg}")
+            logger.error(f"❗ Full analytics result: {result}")
+            raise Exception(f"Analytics function error: {error_msg}")
             
-    except Exception as e:
-        logger.error(f"❗ Interactive analytics failed: {e}")
+    except json.JSONDecodeError as e:
+        logger.error(f"❗ Failed to parse analytics response for {connection_id}: {e}")
+        logger.error(f"❗ Raw response: {response.get('Payload', 'No payload')}")
         clear_interactive_state(connection_id)
         
         apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
         apig.post_to_connection(
             ConnectionId=connection_id,
             Data=json.dumps({
-                "response": "Let me continue with some general questions about your accident.",
+                "response": "I'm having trouble processing the detailed analysis. Let me analyze your case and compare with similar accidents in our database...",
+                "connectionId": connection_id
+            }).encode("utf-8")
+        )
+        
+        return {"statusCode": 200}
+        
+    except Exception as e:
+        logger.error(f"❗ Interactive analytics failed for {connection_id}: {e}")
+        logger.error(f"❗ Current state: {current_state}")
+        logger.error(f"❗ User input: {user_input}")
+        logger.error(f"❗ Analytics function name: {ANALYTICS_FUNCTION_NAME}")
+        logger.error(f"❗ Bucket: {BUCKET}")
+        
+        # Log the full stack trace
+        import traceback
+        logger.error(f"❗ Full traceback: {traceback.format_exc()}")
+        
+        clear_interactive_state(connection_id)
+        
+        apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+        apig.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps({
+                "response": "I encountered an issue with the detailed investigation. Let me analyze your case and compare with similar accidents in our database...",
                 "connectionId": connection_id
             }).encode("utf-8")
         )
@@ -742,7 +989,12 @@ def clear_interactive_state(connection_id):
 
 # --- Helper Functions ---
 def generate_modifier_questions(modifiers: list[str]) -> list[str]:
+    # FIXED: Add JST time context here too
+    jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
+    time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
+    
     prompt = (
+        time_context +
         "You are Mariko, an empathetic insurance claim operator for Tokio Marine Nichido. "
         "Given the following internal legal or traffic modifiers that affect accident fault ratio, "
         "please turn each into a clear and friendly question you can ask a customer involved in the accident. "
@@ -770,7 +1022,11 @@ def generate_modifier_questions(modifiers: list[str]) -> list[str]:
     return questions
 
 def extract_datetime(full_context):
-    prompt = f"Generate the exact datetime (format: yyyy/mm/dd hh:mm) from this accident description: \"{full_context}\". If the user provides a relative date expression such as yesterday, today, or three days ago, instead of a specific date, estimate the exact date by refferring today's date. Just output yyyy/mm/dd hh:mm directly and Don't include any other messages. If not you can't do it, return 'unknown'."
+    # FIXED: Add JST time context
+    jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
+    time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
+    
+    prompt = time_context + f"Generate the exact datetime (format: yyyy/mm/dd hh:mm) from this accident description: \"{full_context}\". If the user provides a relative date expression such as yesterday, today, or three days ago, instead of a specific date, estimate the exact date by referring to today's date. Just output yyyy/mm/dd hh:mm directly and Don't include any other messages. If you can't do it, return 'unknown'."
     response = bedrock.invoke_model(
         modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
@@ -938,7 +1194,7 @@ def find_matching_pattern(category, full_context):
     result_text = json.loads(response["body"].read())["content"][0]["text"]
     logger.info(f"Similarity match response: {result_text}")
 
-    json_match = re.search(r"$$\s*\{.*?\}\s*$$", result_text, re.DOTALL)
+    json_match = re.search(r"\\$\\$\s*\{.*?\}\s*\\$\\$", result_text, re.DOTALL)
     if json_match:
         try:
             return json.loads(json_match.group(0))
