@@ -14,6 +14,77 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
+LANG_CODES = {"EN","JA","ES","KO","ZH"}
+
+def detect_language_via_llm(user_text: str) -> str:
+    """
+    Call LLM once to classify language.
+    Returns one of: EN, JA, ES, KO, ZH, UNKNOWN
+    """
+    try:
+        instruction = (
+            "You are a strict language identifier.\n"
+            "Your only job is to read the user's message and respond with exactly one of:\n"
+            "EN, JA, ES, KO, ZH, UNKNOWN\n"
+            "No explanation. No punctuation. No extra words."
+            "Classify the language of the following user message.\n"
+            f"User message:\n<<<\n{user_text}\n>>>\n"
+        )
+
+        response = bedrock.invoke_model(
+            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 5,
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "user", "content": instruction},
+                ]
+            })
+        )
+        text = json.loads(response["body"].read())["content"][0]["text"].strip().upper()
+        return text if text in LANG_CODES or text == "UNKNOWN" else "UNKNOWN"
+    except Exception as e:
+        logger.error(f"❗ language detect error: {e}")
+        return "UNKNOWN"
+
+
+def normalize_lang(user_text: str) -> str:
+    """Soft, forgiving mapping. Returns 'en','ja','es','ko','zh' or '' if unsure."""
+    if not user_text:
+        return ""
+    t = user_text.strip().lower()
+
+    # direct codes
+    if t in {"en","ja","es","ko","zh"}:
+        return t
+
+    # look for code inside longer sentence
+    for code in ["en","ja","es","ko","zh"]:
+        if f" {code} " in f" {t} ":
+            return code
+
+    # language names / native scripts
+    if any(k in t for k in ["english","inglés"]): return "en"
+    if any(k in t for k in ["日本語","japanese","japonés","japones","jp"]): return "ja"
+    if any(k in t for k in ["español","spanish","espanol"]): return "es"
+    if any(k in t for k in ["한국어","korean","coreano","kr"]): return "ko"
+    if any(k in t for k in ["中文","chinese","chino","cn","汉语","漢語"]): return "zh"
+
+    # final heuristic: if the text contains many CJK chars, guess zh/ja/ko
+    cjk = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
+    hangul = sum(1 for ch in t if '\uac00' <= ch <= '\ud7af')
+    if hangul > 0: return "ko"
+    if cjk > 0:
+        # very rough: presence of "の/です/ます/に/を" may hint Japanese
+        if any(k in t for k in ["です","ます","の","に","を","が"]): return "ja"
+        return "zh"
+
+    return ""  # let the system ask again
+
+
 # --- Setup ---
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -33,16 +104,20 @@ ANALYTICS_FUNCTION_NAME = os.environ.get('ANALYTICS_FUNCTION_NAME')
 chat_histories = {}
 apig_clients = {}
 
+
+
 # --- Task Orchestrator ---
 class ConversationPhase(Enum):
     GREETING = "greeting"
+    LANGUAGE_SELECTION = "language_selection"
     LOCATION_PINNING = "location_pinning"
-    PARALLEL_INFO_GATHERING = "parallel_info_gathering"  # NEW: Gather info while map processes
+    PARALLEL_INFO_GATHERING = "parallel_info_gathering"
     LOCATION_PROCESSING = "location_processing"
     BASIC_INFO_GATHERING = "basic_info_gathering"
     ANALYTICS_PROCESSING = "analytics_processing"
     DETAILED_INVESTIGATION = "detailed_investigation"
     SIMILARITY_ANALYSIS = "similarity_analysis"
+    LEGAL_MODIFIER_INVESTIGATION = "legal_modifier_investigation"  # NEW
     CASE_FINALIZATION = "case_finalization"
     COMPLETED = "completed"
 
@@ -55,7 +130,13 @@ class TaskState:
     analytics_result: Dict[str, Any] = None
     location_attempts: int = 0
     map_processing_started: bool = False  # NEW: Track if map processing started
-    questions_asked: Dict[str, bool] = None  # Track which questions have been asked
+    questions_asked: Dict[str, bool] = None  # Track which questions have been 
+    user_language: str = None  # instead of "en"
+    awaiting_user_input_for: str = None  # NEW: track what we're waiting for
+    modifier_questions: List[str] = None
+    modifier_answers: Dict[str, str] = None
+    current_modifier_index: int = 0
+    #user_language: str = "en"  # NEW: default to English
     
     def __post_init__(self):
         if self.collected_data is None:
@@ -64,6 +145,10 @@ class TaskState:
             self.pending_questions = []
         if self.questions_asked is None:
             self.questions_asked = {"datetime": False, "description": False}
+        if self.modifier_questions is None:
+            self.modifier_questions = []
+        if self.modifier_answers is None:
+            self.modifier_answers = {}
 
 class TaskOrchestrator:
     """Central controller for managing conversation flow and task delegation"""
@@ -77,6 +162,9 @@ class TaskOrchestrator:
         
         if self.state.phase == ConversationPhase.GREETING:
             return self._handle_greeting()
+
+        elif self.state.phase == ConversationPhase.LANGUAGE_SELECTION:
+            return self._handle_language_selection(user_input)
             
         elif self.state.phase == ConversationPhase.LOCATION_PINNING:
             return self._handle_location_pinning(user_input)
@@ -98,144 +186,225 @@ class TaskOrchestrator:
             
         elif self.state.phase == ConversationPhase.SIMILARITY_ANALYSIS:
             return self._handle_similarity_analysis()
+
+        elif self.state.phase == ConversationPhase.LEGAL_MODIFIER_INVESTIGATION:
+            return self._handle_legal_modifier_investigation(user_input)
             
         elif self.state.phase == ConversationPhase.CASE_FINALIZATION:
             return self._handle_case_finalization()
             
         else:
             return {"action": "error", "message": "Unknown phase"}
-    
+
+    def _handle_legal_modifier_investigation(self, user_input: str) -> Dict[str, Any]:
+        lang = (self.state.user_language or "en").upper()
+        
+        # Store user's answer if provided
+        if user_input and user_input.strip() and self.state.current_modifier_index > 0:
+            question_key = f"modifier_{self.state.current_modifier_index - 1}"
+            self.state.modifier_answers[question_key] = user_input
+        
+        # Check if we have more questions to ask
+        if self.state.current_modifier_index < len(self.state.modifier_questions):
+            current_question = self.state.modifier_questions[self.state.current_modifier_index]
+            self.state.current_modifier_index += 1
+            
+            return {
+                "action": "claude_response",
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    f"Ask this specific question to determine legal liability factors: "
+                    f"'{current_question}' "
+                    "Be empathetic and explain that this helps determine accurate fault ratios."
+                ),
+                "progress": f"Legal assessment (Step 6/6) - Question {self.state.current_modifier_index}/{len(self.state.modifier_questions)}"
+            }
+        else:
+            # All modifier questions answered, move to finalization
+            self.state.phase = ConversationPhase.CASE_FINALIZATION
+            return {
+                "action": "claude_response",
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    "Thank the user for providing detailed information and explain that "
+                    "you're now calculating the final fault ratio and preparing their claim summary."
+                ),
+                "progress": "Calculating fault ratio (Step 6/6)"
+            }
+
+
     def _handle_greeting(self) -> Dict[str, Any]:
-        """Phase 1: Initial greeting and map request"""
+        # Move to language selection; LLM will produce a multilingual greeting on its own
+        self.state.phase = ConversationPhase.LANGUAGE_SELECTION
+
+        return {
+            "action": "claude_response",
+            # Keep the system light—just set role; let the model compose freely
+            "system": (
+                "You are Mariko, a claims operator at Tokio Marine & Nichido. "
+                "Be polite, concise, and professional."
+            ),
+            # ✅ Your working instruction (as you wrote it)
+            "instruction": (
+                "あなたは東京海上日動で働いているマリコです。あなたはマルチリンガルで、"
+                "日本語、英語、韓国語、中国語が話せます。まずはすべての言葉であいさつをしながら、"
+                "どの言語を選ぶかお客様に聞いてください。"
+            ),
+            "progress": "Language selection"
+        }
+
+    def _handle_language_selection(self, user_input: str) -> Dict[str, Any]:
+        code = detect_language_via_llm(user_input)  # -> EN/JA/ES/KO/ZH/UNKNOWN
+
+        if code == "UNKNOWN":
+            # Ask again in multiple languages
+            return {
+                "action": "claude_response",
+                "instruction": (
+                    "The user hasn't clearly selected a language. "
+                    "Ask them again to choose their preferred language, offering: "
+                    "English (EN), 日本語 (JA), Español (ES), 한국어 (KO), 中文 (ZH). "
+                    "Be multilingual in your response."
+                ),
+                "progress": "Language selection"
+            }
+
+        # Lock language + move to next phase
+        self.state.user_language = code.lower()
         self.state.phase = ConversationPhase.LOCATION_PINNING
+
         return {
             "action": "claude_response",
             "instruction": (
-                "You are Mariko from Tokio Marine Nichido. Start the conversation by greeting the user "
-                "and asking them to pin the location on the map where their accident occurred. "
-                "Be empathetic and professional. Don't ask multiple questions - just focus on getting "
-                "the location pinned first."
+                f"Reply only in {code}. "
+                "Tell the user they have a map UI and ask them to: "
+                "1) Drop a pin on the exact accident location, "
+                "2) Click the button below the map, "
+                "3) Then wait a moment."
             ),
-            "progress": "Starting claim process (Step 1/6)"
+            "progress": "Pin the location (Step 1/6)"
         }
 
     def _handle_location_pinning(self, user_input: str) -> Dict[str, Any]:
-        """Phase 2: Waiting for location to be pinned"""
+        lang = (self.state.user_language or "en").upper()
+
         logger.info(f"🗺️ Location pinning - received input: '{user_input}'")
-        
-        # Check for various location indicators
         location_detected = False
+
         if user_input:
-            location_indicators = [
-                "Location was detected",
-                "coordinates",
-                "lat",
-                "longitude",
-                "pinned",
-                "dropped"
-            ]
-            
-            # Check for text indicators
-            for indicator in location_indicators:
+            # Your existing heuristics for detection
+            indicators = ["Location was detected", "Location detected", "coordinates", "lat", "longitude", "pinned", "dropped"]
+            for indicator in indicators:
                 if indicator.lower() in user_input.lower():
                     location_detected = True
                     break
-            
-            # Check for coordinate patterns (decimal numbers) - avoiding regex
             if not location_detected:
-                # Simple check for decimal numbers without regex
-                words = user_input.split()
-                for word in words:
+                for word in user_input.split():
                     try:
-                        float_val = float(word)
-                        if '.' in word and len(word) > 3:  # Simple decimal check
+                        float(word)
+                        if "." in word and len(word) > 3:
                             location_detected = True
                             break
                     except ValueError:
                         continue
-        
+
         if location_detected:
             logger.info(f"✅ Locations detected for {self.connection_id}")
-            # Move to parallel info gathering instead of waiting for processing
+            # Advance phase; map analysis can run in parallel as before
             self.state.phase = ConversationPhase.PARALLEL_INFO_GATHERING
             self.state.map_processing_started = True
-            
+
+            # Say a short acknowledgment, then immediately proceed to ask first question
             return {
-                "action": "start_parallel_processing",
-                "message": (
-                    "Perfect! Thank you for pinning the location. I'm analyzing the road infrastructure "
-                    "and traffic conditions in the background. While that's processing, let me gather "
-                    "some basic information to move things along quickly."
+                "action": "claude_response",
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    "Say this to the user, concisely, in 1–2 short sentences:\n"
+                    "Thanks—I've received your pinned location. I'm analyzing the map in the background now. "
+                    "Let me start with the first question: What date and time did the accident occur?"
                 ),
                 "progress": "Processing location & gathering info (Step 2/6)"
             }
-        else:
-            # Increment attempts to prevent infinite loops
-            self.state.location_attempts += 1
-            
-            # If too many attempts, move forward anyway
-            if self.state.location_attempts > 3:
-                logger.warning(f"⚠️ Too many location attempts for {self.connection_id}, moving forward")
-                self.state.phase = ConversationPhase.PARALLEL_INFO_GATHERING
-                return {
-                    "action": "claude_response",
-                    "instruction": "Let's proceed without the exact location for now. Ask the user about the basic details of their accident - what happened and when did it occur?",
-                    "progress": "Gathering basic information (Step 3/6)"
-                }
-            
+
+        # Not detected yet → keep asking, up to N tries, but do NOT crash or change architectures
+        self.state.location_attempts += 1
+        if self.state.location_attempts > 3:
+            logger.warning(f"⚠️ No pin after multiple attempts for {self.connection_id}; continuing.")
+            self.state.phase = ConversationPhase.PARALLEL_INFO_GATHERING
             return {
-                "action": "claude_response", 
+                "action": "claude_response",
                 "instruction": (
-                    "The user is trying to communicate but hasn't pinned the location yet. "
-                    "Gently redirect them to pin the location on the map first. "
-                    "Be patient and understanding - they might be having trouble with the map interface."
+                    f"Reply only in {lang}. "
+                    "Say this to the user, concisely, in 1–2 short sentences:\n"
+                    "“No problem—let’s continue while the map is processing. First, what date and time did the accident occur?”"
                 ),
-                "progress": "Waiting for location (Step 1/6)"
+                "progress": "Gathering basic information (Step 3/6)"
             }
+
+        # Ask again (simple, no i18n table)
+        return {
+            "action": "claude_response",
+            "instruction": (
+                f"Reply only in {lang}. "
+                "Tell the user, in one short sentence: "
+                "“Please use the map UI to drop a pin on the exact accident location, then press the button below the map.”"
+            ),
+            "progress": "Waiting for location (Step 1/6)"
+        }
 
 
     def _handle_parallel_info_gathering(self, user_input: str) -> Dict[str, Any]:
-        """NEW Phase: Gather info while map processes in background - FIXED to avoid duplicate questions"""
-        parallel_questions = [
-            ("datetime", "What date and time did the accident occur?"),
-            ("description", "Could you please describe what happened during the accident? Feel free to share as much detail as you remember.")
-        ]
+        lang = (self.state.user_language or "en").upper()
         
-        # If we have user input (and it's not the initial call), store it
-        if user_input and user_input.strip() and not self.state.map_processing_started:
-            # Find the current question being answered
-            for i, (question_key, _) in enumerate(parallel_questions):
-                if i == self.state.sub_step and not self.state.questions_asked[question_key]:
-                    self.state.collected_data[question_key] = user_input
-                    self.state.questions_asked[question_key] = True
-                    self.state.sub_step += 1
-                    break
+        # Store user input if provided
+        if user_input and user_input.strip():
+            # Determine which question this answers
+            if not self.state.questions_asked["datetime"]:
+                self.state.collected_data["datetime"] = user_input
+                self.state.questions_asked["datetime"] = True
+            elif not self.state.questions_asked["description"]:
+                self.state.collected_data["description"] = user_input
+                self.state.questions_asked["description"] = True
         
-        # Reset the flag after first use
-        if self.state.map_processing_started:
-            self.state.map_processing_started = False
-        
-        # Find next unasked question
-        next_question = None
-        for i, (question_key, question_text) in enumerate(parallel_questions):
-            if not self.state.questions_asked[question_key]:
-                next_question = question_text
-                break
-        
-        if next_question:
+        # Find next question to ask
+        if not self.state.questions_asked["datetime"]:
+            self.state.awaiting_user_input_for = "datetime"  # Track what we're waiting for
             return {
                 "action": "claude_response",
-                "instruction": f"Ask this question naturally: '{next_question}'. Be conversational and empathetic.",
-                "progress": f"Gathering information (Step 2/6) - Question {sum(self.state.questions_asked.values()) + 1}/{len(parallel_questions)}"
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    "Ask the user this question in a friendly, empathetic way: "
+                    "'What date and time did the accident occur?'"
+                ),
+                "progress": "Gathering information (Step 2/6) - Question 1/2"
+            }
+        elif not self.state.questions_asked["description"]:
+            self.state.awaiting_user_input_for = "description"  # Track what we're waiting for
+            return {
+                "action": "claude_response",
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    "Ask the user this question in a friendly, empathetic way: "
+                    "'Could you describe what happened during the accident?'"
+                ),
+                "progress": "Gathering information (Step 2/6) - Question 2/2"
             }
         else:
-            # All questions answered, check if map processing is done
+            # All questions answered, move to next phase
+            self.state.phase = ConversationPhase.ANALYTICS_PROCESSING
+            self.state.awaiting_user_input_for = None
             return {
-                "action": "check_map_processing",
-                "message": "Thank you for that information. Let me check if the location analysis is complete...",
+                "action": "claude_response",
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    "Tell the user, concisely: "
+                    "'Perfect! I have all the basic information. Now I'll analyze the location details and ask some specific questions based on the road layout.'"
+                ),
                 "progress": "Finalizing location analysis (Step 3/6)"
             }
-    
+
+
+
     def _handle_location_processing(self) -> Dict[str, Any]:
         """Phase 3: Processing location data (now rarely used due to parallel processing)"""
         return {
@@ -619,23 +788,44 @@ def handle_trigger_analytics(connection_id: str, action: Dict[str, Any], apig, e
         return {"statusCode": 500}
 
 def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
-    """Start detailed analytics with interactive investigation"""
+    """Start detailed analytics with interactive investigation - FIXED data mapping"""
     try:
-        # Prepare collected data - get data from either parallel or basic gathering
+        # Get orchestrator data
+        orchestrator = orchestrators[connection_id]
+        orchestrator_data = orchestrator.state.collected_data
+        
+        # FIXED: Comprehensive data mapping with debugging
         collected_data = {}
-        orchestrator_data = orchestrators[connection_id].state.collected_data
         
-        # Map the collected data to consistent keys
-        if "datetime" in orchestrator_data:
-            collected_data["basic_q_0"] = orchestrator_data["datetime"]
-        if "description" in orchestrator_data:
-            collected_data["basic_q_1"] = orchestrator_data["description"]
+        # Debug: Log what we have
+        logger.info(f"🔍 Orchestrator collected data: {orchestrator_data}")
+        logger.info(f"🔍 Questions asked status: {orchestrator.state.questions_asked}")
         
-        # Fallback to old keys if they exist
-        if "parallel_q_0" in orchestrator_data:
-            collected_data["basic_q_0"] = orchestrator_data["parallel_q_0"]
-        if "parallel_q_1" in orchestrator_data:
-            collected_data["basic_q_1"] = orchestrator_data["parallel_q_1"]
+        # Priority 1: Direct keys from parallel/basic gathering
+        datetime_value = None
+        description_value = None
+        
+        # Check all possible datetime keys
+        for key in ["datetime", "parallel_q_0", "basic_q_0"]:
+            if key in orchestrator_data and orchestrator_data[key]:
+                datetime_value = orchestrator_data[key]
+                logger.info(f"✅ Found datetime in key: {key} = {datetime_value}")
+                break
+        
+        # Check all possible description keys  
+        for key in ["description", "parallel_q_1", "basic_q_1"]:
+            if key in orchestrator_data and orchestrator_data[key]:
+                description_value = orchestrator_data[key]
+                logger.info(f"✅ Found description in key: {key} = {description_value}")
+                break
+        
+        # Map to analytics expected format
+        if datetime_value:
+            collected_data["basic_q_0"] = datetime_value
+        if description_value:
+            collected_data["basic_q_1"] = description_value
+            
+        logger.info(f"📤 Sending to analytics: {collected_data}")
         
         # Call analytics function
         response = lambda_client.invoke(
@@ -681,6 +871,7 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
     except Exception as e:
         logger.error(f"❗ Detailed analytics error: {e}")
         return {"statusCode": 500}
+
 
 def handle_interactive_investigation(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
     """Handle interactive investigation responses"""
@@ -750,6 +941,7 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
         logger.error(f"❗ Interactive investigation error: {e}")
         return {"statusCode": 500}
 
+
 def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
     """Handle similarity search and case matching"""
     try:
@@ -780,31 +972,38 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
                 if modifiers:
                     mod_questions = generate_modifier_questions(modifiers)
                     
-                    followup_msg = (
-                        "I found some similar cases in our database. To provide the most accurate assessment, "
-                        "I have a few more specific questions:\n\n"
-                        + "\n".join(f"• {q}" for q in mod_questions)
-                        + "\n\nPlease answer what you can remember."
+                    # Store modifier questions in orchestrator state
+                    orchestrators[connection_id].state.modifier_questions = mod_questions
+                    orchestrators[connection_id].state.current_modifier_index = 0
+                    
+                    # Move to legal modifier investigation phase
+                    orchestrators[connection_id].state.phase = ConversationPhase.LEGAL_MODIFIER_INVESTIGATION
+                    
+                    intro_msg = (
+                        "I found some similar cases in our database. To provide the most accurate fault ratio assessment, "
+                        "I need to ask a few specific questions about the circumstances. These help determine legal liability factors."
                     )
                     
                     apig.post_to_connection(
                         ConnectionId=connection_id,
                         Data=json.dumps({
-                            "response": followup_msg,
+                            "response": intro_msg,
                             "connectionId": connection_id,
-                            "progress": "Final questions (Step 6/6)"
+                            "progress": "Preparing legal assessment (Step 6/6)"
                         }).encode("utf-8")
                     )
                     
                     return {"statusCode": 200}
         
-        # Move to finalization
+        # Move to finalization if no modifiers or not enough context
         orchestrators[connection_id].state.phase = ConversationPhase.CASE_FINALIZATION
         return handle_finalize_case(connection_id, {"action": "finalize_case"}, apig)
         
     except Exception as e:
         logger.error(f"❗ Similarity search error: {e}")
         return {"statusCode": 500}
+
+
 
 def handle_finalize_case(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
     """Finalize the case"""

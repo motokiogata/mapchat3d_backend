@@ -391,103 +391,48 @@ class InteractiveTrafficAnalyzer:
 
 
     def process_user_response(self, user_input, current_state):
-        """Process response and move to next question with rock-solid state handling."""
-
-        # 1) Persist raw response for auditability
+        """Process response and move to next question"""
+        
+        # Save response
         self.responses[current_state] = user_input
-
-        # 2) Let the per-state logic update path / possibly queue a forced follow-up
+        
+        # Update user path with structured data
         self.update_user_path_from_response(user_input, current_state)
-
-        # 3) If we queued a forced question (choice or confirmation), return it NOW
-        #    IMPORTANT: do NOT advance the step here.
-        if getattr(self, "_next_forced", None):
-            nxt = self._next_forced
-            self._next_forced = None
-
-            # Safety: forced payload must include conversation_state
-            if "conversation_state" not in nxt or not nxt["conversation_state"]:
-                # Fall back to echo current_state so app.py keeps the thread
-                nxt["conversation_state"] = current_state
-
-            return nxt
-
-        # 4) No forced question -> advance the scripted wizard by ONE step
+        
+        # Move to next step
         self.current_step += 1
-
-        # 5) Ask the next scripted question
-        nxt = self.get_next_question()
-
-        # Safety: always return a conversation_state
-        if not isinstance(nxt, dict):
-            nxt = {"statusCode": 200, "message": str(nxt), "conversation_state": "unknown"}
-
-        if "conversation_state" not in nxt or not nxt["conversation_state"]:
-            # Best-effort default to the nominal step name
-            if 0 <= self.current_step < len(self.investigation_steps):
-                nxt["conversation_state"] = self.investigation_steps[self.current_step]
-            else:
-                nxt["conversation_state"] = "investigation_complete"
-
-        return nxt
-
+        
+        # Get next question (which will use JSON data)
+        return self.get_next_question()
 
     def update_user_path_from_response(self, user_input, current_state):
-        """Update user path with structured data extraction and drive alias-based clarification."""
+        """Update user path with structured data extraction"""
 
-        def _as_int(s):
-            try:
-                # Handle both "1" and "Road_1" formats
-                s_clean = str(s).strip().lower()
-                if s_clean.startswith("road_"):
-                    # Extract number from "road_0" -> try index 0+1=1
-                    road_num = s_clean.replace("road_", "")
-                    return int(road_num) + 1  # Convert 0-based to 1-based
-                return int(s_clean)
-            except Exception:
-                return None
-
-
-        # --- Original scripted states ---
         if current_state == "approach_direction":
-            # Save & try to extract road name
+            # User vehicle origin direction
             self.user_path["origin_direction"] = user_input
             self.extract_road_name_from_direction(user_input)
 
-            # If alias flow is available, propose origin road choices (do NOT advance step)
-            if hasattr(self, "_propose_origin_roads_question"):
-                q = self._propose_origin_roads_question()
-                if q:
-                    self._next_forced = q
-                    return
-
-            # Fallback: try automatic ID resolution (user)
-            if hasattr(self, "_resolve_vehicle_origin_ids"):
-                try:
-                    self._resolve_vehicle_origin_ids("user")
-                except Exception as e:
-                    logger.warning(f"user origin lane resolve failed: {e}")
+            # Try resolving IDs for user vehicle
+            try:
+                self._resolve_vehicle_origin_ids("user")
+            except Exception as e:
+                logger.warning(f"user origin lane resolve failed: {e}")
 
         elif current_state == "intended_action":
+            # User vehicle intended maneuver
             self.user_path["intended_maneuver"] = user_input
             self.extract_destination_from_action(user_input)
 
-            # If alias flow is available and road is chosen, propose lanes now
-            if self.user_path.get("origin_road_id") is not None and hasattr(self, "_propose_origin_lanes_question"):
-                q = self._propose_origin_lanes_question()
-                if q:
-                    self._next_forced = q
-                    return
-
-            # Fallback: keep trying auto resolution (user)
-            if hasattr(self, "_resolve_vehicle_origin_ids"):
-                try:
-                    self._resolve_vehicle_origin_ids("user")
-                except Exception as e:
-                    logger.warning(f"user origin lane somehow resolve failed: {e}")
+            # Try resolving IDs again (maneuver helps filtering)
+            try:
+                self._resolve_vehicle_origin_ids("user")
+            except Exception as e:
+                logger.warning(f"user origin lane resolve failed: {e}")
 
         elif current_state == "lane_position":
             self.user_path["approach_lane"] = self.standardize_lane(user_input)
+            # (Optional) refine lane choice here if multiple candidates exist
 
         elif current_state == "traffic_signal":
             self.user_path["traffic_conditions"]["signal_state"] = user_input
@@ -496,97 +441,27 @@ class InteractiveTrafficAnalyzer:
             ov = self.user_path.setdefault("other_vehicle", {})
             ov["position"] = user_input
 
-            # Optional: mirror alias flow for the other vehicle; for now, try auto-resolve
-            if hasattr(self, "_resolve_vehicle_origin_ids"):
-                try:
-                    self._resolve_vehicle_origin_ids("other")
-                except Exception as e:
-                    logger.warning(f"other origin lane resolve failed: {e}")
+            # Try resolving IDs for other vehicle
+            try:
+                self._resolve_vehicle_origin_ids("other")
+            except Exception as e:
+                logger.warning(f"other origin lane resolve failed: {e}")
 
         elif current_state == "other_vehicle_action":
             ov = self.user_path.setdefault("other_vehicle", {})
             ov["action"] = user_input
 
-            if hasattr(self, "_resolve_vehicle_origin_ids"):
-                try:
-                    self._resolve_vehicle_origin_ids("other")
-                except Exception as e:
-                    logger.warning(f"other origin lane resolve failed: {e}")
+            # Try resolving IDs again once we know action
+            try:
+                self._resolve_vehicle_origin_ids("other")
+            except Exception as e:
+                logger.warning(f"other origin lane resolve failed: {e}")
 
         elif current_state == "collision_point":
             self.user_path["collision_point"] = user_input
 
         elif current_state == "accident_time":
             self.user_path["accident_time"] = user_input
-
-        # --- Alias micro-states (injected when we need clarification) ---
-        elif current_state == "choose_origin_road":
-            idx = _as_int(user_input)
-            choice = None
-            
-            if idx and hasattr(self, "_pending_origin_road_choices"):
-                choice = next((c for c in self._pending_origin_road_choices if c["idx"] == idx), None)
-
-            if choice:
-                self.user_path["origin_road_id"] = choice["road_id"]
-                logger.info(f"✅ User selected road: {choice['alias']} (ID: {choice['road_id']})")
-
-                # Next: choose lane (filtered by maneuver); do NOT advance wizard step
-                if hasattr(self, "_propose_origin_lanes_question"):
-                    q = self._propose_origin_lanes_question()
-                    if q:
-                        self._next_forced = q
-                        return
-            else:
-                # Re-ask the same forced question with error message
-                logger.warning(f"⚠️ Invalid road selection: '{user_input}' (parsed as {idx})")
-                if hasattr(self, "_propose_origin_roads_question"):
-                    q = self._propose_origin_roads_question()
-                    if q:
-                        q["message"] = f"I didn't understand '{user_input}'. " + q["message"]
-                        self._next_forced = q
-                        return
-
-        elif current_state == "choose_origin_lane":
-            idx = _as_int(user_input)
-            choice = None
-            if idx and hasattr(self, "_pending_origin_lane_choices"):
-                choice = next((c for c in self._pending_origin_lane_choices if c["idx"] == idx), None)
-
-            if choice:
-                self.user_path["origin_lane_id"] = choice["lane_id"]
-
-                # Final confirmation before locking; do NOT advance wizard step
-                if hasattr(self, "_confirmation_question"):
-                    q = self._confirmation_question()
-                    if q:
-                        self._next_forced = q
-                        return
-            else:
-                # Re-ask the same forced question
-                if hasattr(self, "_propose_origin_lanes_question"):
-                    q = self._propose_origin_lanes_question()
-                    if q:
-                        self._next_forced = q
-                        return
-
-        elif current_state == "confirm_summary":
-            yn = (user_input or "").strip().lower()
-            if yn in ("yes", "y", "ok", "correct"):
-                # Accepted → nothing else to do; the main flow will advance after this
-                return
-            else:
-                # Not correct → restart the alias selection at roads; do NOT advance wizard step
-                if hasattr(self, "_propose_origin_roads_question"):
-                    q = self._propose_origin_roads_question()
-                    if q:
-                        self._next_forced = q
-                        return
-
-        else:
-            # Unknown state: do nothing but keep going
-            logger.warning(f"Unrecognized conversation_state '{current_state}', continuing.")
-
 
 
 
@@ -1455,216 +1330,79 @@ class InteractiveTrafficAnalyzer:
         ]
 
     def _build_road_index(self):
+        """name.lower() -> road_id, and id->name map from roads_metadata_only.json"""
         name2id, id2name = {}, {}
         for r in (self.roads_data or {}).get("roads_metadata", []):
             rid = r.get("road_id")
             nm  = (r.get("name") or r.get("display_name") or "").strip()
-            if nm and rid is not None:
+            if nm != "" and rid is not None:
                 name2id[nm.lower()] = rid
                 id2name[rid] = nm
         return name2id, id2name
 
-    def _dir8_label(self, d: str) -> str:
-        d = (d or "unknown").lower()
-        if d in ("n","north"): return "NB"
-        if d in ("s","south"): return "SB"
-        if d in ("e","east"):  return "EB"
-        if d in ("w","west"):  return "WB"
-        if "northwest" in d or d=="nw": return "NW"
-        if "northeast" in d or d=="ne": return "NE"
-        if "southwest" in d or d=="sw": return "SW"
-        if "southeast" in d or d=="se": return "SE"
-        return d.upper()
-
-
     def _build_lane_index(self):
+        """
+        Build lane lookups from lane_tree_routes_enhanced.json:
+        - by_lane_id: lane_id -> lane object
+        - by_road: road_id -> [lane objects]
+        - by_name_dir: (parent_road_name.lower(), direction.lower()) -> [lane objects]
+        """
         by_lane_id, by_road, by_name_dir = {}, {}, {}
         for lane in (self.lane_tree_data or {}).get("lane_trees", []):
             lid = lane.get("lane_id")
             rid = lane.get("road_id")
-            meta = lane.get("metadata", {}) or {}
-            name = (meta.get("parent_road_name") or meta.get("road_name") or "").strip()
+            meta = lane.get("metadata", {})
+            name = (meta.get("parent_road_name") or meta.get("road_name") or "").lower()
             direction = (lane.get("direction") or meta.get("dir8") or meta.get("traffic_direction") or "unknown").lower()
+
             if lid:
                 by_lane_id[lid] = lane
             if rid is not None:
                 by_road.setdefault(rid, []).append(lane)
             if name:
-                by_name_dir.setdefault((name.lower(), direction), []).append(lane)
+                by_name_dir.setdefault((name, direction), []).append(lane)
         return by_lane_id, by_road, by_name_dir
 
-
-    def _alias_for_road(self, road_id: int, dir8: str = None) -> str:
-        """FIXED: Better road naming with actual direction analysis"""
-        base = self.road_id2name.get(road_id, f"Road_{road_id}")
-        
-        # ✅ GET ACTUAL DIRECTION FROM LANE DATA
-        actual_directions = []
-        for lane in self.lanes_by_road.get(road_id, []):
-            lane_dir = (lane.get("direction") or lane.get("metadata", {}).get("dir8") or "").lower()
-            if lane_dir and lane_dir not in actual_directions:
-                actual_directions.append(lane_dir)
-        
-        if actual_directions:
-            # Show all directions this road serves
-            dir_labels = [self._dir8_label(d) for d in actual_directions[:2]]  # Max 2
-            dir_text = "/".join(dir_labels)
-        else:
-            dir_text = self._dir8_label(dir8) if dir8 else "unknown"
-        
-        return f"{base} ({dir_text})"
-    
-        
-    def _alias_for_lane(self, lane_obj) -> str:
-        meta = lane_obj.get("metadata", {}) or {}
-        base = (meta.get("parent_road_name") or meta.get("road_name") or self.road_id2name.get(lane_obj.get("road_id"), "Road"))
-        dir8 = (lane_obj.get("direction") or meta.get("dir8") or "unknown")
-        turns = meta.get("allowed_turns") or []
-        turn_txt = "left-turn" if "left" in turns else ("right-turn" if "right" in turns else ("through" if "through" in turns else "lane"))
-        # crude lateral hint if present
-        pos = meta.get("lateral_position_label") or meta.get("lane_position_label") or ""
-        pos_txt = f" – {pos}" if pos else ""
-        return f"{base} ({self._dir8_label(dir8)}) {turn_txt}{pos_txt}"
-
-    def _lane_choices_for(self, road_id: int, dirset: set, intended_std: str):
-        allowed_pref = {"straight": {"through"}, "left_turn": {"left"}, "right_turn": {"right"}}.get(intended_std, {"through","left","right"})
-        def lane_dir(l): return (l.get("direction") or l.get("metadata", {}).get("dir8") or "").lower()
-        def lane_ok(l):
-            al = (l.get("metadata", {}).get("allowed_turns") or [])
-            return any(a in allowed_pref for a in al) if al else True
-        candidates = [l for l in self.lanes_by_road.get(road_id, []) if (lane_dir(l) in dirset)]
-        prefer = [l for l in candidates if lane_ok(l)]
-        return prefer or candidates
-
     def _dir8_from_origin_direction(self, origin_direction: str) -> set:
+        """
+        Map user's 'came from <dir>' into the vehicle's travel direction toward the center.
+        E.g., from 'north' means traveling south-ish (S / SE / SW).
+        """
         d = (origin_direction or "unknown").lower()
-        if "north" in d or d=="n": return {"s","se","sw"}
-        if "south" in d or d=="s": return {"n","ne","nw"}
-        if "west"  in d or d=="w": return {"e","ne","se"}
-        if "east"  in d or d=="e": return {"w","nw","sw"}
-        if d in ("ne","northeast"): return {"sw"}
-        if d in ("nw","northwest"): return {"se"}
-        if d in ("se","southeast"): return {"nw"}
-        if d in ("sw","southwest"): return {"ne"}
-        return {"n","s","e","w"}  # fall back
-
-
-    def _propose_origin_roads_question(self):
-        """Add debugging info"""
-        origin_dir = self.user_path.get("origin_direction")
-        dirset = self._dir8_from_user_origin(self.standardize_direction(origin_dir))
-        
-        logger.info(f"🧭 User said direction: '{origin_dir}' -> Travel directions: {dirset}")
-        logger.info(f"📍 Available roads: {list(self.lanes_by_road.keys())}")
-        
-        """FIXED: Better road filtering and error handling"""
-        dirset = self._dir8_from_user_origin(self.standardize_direction(self.user_path.get("origin_direction")))
-        
-        candidates = []
-        seen = set()
-        
-        for rid, lanes in self.lanes_by_road.items():
-            # ✅ CHECK IF ANY LANE ON THIS ROAD MATCHES THE DIRECTION SET
-            matching_lanes = []
-            for lane in lanes:
-                lane_dir = (lane.get("direction") or lane.get("metadata", {}).get("dir8") or "").lower()
-                if lane_dir in dirset or any(d in lane_dir for d in dirset):
-                    matching_lanes.append(lane)
-            
-            if matching_lanes:
-                # Use the most common direction from matching lanes
-                dirs = [l.get("direction") or l.get("metadata", {}).get("dir8") or "" for l in matching_lanes]
-                most_common_dir = max(set(dirs), key=dirs.count) if dirs else ""
-                alias = self._alias_for_road(rid, most_common_dir)
-                
-                if (rid, alias) not in seen:
-                    candidates.append((rid, alias))
-                    seen.add((rid, alias))
-
-        # ✅ FALLBACK: If no matches, show ALL roads
-        if not candidates:
-            logger.warning(f"⚠️ No roads found for direction set {dirset}, showing all roads")
-            for rid in list(self.lanes_by_road.keys())[:6]:  # Limit to 6
-                alias = self._alias_for_road(rid)
-                candidates.append((rid, alias))
-
-        if not candidates:
-            logger.error("❗ No roads available at all!")
-            return None
-
-        # Limit to 6 options
-        candidates = candidates[:6]
-        self._pending_origin_road_choices = [
-            {"idx": i+1, "road_id": rid, "alias": alias} 
-            for i, (rid, alias) in enumerate(candidates)
-        ]
-        
-        options = "\n".join([f"{c['idx']}. {c['alias']}" for c in self._pending_origin_road_choices])
-        
-        return {
-            "statusCode": 200,
-            "message": f"Which road were you on as you approached?\n{options}\n\nPlease answer with the number (1, 2, 3, etc.)",
-            "conversation_state": "choose_origin_road"
-        }
-
-
-    def _propose_origin_lanes_question(self):
-        rid = self.user_path.get("origin_road_id")
-        if rid is None: return None
-        dirset = self._dir8_from_origin_direction(self.standardize_direction(self.user_path.get("origin_direction")))
-        intended = self.standardize_maneuver(self.user_path.get("intended_maneuver"))
-        lanes = self._lane_choices_for(rid, dirset, intended)
-        if not lanes: return None
-        self._pending_origin_lane_choices = [{"idx": i+1, "lane_id": l.get("lane_id"), "alias": self._alias_for_lane(l)} for i,l in enumerate(lanes[:6])]
-        options = "\n".join([f"{c['idx']}. {c['alias']}" for c in self._pending_origin_lane_choices])
-        return {
-            "statusCode": 200,
-            "message": f"Which lane were you in on that road?\n{options}\n\nPlease answer with a number.",
-            "conversation_state": "choose_origin_lane"
-        }
-
-    def _confirmation_question(self):
-        road_alias = self._alias_for_road(self.user_path.get("origin_road_id"), next(iter(self._dir8_from_origin_direction(self.user_path.get("origin_direction")))))
-        lane_alias = None
-        lid = self.user_path.get("origin_lane_id")
-        if lid and lid in self.lane_by_id:
-            lane_alias = self._alias_for_lane(self.lane_by_id[lid])
-        maneu = self.standardize_maneuver(self.user_path.get("intended_maneuver"))
-        maneu_txt = {"straight":"go straight","left_turn":"turn left","right_turn":"turn right","u_turn":"make a U-turn"}.get(maneu, maneu)
-        msg = f"Just to confirm: you were on **{road_alias}**, in the **{lane_alias or 'selected lane'}**, planning to **{maneu_txt}**. Is that correct? (Yes/No)"
-        return {"statusCode": 200, "message": msg, "conversation_state": "confirm_summary"}
-
+        if "northwest" in d or d == "nw": return {"se"}
+        if "northeast" in d or d == "ne": return {"sw"}
+        if "southwest" in d or d == "sw": return {"ne"}
+        if "southeast" in d or d == "se": return {"nw"}
+        if "north" in d or d == "n":     return {"s","se","sw"}
+        if "south" in d or d == "s":     return {"n","ne","nw"}
+        if "west"  in d or d == "w":     return {"e","ne","se"}
+        if "east"  in d or d == "e":     return {"w","nw","sw"}
+        return {"unknown"}
 
     def _dir8_from_user_origin(self, origin_direction: str) -> set:
         """
         Map user's 'came from <dir>' to the *travel* direction toward the center.
-        FIXED: More comprehensive direction matching
+        Example: 'north' -> going south (S); 'upper left/NW' -> going SE.
+        Return a small set to allow some tolerance.
         """
         d = (origin_direction or "unknown").lower()
-        
-        # Direct mappings first
+        if "northwest" in d or d in ("nw",):
+            return {"se"}
+        if "northeast" in d or d in ("ne",):
+            return {"sw"}
+        if "southwest" in d or d in ("sw",):
+            return {"ne"}
+        if "southeast" in d or d in ("se",):
+            return {"nw"}
         if "north" in d or d == "n":
-            return {"s", "sb", "south", "southbound"}  # ✅ Add more variations
-        elif "south" in d or d == "s":
-            return {"n", "nb", "north", "northbound"}
-        elif "west" in d or d == "w":
-            return {"e", "eb", "east", "eastbound"}
-        elif "east" in d or d == "e":
-            return {"w", "wb", "west", "westbound"}
-            
-        # Compound directions
-        elif "northwest" in d or d in ("nw",):
-            return {"se", "southeast"}
-        elif "northeast" in d or d in ("ne",):
-            return {"sw", "southwest"}
-        elif "southwest" in d or d in ("sw",):
-            return {"ne", "northeast"}
-        elif "southeast" in d or d in ("se",):
-            return {"nw", "northwest"}
-        
-        # ✅ FALLBACK: If no match, include all directions
-        return {"n", "s", "e", "w", "ne", "nw", "se", "sw", "north", "south", "east", "west"}
-
+            return {"s", "se", "sw"}
+        if "south" in d or d == "s":
+            return {"n", "ne", "nw"}
+        if "west" in d or d == "w":
+            return {"e", "ne", "se"}
+        if "east" in d or d == "e":
+            return {"w", "nw", "sw"}
+        return {"unknown"}
 
     def _maneuver_to_allowed(self, maneuver_std: str) -> set:
         if maneuver_std == "straight":    return {"through"}

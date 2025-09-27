@@ -1379,7 +1379,6 @@ class IntegratedRoadNetworkGenerator:
         
         return (center_x, center_y)
 
-    ############# LARGE INTERSECTION ZONE CREATION #############
     def create_large_intersection_zone(self, center, roads_connecting, base_radius=80):
         """Create a large intersection zone that roads connect to"""
         
@@ -1402,17 +1401,10 @@ class IntegratedRoadNetworkGenerator:
         return {
             'center': center,
             'radius': int(zone_radius),
-            'zone_type': 'intersection_management_area',  # 🔥 Changed from 'circular'
-            'intersection_shape': 'circular_zone',        # 🔥 More specific
-            'purpose': 'intersection_management',         # 🔥 Clarify purpose
-            'is_road': False,                            # 🔥 Explicitly NOT a road
-            'is_intersection': True,                     # 🔥 Explicitly IS intersection
+            'zone_type': 'circular',
             'boundary_points': self.generate_intersection_boundary_points(center, zone_radius),
-            'connection_points': self.generate_connection_points(center, zone_radius, len(roads_connecting)),
-            'usage_explanation': 'Roads connect to this zone for navigation - this zone itself is not a driving path'  # 🔥 Usage clarification
+            'connection_points': self.generate_connection_points(center, zone_radius, len(roads_connecting))
         }
-
-
 
     def generate_intersection_boundary_points(self, center, radius, num_points=32):
         """Generate points around intersection boundary"""
@@ -3099,7 +3091,6 @@ class IntegratedRoadNetworkGenerator:
             identifiers = road['metadata']['conversational_identifiers'][:2]  # First 2
             print(f"  ✅ Road {i}: {identifiers}")
 
-    # ==================== INTERSECTION METADATA METHODS ====================
     def assign_metadata_to_intersections(self):
         """Assign comprehensive metadata to intersections - AFTER TRIMMING"""
         print("🏷️  ASSIGNING METADATA TO INTERSECTIONS...")
@@ -3119,11 +3110,6 @@ class IntegratedRoadNetworkGenerator:
             
             if 'metadata' not in intersection:
                 intersection['metadata'] = {}
-            
-            # 🔥 GET ZONE INFO FOR EXPLICIT INTERSECTION IDENTIFICATION
-            zone = intersection.get('zone', {})
-            zone_radius = zone.get('radius', 80)
-            zone_type = zone.get('zone_type', 'circular')
             
             intersection['metadata'].update({
                 # Basic identification
@@ -3158,24 +3144,6 @@ class IntegratedRoadNetworkGenerator:
                                     if road['road_class'] == 'secondary_road'],
                     'local_streets': [road['display_name'] for road in connected_roads_info 
                                     if road['road_class'] == 'local_street']
-                },
-                
-                # 🔥 NEW: EXPLICIT INTERSECTION IDENTIFICATION TO PREVENT CIRCLE ROAD CONFUSION
-                'structure_type': 'intersection_zone',
-                'is_road': False,
-                'is_intersection': True,
-                'not_a_circular_road': True,
-                'intersection_explanation': f'This is an intersection management zone with {zone_radius}px radius where {len(connected_roads_info)} roads meet. It is NOT a circular road to drive around.',
-                'zone_purpose': 'traffic_management_and_turning_area',
-                'driving_behavior': 'roads_connect_to_this_zone_but_do_not_circle_around_it',
-                'zone_description': f'Circular management area (radius: {zone_radius}px) for intersection navigation, not a roadway',
-                
-                # 🔥 LLM-SPECIFIC CLARIFICATIONS
-                'for_llm_analysis': {
-                    'this_is_intersection_not_road': True,
-                    'circular_shape_explanation': 'The circular shape is used for traffic management geometry, not as a driving path',
-                    'road_relationship': 'Roads terminate at or pass through this zone - they do not circle around it',
-                    'navigation_purpose': 'Intersection decision point and turning area'
                 }
             })
             
@@ -3183,7 +3151,6 @@ class IntegratedRoadNetworkGenerator:
             nearby_count = len(nearby_landmarks)
             
             print(f"  ✅ Intersection {intersection['id']}: {intersection_name} ({nearby_count} landmarks)")
-            print(f"    🔧 Added explicit metadata: NOT a circular road, IS an intersection zone")
 
     # ==================== LANE GENERATION METHODS ====================
     

@@ -4,6 +4,7 @@
 REGION="ap-northeast-1"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 IMAGE_TAG=$(date +%Y%m%d-%H%M%S)
+UNIQUE_BUILD_ID=$(uuidgen | cut -c1-8)  # ✅ ADD: Unique build ID for cache busting
 
 # --- DOCKER 1: Field Generator (Existing) ---
 REPO_NAME_1="field-generator"
@@ -20,12 +21,23 @@ ECR_URI_2="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME_2"
 DOCKER_CONTEXT_DIR_2="svgDocker"
 
 echo "🚀 Building and deploying Docker images with tag: $IMAGE_TAG"
+echo "🔥 Cache busting ID: $UNIQUE_BUILD_ID"  # ✅ ADD: Show cache bust ID
 echo "=================================================="
 
 # --- BUILD AND DEPLOY DOCKER 1: Field Generator ---
 echo ""
 echo "📦 [DOCKER 1] Building Field Generator..."
-docker build -t $REPO_NAME_1:$IMAGE_TAG $DOCKER_CONTEXT_DIR_1 --no-cache || {
+
+# ✅ ADD: Simple cache cleanup (optional)
+docker system prune -f 2>/dev/null || true
+
+# ✅ MODIFY: Add build args for cache busting
+docker build \
+  --no-cache \
+  --build-arg CACHEBUST=$UNIQUE_BUILD_ID \
+  --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+  -t $REPO_NAME_1:$IMAGE_TAG \
+  $DOCKER_CONTEXT_DIR_1 || {
     echo "❌ Failed to build Docker 1"
     exit 1
 }
@@ -44,10 +56,12 @@ fi
 
 echo "🏷️ [DOCKER 1] Tagging image..."
 docker tag $REPO_NAME_1:$IMAGE_TAG $ECR_URI_1:$IMAGE_TAG
+docker tag $REPO_NAME_1:$IMAGE_TAG $ECR_URI_1:build-$UNIQUE_BUILD_ID  # ✅ ADD: Unique tag
 docker tag $REPO_NAME_1:$IMAGE_TAG $ECR_URI_1:latest
 
 echo "📤 [DOCKER 1] Pushing image to ECR..."
 docker push $ECR_URI_1:$IMAGE_TAG
+docker push $ECR_URI_1:build-$UNIQUE_BUILD_ID  # ✅ ADD: Push unique tag
 docker push $ECR_URI_1:latest
 
 echo "🔄 [DOCKER 1] Updating ECS service..."
@@ -62,7 +76,15 @@ echo "✅ [DOCKER 1] Field Generator deployment complete!"
 # --- BUILD AND DEPLOY DOCKER 2: SVG Animation Generator ---
 echo ""
 echo "🎬 [DOCKER 2] Building SVG Animation Generator..."
-docker build -t $REPO_NAME_2:$IMAGE_TAG $DOCKER_CONTEXT_DIR_2 --no-cache || {
+
+# ✅ ADD: Simple cache cleanup (optional)
+docker system prune -f 2>/dev/null || true
+
+# ✅ MODIFY: Add build args for cache busting
+docker build -t $REPO_NAME_2:$IMAGE_TAG $DOCKER_CONTEXT_DIR_2 \
+  --no-cache \
+  --build-arg CACHEBUST=$UNIQUE_BUILD_ID \
+  --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || {
     echo "❌ Failed to build Docker 2"
     exit 1
 }
@@ -77,10 +99,12 @@ fi
 
 echo "🏷️ [DOCKER 2] Tagging image..."
 docker tag $REPO_NAME_2:$IMAGE_TAG $ECR_URI_2:$IMAGE_TAG
+docker tag $REPO_NAME_2:$IMAGE_TAG $ECR_URI_2:build-$UNIQUE_BUILD_ID  # ✅ ADD: Unique tag
 docker tag $REPO_NAME_2:$IMAGE_TAG $ECR_URI_2:latest
 
 echo "📤 [DOCKER 2] Pushing image to ECR..."
 docker push $ECR_URI_2:$IMAGE_TAG
+docker push $ECR_URI_2:build-$UNIQUE_BUILD_ID  # ✅ ADD: Push unique tag
 docker push $ECR_URI_2:latest
 
 echo "🔄 [DOCKER 2] Updating ECS service..."
@@ -92,12 +116,32 @@ aws ecs update-service \
 
 echo "✅ [DOCKER 2] SVG Animation Generator deployment complete!"
 
+# ✅ ADD: Lambda update section (simple)
+echo ""
+echo "🔧 [LAMBDA] Quick Lambda update..."
+if [ -f "analytics.py" ]; then
+    TEMP_DIR=$(mktemp -d)
+    cp analytics.py $TEMP_DIR/
+    echo "# Build: $UNIQUE_BUILD_ID" >> $TEMP_DIR/analytics.py
+    cd $TEMP_DIR && zip -r lambda.zip . --quiet
+    
+    # ⚠️ Replace with your actual function name
+    LAMBDA_FUNC="your-analytics-function-name"
+    aws lambda update-function-code \
+        --function-name $LAMBDA_FUNC \
+        --zip-file fileb://lambda.zip \
+        --region $REGION 2>/dev/null && \
+        echo "✅ Lambda updated" || echo "⚠️ Lambda update failed"
+    
+    rm -rf $TEMP_DIR
+fi
+
 # --- SUMMARY ---
 echo ""
 echo "🎉 ALL DEPLOYMENTS COMPLETE!"
 echo "=================================================="
-echo "📝 Field Generator: $ECR_URI_1:$IMAGE_TAG"
-echo "📝 SVG Generator: $ECR_URI_2:$IMAGE_TAG"
+echo "📝 Field Generator: $ECR_URI_1:$IMAGE_TAG (build-$UNIQUE_BUILD_ID)"
+echo "📝 SVG Generator: $ECR_URI_2:$IMAGE_TAG (build-$UNIQUE_BUILD_ID)"
 echo ""
 echo "🔍 Check deployment status with:"
 echo "# Field Generator:"
