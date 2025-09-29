@@ -129,14 +129,17 @@ class TaskState:
     pending_questions: List[str] = None
     analytics_result: Dict[str, Any] = None
     location_attempts: int = 0
-    map_processing_started: bool = False  # NEW: Track if map processing started
-    questions_asked: Dict[str, bool] = None  # Track which questions have been 
-    user_language: str = None  # instead of "en"
-    awaiting_user_input_for: str = None  # NEW: track what we're waiting for
+    map_processing_started: bool = False
+    questions_asked: Dict[str, bool] = None
+    user_language: str = None
+    awaiting_user_input_for: str = None
     modifier_questions: List[str] = None
     modifier_answers: Dict[str, str] = None
     current_modifier_index: int = 0
-    #user_language: str = "en"  # NEW: default to English
+    datetime_attempts: int = 0  # NEW: Track datetime specificity attempts
+    datetime_validation_state: str = "initial"  # NEW: Track validation state
+    last_processed_input: str = None  # ✅ Add this field
+
     
     def __post_init__(self):
         if self.collected_data is None:
@@ -360,26 +363,61 @@ class TaskOrchestrator:
         if user_input and user_input.strip():
             # Determine which question this answers
             if not self.state.questions_asked["datetime"]:
-                self.state.collected_data["datetime"] = user_input
-                self.state.questions_asked["datetime"] = True
+                # Validate datetime specificity
+                validation = validate_datetime_specificity(user_input)
+                
+                if validation["is_specific"]:
+                    # Datetime is specific enough
+                    self.state.collected_data["datetime"] = user_input
+                    self.state.questions_asked["datetime"] = True
+                    self.state.datetime_validation_state = "completed"
+                    logger.info(f"✅ Accepted specific datetime: {user_input}")
+                else:
+                    # Not specific enough, ask for more details
+                    self.state.datetime_attempts += 1
+                    self.state.datetime_validation_state = "needs_clarification"
+                    
+                    if self.state.datetime_attempts >= 3:
+                        # After 3 attempts, accept what we have
+                        logger.info(f"⚠️ Accepting datetime after 3 attempts: {user_input}")
+                        self.state.collected_data["datetime"] = user_input
+                        self.state.questions_asked["datetime"] = True
+                        self.state.datetime_validation_state = "completed"
+                    else:
+                        # Ask for more specific information
+                        follow_up = validation["follow_up_question"]
+                        self.state.awaiting_user_input_for = "datetime_clarification"
+                        
+                        return {
+                            "action": "claude_response",
+                            "instruction": (
+                                f"Reply only in {lang}. "
+                                f"The user said '{user_input}' but we need more specific timing information. "
+                                f"Ask this follow-up question in a friendly way: '{follow_up}' "
+                                "Explain that specific timing helps with accurate claim processing."
+                            ),
+                            "progress": f"Gathering information (Step 2/6) - Clarifying timing (Attempt {self.state.datetime_attempts}/3)"
+                        }
+                        
             elif not self.state.questions_asked["description"]:
                 self.state.collected_data["description"] = user_input
                 self.state.questions_asked["description"] = True
         
         # Find next question to ask
         if not self.state.questions_asked["datetime"]:
-            self.state.awaiting_user_input_for = "datetime"  # Track what we're waiting for
+            self.state.awaiting_user_input_for = "datetime"
             return {
                 "action": "claude_response",
                 "instruction": (
                     f"Reply only in {lang}. "
                     "Ask the user this question in a friendly, empathetic way: "
-                    "'What date and time did the accident occur?'"
+                    "'What date and time did the accident occur? Please be as specific as possible - "
+                    "for example, \"January 15th around 3 PM\" or \"yesterday at 2:30 PM\".'"
                 ),
                 "progress": "Gathering information (Step 2/6) - Question 1/2"
             }
         elif not self.state.questions_asked["description"]:
-            self.state.awaiting_user_input_for = "description"  # Track what we're waiting for
+            self.state.awaiting_user_input_for = "description"
             return {
                 "action": "claude_response",
                 "instruction": (
@@ -403,8 +441,6 @@ class TaskOrchestrator:
                 "progress": "Finalizing location analysis (Step 3/6)"
             }
 
-
-
     def _handle_location_processing(self) -> Dict[str, Any]:
         """Phase 3: Processing location data (now rarely used due to parallel processing)"""
         return {
@@ -414,44 +450,69 @@ class TaskOrchestrator:
         }
     
     def _handle_basic_info_gathering(self, user_input: str) -> Dict[str, Any]:
-        """Phase 4: Collect basic accident information - FIXED to avoid duplicate questions"""
+        """Phase 4: Collect basic accident information with datetime validation"""
+        lang = (self.state.user_language or "en").upper()
+        
         # Check if we already have info from parallel gathering
         if self.state.questions_asked["datetime"] and self.state.questions_asked["description"]:
             # We already have basic info, move to analytics
             self.state.phase = ConversationPhase.ANALYTICS_PROCESSING
             return self._handle_analytics_processing()
         
-        basic_questions = [
-            ("datetime", "What date and time did the accident occur?"),
-            ("description", "Could you describe what happened during the accident?")
-        ]
-        
         # Store user input if provided
         if user_input and user_input.strip():
-            for question_key, _ in basic_questions:
-                if not self.state.questions_asked[question_key]:
-                    self.state.collected_data[question_key] = user_input
-                    self.state.questions_asked[question_key] = True
-                    break
+            if not self.state.questions_asked["datetime"]:
+                # Validate datetime specificity
+                validation = validate_datetime_specificity(user_input)
+                
+                if validation["is_specific"] or self.state.datetime_attempts >= 2:
+                    self.state.collected_data["datetime"] = user_input
+                    self.state.questions_asked["datetime"] = True
+                    logger.info(f"✅ Accepted datetime: {user_input}")
+                else:
+                    # Ask for more specific information
+                    self.state.datetime_attempts += 1
+                    follow_up = validation["follow_up_question"]
+                    
+                    return {
+                        "action": "claude_response",
+                        "instruction": (
+                            f"Reply only in {lang}. "
+                            f"The user provided '{user_input}' but we need more specific timing. "
+                            f"Ask: '{follow_up}'"
+                        ),
+                        "progress": f"Gathering basic information (Step 3/6) - Clarifying timing"
+                    }
+                    
+            elif not self.state.questions_asked["description"]:
+                self.state.collected_data["description"] = user_input
+                self.state.questions_asked["description"] = True
         
         # Find next unasked question
-        next_question = None
-        for question_key, question_text in basic_questions:
-            if not self.state.questions_asked[question_key]:
-                next_question = question_text
-                break
-        
-        if next_question:
+        if not self.state.questions_asked["datetime"]:
             return {
                 "action": "claude_response",
-                "instruction": f"Ask this specific question: '{next_question}'. Be conversational and empathetic. Ask ONLY this question.",
-                "progress": f"Gathering basic information (Step 3/6) - Question {sum(self.state.questions_asked.values()) + 1}/{len(basic_questions)}"
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    "Ask: 'What date and time did the accident occur? Please be as specific as possible - "
+                    "even approximate times like \"around 3 PM yesterday\" are helpful.'"
+                ),
+                "progress": "Gathering basic information (Step 3/6) - Question 1/2"
+            }
+        elif not self.state.questions_asked["description"]:
+            return {
+                "action": "claude_response",
+                "instruction": (
+                    f"Reply only in {lang}. "
+                    "Ask: 'Could you describe what happened during the accident?'"
+                ),
+                "progress": "Gathering basic information (Step 3/6) - Question 2/2"
             }
         else:
             # Move to analytics processing
             self.state.phase = ConversationPhase.ANALYTICS_PROCESSING
             return self._handle_analytics_processing()
-    
+
     def _handle_analytics_processing(self) -> Dict[str, Any]:
         """Phase 5: Advanced analytics processing"""
         self.state.phase = ConversationPhase.DETAILED_INVESTIGATION
@@ -466,6 +527,7 @@ class TaskOrchestrator:
         return {
             "action": "interactive_investigation",
             "user_input": user_input,
+            "processed_input": user_input,  # ✅ Add this
             "progress": "Detailed investigation (Step 5/6)"
         }
     
@@ -538,48 +600,429 @@ def handle_init_conversation(event):
         logger.error(f"❗ initConversation failed: {e}")
         return {"statusCode": 500, "body": "Internal Server Error"}
 
+
+def understand_user_response_by_phase(user_input: str, orchestrator_state: TaskState, connection_id: str) -> Dict[str, Any]:
+    """
+    Route to appropriate understanding function based on current phase
+    """
+    phase = orchestrator_state.phase
+    
+    if phase == ConversationPhase.LANGUAGE_SELECTION:
+        return understand_language_selection(user_input)
+    
+    elif phase == ConversationPhase.LOCATION_PINNING:
+        return understand_location_response(user_input)
+    
+    elif phase == ConversationPhase.PARALLEL_INFO_GATHERING:
+        return understand_info_gathering_response(user_input, orchestrator_state)
+    
+    elif phase == ConversationPhase.DETAILED_INVESTIGATION:
+        return understand_analytics_response(user_input, orchestrator_state, connection_id)  # Pass connection_id
+    
+    elif phase == ConversationPhase.LEGAL_MODIFIER_INVESTIGATION:
+        return understand_modifier_response(user_input, orchestrator_state)
+    
+    else:
+        return understand_general_response(user_input)
+
+
+def understand_modifier_response(user_input: str, state) -> Dict[str, Any]:
+    """Understanding for legal modifier questions"""
+    return {
+        "understood": True,
+        "extracted_info": user_input,
+        "confidence": 0.9,
+        "interpretation": "Modifier response"
+    }
+
+
+def understand_language_selection(user_input: str) -> Dict[str, Any]:
+    """Specific understanding for language selection"""
+    # This is where your existing detect_language_via_llm logic goes
+    code = detect_language_via_llm(user_input)
+    return {
+        "understood": code != "UNKNOWN",
+        "extracted_info": code.lower() if code != "UNKNOWN" else None,
+        "confidence": 0.9 if code != "UNKNOWN" else 0.1,
+        "interpretation": f"User selected language: {code}"
+    }
+
+def understand_location_response(user_input: str) -> Dict[str, Any]:
+    """Understanding for location responses"""
+    # Simple location understanding
+    return {
+        "understood": True,
+        "extracted_info": user_input,
+        "confidence": 0.8,
+        "interpretation": "Location response"
+    }
+
+
+def understand_datetime_response(user_input: str) -> Dict[str, Any]:
+    """Understanding datetime responses"""
+    return {
+        "understood": True,
+        "extracted_info": user_input,
+        "confidence": 0.9,
+        "interpretation": "Datetime provided"
+    }
+
+
+def understand_info_gathering_response(user_input: str, state: TaskState) -> Dict[str, Any]:
+    """Understanding for basic info gathering phase"""
+    awaiting_for = state.awaiting_user_input_for
+    
+    if awaiting_for == "datetime":
+        return understand_datetime_response(user_input)
+    elif awaiting_for == "description":
+        return understand_description_response(user_input)
+    else:
+        # Try to figure out what they're answering
+        return understand_general_info_response(user_input, state)
+
+def understand_general_info_response(user_input: str, state) -> Dict[str, Any]:
+    """General info understanding"""
+    return {
+        "understood": True,
+        "extracted_info": user_input,
+        "confidence": 0.7,
+        "interpretation": "General response"
+    }
+
+def understand_description_response(user_input: str) -> Dict[str, Any]:
+    """Understanding description responses"""
+    return {
+        "understood": True,
+        "extracted_info": user_input,
+        "confidence": 0.9,
+        "interpretation": "Description provided"
+    }
+
+
+def understand_analytics_response(user_input: str, state: TaskState, connection_id: str) -> Dict[str, Any]:
+    """Understanding for analytics/investigation phase - FIXED connection_id access"""
+    
+    # Now we have connection_id as a parameter
+    if not connection_id:
+        return understand_general_response(user_input)
+        
+    interactive_state = get_interactive_state(connection_id)
+    current_question_type = None
+    available_options = None
+    
+    if interactive_state:
+        conversation_state = interactive_state.get("conversation_state", "")
+        # For road/direction questions, always pass through user's natural response
+        if "road" in conversation_state.lower() or "direction" in conversation_state.lower():
+            current_question_type = "natural_road_response"
+        elif "traffic" in conversation_state.lower() or "signal" in conversation_state.lower():
+            current_question_type = "traffic_signal"
+        elif "speed" in conversation_state.lower():
+            current_question_type = "speed_info"
+            available_options = None
+    
+    if current_question_type == "natural_road_response":
+        return {
+            "understood": True,
+            "extracted_info": user_input,  # Keep user's natural response
+            "confidence": 0.9,
+            "interpretation": "Natural road/direction response"
+        }
+    else:
+        return understand_general_response(user_input)
+
+def understand_specific_analytics_question(user_input: str, question_type: str, options: list = None) -> Dict[str, Any]:
+    """Handle specific analytics questions with appropriate understanding"""
+    
+    if question_type == "road_selection" and options:
+        # This handles your "2" -> "Road_0_1" case
+        return understand_option_selection(user_input, options, "road selection")
+    
+    elif question_type == "traffic_signal" and options:
+        return understand_option_selection(user_input, options, "traffic signal")
+    
+    elif question_type == "speed_info":
+        return understand_speed_response(user_input)
+    
+    else:
+        # Generic understanding for unknown question types
+        return understand_general_response(user_input)
+
+def understand_speed_response(user_input: str) -> Dict[str, Any]:
+    """Understanding speed-related responses"""
+    return {
+        "understood": True,
+        "extracted_info": user_input,
+        "confidence": 0.8,
+        "interpretation": "Speed information provided"
+    }
+
+def understand_general_response(user_input: str) -> Dict[str, Any]:
+    """Fallback understanding for any response"""
+    return {
+        "understood": True,
+        "extracted_info": user_input,
+        "confidence": 0.6,
+        "interpretation": "General user response"
+    }
+
+
+def understand_option_selection(user_input: str, options: list, context: str) -> Dict[str, Any]:
+    """Handle option selection using LLM - return the number"""
+    
+    try:
+        # ✅ PRIMARY METHOD: Use Claude to understand selection
+        jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
+        time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
+        
+        options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)])
+        
+        prompt = (
+            time_context +
+            f"The user was asked to select from these {context} options:\n"
+            f"{options_text}\n\n"
+            f"User responded: '{user_input}'\n\n"
+            "Your task: Determine which numbered option (1, 2, 3, etc.) the user selected.\n"
+            "Common patterns:\n"
+            "- Direct numbers: '2', 'number 2', 'option 2' → return 2\n"
+            "- Text matching: 'Main Street' when option 1 is 'Main Street (Northbound)' → return 1\n"
+            "- Descriptive: 'the second one', 'the first road' → return 2 or 1\n\n"
+            "Respond with ONLY the option number (1, 2, 3, etc.) that the user selected.\n"
+            "If unclear, respond with 'unclear'.\n"
+            "No explanations, no other text."
+        )
+        
+        response = bedrock.invoke_model(
+            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 10,
+                "temperature": 0.1,
+                "messages": [{"role": "user", "content": prompt}]
+            })
+        )
+        
+        result_text = json.loads(response["body"].read())["content"][0]["text"].strip()
+        logger.info(f"🤖 Claude understood: '{user_input}' → '{result_text}'")
+        
+        # Parse Claude's response
+        if result_text.lower() == "unclear":
+            return {
+                "understood": False,
+                "confidence": 0.1,
+                "interpretation": "Claude could not determine selection"
+            }
+        
+        try:
+            choice_num = int(result_text)
+            if 1 <= choice_num <= len(options):
+                selected_option = options[choice_num - 1]
+                logger.info(f"✅ Claude selection: '{user_input}' → {choice_num} → '{selected_option}'")
+                return {
+                    "understood": True,
+                    "selected_text": selected_option,
+                    "selected_index": choice_num - 1,
+                    "confidence": 0.9,
+                    "interpretation": f"Claude determined user selected option {choice_num}: {selected_option}"
+                }
+            else:
+                logger.warning(f"⚠️ Claude returned invalid number: {choice_num}")
+                return {
+                    "understood": False,
+                    "confidence": 0.2,
+                    "interpretation": f"Claude returned out of range number: {choice_num}"
+                }
+        except ValueError:
+            logger.warning(f"⚠️ Claude returned non-numeric: '{result_text}'")
+            return {
+                "understood": False,
+                "confidence": 0.2,
+                "interpretation": f"Claude returned non-numeric response: {result_text}"
+            }
+            
+    except Exception as e:
+        logger.error(f"❗ LLM option selection failed: {e}")
+        
+        # ✅ FALLBACK: Simple numeric parsing only
+        try:
+            import re
+            number_match = re.search(r'\b(\d+)\b', user_input.strip())
+            if number_match:
+                choice_num = int(number_match.group(1))
+                if 1 <= choice_num <= len(options):
+                    selected_option = options[choice_num - 1]
+                    logger.info(f"✅ Fallback parsing: '{user_input}' → {choice_num} → '{selected_option}'")
+                    return {
+                        "understood": True,
+                        "selected_text": selected_option,
+                        "selected_index": choice_num - 1,
+                        "confidence": 0.7,
+                        "interpretation": f"Fallback parsing: option {choice_num}"
+                    }
+        except Exception:
+            pass
+        
+        # Last resort
+        return {
+            "understood": False,
+            "confidence": 0.0,
+            "interpretation": f"Failed to understand: {user_input}"
+        }
+    
+def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
+    """
+    Validate if the user provided specific enough datetime information.
+    Returns: {
+        "is_specific": bool,
+        "has_date": bool, 
+        "has_time": bool,
+        "missing_info": str,
+        "follow_up_question": str
+    }
+    """
+    try:
+        # Add JST time context
+        jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
+        time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
+        
+        prompt = (
+            time_context +
+            f"Analyze this user input about accident timing: \"{user_input}\"\n\n"
+            "Determine:\n"
+            "1. Does it include a specific DATE (not just 'yesterday', 'today')?\n"
+            "2. Does it include a specific TIME with at least HOUR (like '3 PM', '15:30', 'around 2 o'clock')?\n"
+            "3. What specific information is missing?\n\n"
+            "Respond ONLY with a JSON object like:\n"
+            "{\n"
+            '  "has_specific_date": true/false,\n'
+            '  "has_specific_time": true/false,\n'
+            '  "missing_info": "date and time" or "specific time" or "specific date" or "none",\n'
+            '  "is_sufficient": true/false\n'
+            "}\n"
+            "No other text or formatting."
+        )
+        
+        response = bedrock.invoke_model(
+            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 150,
+                "temperature": 0.1,
+                "messages": [{"role": "user", "content": prompt}]
+            })
+        )
+        
+        result_text = json.loads(response["body"].read())["content"][0]["text"].strip()
+        
+        # Parse JSON response
+        try:
+            validation_result = json.loads(result_text)
+            
+            # Generate follow-up question if needed
+            follow_up = ""
+            if not validation_result.get("is_sufficient", False):
+                missing = validation_result.get("missing_info", "")
+                if "time" in missing.lower():
+                    follow_up = "Could you please tell me the approximate time? For example, was it in the morning, afternoon, or evening? Even an approximate hour would be helpful."
+                elif "date" in missing.lower():
+                    follow_up = "Could you please provide the specific date? For example, 'January 15th' or '2024/01/15'?"
+                else:
+                    follow_up = "Could you provide more specific date and time information? Even approximate times like 'around 3 PM yesterday' would be helpful."
+            
+            return {
+                "is_specific": validation_result.get("is_sufficient", False),
+                "has_date": validation_result.get("has_specific_date", False),
+                "has_time": validation_result.get("has_specific_time", False),
+                "missing_info": validation_result.get("missing_info", ""),
+                "follow_up_question": follow_up
+            }
+            
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse datetime validation JSON: {result_text}")
+            return {
+                "is_specific": False,
+                "has_date": False,
+                "has_time": False,
+                "missing_info": "date and time",
+                "follow_up_question": "Could you please provide the specific date and time of the accident?"
+            }
+            
+    except Exception as e:
+        logger.error(f"❗ Datetime validation error: {e}")
+        return {
+            "is_specific": False,
+            "has_date": False,
+            "has_time": False,
+            "missing_info": "date and time",
+            "follow_up_question": "Could you please provide the date and time of the accident?"
+        }
+
+
+
 def handle_send_message(event):
-    """Main message handler - routes through orchestrator"""
+    """FIXED: Ensure user's actual input reaches analytics"""
     try:
         connection_id = event["requestContext"]["connectionId"]
         body = json.loads(event.get("body", "{}"))
         user_msg = body.get("message", "")
         
-        # Check if in interactive analytics mode (legacy support)
-        interactive_state = get_interactive_state(connection_id)
-        if interactive_state and interactive_state["mode"] == "interactive_analytics":
-            logger.info(f"🕵️ User in interactive analytics mode")
-            return handle_interactive_analytics_response(connection_id, user_msg, interactive_state["conversation_state"], event)
-        
-        # Get or create orchestrator
-        if connection_id not in orchestrators:
-            orchestrators[connection_id] = TaskOrchestrator(connection_id)
+        # Load orchestrator
+        if connection_id in orchestrators:
+            orchestrator = orchestrators[connection_id]
+        else:
+            orchestrator = load_orchestrator_state(connection_id)
+            orchestrators[connection_id] = orchestrator
+            
+        if connection_id not in chat_histories:
             chat_histories[connection_id] = []
         
-        orchestrator = orchestrators[connection_id]
+        logger.info(f"🧠 Current Phase: {orchestrator.state.phase}")
+        logger.info(f"👤 User said (RAW): '{user_msg}'")  # ✅ Log raw input
         
-        # Add user message to history
+        # ✅ FIXED: For road selection, pass user's raw input directly
+        processed_input = user_msg  # Keep it simple
+
+        # Don't try to "understand" direction responses as option selections
+        if orchestrator.state.phase == ConversationPhase.DETAILED_INVESTIGATION:
+            interactive_state = get_interactive_state(connection_id)
+            if interactive_state and interactive_state.get("conversation_state") == "approach_direction":
+                # This is a direction response, not option selection
+                # Pass it through unchanged
+                processed_input = user_msg
+        
         if user_msg and user_msg.strip():
+            understanding = understand_user_response_by_phase(user_msg, orchestrator.state, connection_id)
+            logger.info(f"🧠 Understanding result: {understanding}")
+            
             chat_histories[connection_id].append({"role": "user", "content": user_msg})
-        
-        # Handle special messages
-        if user_msg.strip() == "Processing complete. The map data is ready for LLM":
-            # If we're in parallel info gathering, move to detailed investigation
-            # If we're in location processing, move to basic info gathering
-            if orchestrator.state.phase == ConversationPhase.PARALLEL_INFO_GATHERING:
-                orchestrator.state.phase = ConversationPhase.ANALYTICS_PROCESSING
+            
+            # ✅ ONLY use understanding result if it's clearly better
+            if understanding.get("understood") and understanding.get("selected_text"):
+                # This is for road selection - use the selected text
+                processed_input = understanding["selected_text"] 
+                logger.info(f"✅ Using understood selection: '{processed_input}'")
             else:
-                orchestrator.state.phase = ConversationPhase.BASIC_INFO_GATHERING
+                # Keep user's raw input
+                processed_input = user_msg
+                logger.info(f"✅ Using raw input: '{processed_input}'")
         
-        # Get next action from orchestrator
-        action = orchestrator.get_next_action(user_msg)
+        # ✅ CRITICAL: Pass the correct input
+        action = orchestrator.get_next_action(processed_input)
         
-        # Execute the action
+        if action.get("action") == "interactive_investigation":
+            action["processed_input"] = processed_input  # ✅ Ensure correct input
+            
+        save_orchestrator_state(connection_id, orchestrator)
         return execute_action(connection_id, action, event)
         
     except Exception as e:
-        logger.error(f"❗ Unhandled error in send_message: {e}")
-        return {"statusCode": 500, "body": "Internal Server Error"}
+        logger.error(f"❗ Send message error: {e}")
+        return {"statusCode": 500}
+
 
 # --- Action Executors ---
 def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[str, int]:
@@ -679,7 +1122,8 @@ def handle_check_map_processing(connection_id: str, action: Dict[str, Any], apig
         
         # Move to analytics processing
         orchestrators[connection_id].state.phase = ConversationPhase.ANALYTICS_PROCESSING
-        
+        # ✅ ADD THIS:
+        save_orchestrator_state(connection_id, orchestrators[connection_id])
         return {"statusCode": 200}
         
     except Exception as e:
@@ -756,7 +1200,7 @@ def handle_acknowledge_location(connection_id: str, action: Dict[str, Any], apig
         
         # Move to basic info gathering immediately
         orchestrators[connection_id].state.phase = ConversationPhase.BASIC_INFO_GATHERING
-        
+        save_orchestrator_state(connection_id, orchestrators[connection_id])
         return {"statusCode": 200}
         
     except Exception as e:
@@ -768,7 +1212,8 @@ def handle_trigger_analytics(connection_id: str, action: Dict[str, Any], apig, e
     try:
         # This is where "Processing complete. The map data is ready for LLM" is handled
         orchestrators[connection_id].state.phase = ConversationPhase.BASIC_INFO_GATHERING
-        
+        # ✅ ADD THIS:
+        save_orchestrator_state(connection_id, orchestrators[connection_id])
         message = "Location analysis complete. Now let me gather some basic information about your accident."
         progress = action.get("progress", "")
         
@@ -848,6 +1293,9 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
             # Move to detailed investigation
             orchestrators[connection_id].state.phase = ConversationPhase.DETAILED_INVESTIGATION
             
+            # ✅ CRITICAL: Save state after modification
+            save_orchestrator_state(connection_id, orchestrators[connection_id])
+
             first_question = result.get('message', 'Based on the location analysis, let me ask you some detailed questions about the accident.')
             
             # Store interactive state
@@ -873,10 +1321,22 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
         return {"statusCode": 500}
 
 
+
 def handle_interactive_investigation(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
     """Handle interactive investigation responses"""
     try:
-        user_input = action.get("user_input", "")
+        raw_user_input = action.get("user_input", "")
+        processed_input = action.get("processed_input", raw_user_input)
+        
+        logger.info(f"🔍 Interactive investigation - Raw: '{raw_user_input}' -> Processed: '{processed_input}'")
+        
+        # ✅ FIXED: Get the CURRENT conversation state from interactive state
+        interactive_state = get_interactive_state(connection_id)
+        current_conversation_state = "approach_direction"  # default
+        
+        if interactive_state:
+            current_conversation_state = interactive_state.get("conversation_state", "approach_direction")
+            logger.info(f"✅ Using stored conversation state: {current_conversation_state}")
         
         # Call analytics for follow-up
         response = lambda_client.invoke(
@@ -886,8 +1346,8 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
                 'connection_id': connection_id,
                 'bucket_name': BUCKET,
                 'message_type': 'user_response',
-                'user_input': user_input,
-                'conversation_state': orchestrators[connection_id].state.analytics_result.get('conversation_state')
+                'user_input': processed_input,
+                'conversation_state': current_conversation_state  # ✅ Use the stored state
             })
         )
         
@@ -896,14 +1356,16 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
         if result.get("statusCode") == 200:
             message = result.get("message", "Thank you for that information.")
             
-            # Update interactive state
+            # Update interactive state with NEW conversation state
             new_state = result.get("conversation_state")
             if new_state:
                 store_interactive_state(connection_id, new_state)
+                logger.info(f"✅ Updated conversation state to: {new_state}")
             
             # Check if investigation is complete
             if result.get("animation_ready") or result.get("investigation_complete"):
                 orchestrators[connection_id].state.phase = ConversationPhase.SIMILARITY_ANALYSIS
+                save_orchestrator_state(connection_id, orchestrators[connection_id])
                 message += "\n\nExcellent! Now let me find similar accident cases for comparison..."
                 
                 # Clear interactive state
@@ -940,7 +1402,6 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
     except Exception as e:
         logger.error(f"❗ Interactive investigation error: {e}")
         return {"statusCode": 500}
-
 
 def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
     """Handle similarity search and case matching"""
@@ -979,6 +1440,9 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
                     # Move to legal modifier investigation phase
                     orchestrators[connection_id].state.phase = ConversationPhase.LEGAL_MODIFIER_INVESTIGATION
                     
+                    # ✅ ADD THIS:
+                    save_orchestrator_state(connection_id, orchestrators[connection_id])
+
                     intro_msg = (
                         "I found some similar cases in our database. To provide the most accurate fault ratio assessment, "
                         "I need to ask a few specific questions about the circumstances. These help determine legal liability factors."
@@ -997,6 +1461,7 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
         
         # Move to finalization if no modifiers or not enough context
         orchestrators[connection_id].state.phase = ConversationPhase.CASE_FINALIZATION
+        save_orchestrator_state(connection_id, orchestrators[connection_id])
         return handle_finalize_case(connection_id, {"action": "finalize_case"}, apig)
         
     except Exception as e:
@@ -1036,7 +1501,7 @@ def handle_finalize_case(connection_id: str, action: Dict[str, Any], apig) -> Di
         )
         
         orchestrators[connection_id].state.phase = ConversationPhase.COMPLETED
-        
+        save_orchestrator_state(connection_id, orchestrators[connection_id])
         return {"statusCode": 200}
         
     except Exception as e:
@@ -1087,7 +1552,7 @@ def handle_interactive_analytics_response(connection_id, user_input, current_sta
                 # Move orchestrator to similarity analysis
                 if connection_id in orchestrators:
                     orchestrators[connection_id].state.phase = ConversationPhase.SIMILARITY_ANALYSIS
-            
+                    save_orchestrator_state(connection_id, orchestrators[connection_id])
             apig.post_to_connection(
                 ConnectionId=connection_id,
                 Data=json.dumps({
@@ -1143,6 +1608,82 @@ def handle_interactive_analytics_response(connection_id, user_input, current_sta
         )
         
         return {"statusCode": 200}
+
+
+def save_orchestrator_state(connection_id: str, orchestrator: TaskOrchestrator):
+    """Save orchestrator state to S3"""
+    try:
+        state_data = {
+            "connection_id": orchestrator.connection_id,
+            "phase": orchestrator.state.phase.value,  # Convert enum to string
+            "sub_step": orchestrator.state.sub_step,
+            "collected_data": orchestrator.state.collected_data,
+            "pending_questions": orchestrator.state.pending_questions,
+            "analytics_result": orchestrator.state.analytics_result,
+            "location_attempts": orchestrator.state.location_attempts,
+            "map_processing_started": orchestrator.state.map_processing_started,
+            "questions_asked": orchestrator.state.questions_asked,
+            "user_language": orchestrator.state.user_language,
+            "awaiting_user_input_for": orchestrator.state.awaiting_user_input_for,
+            "modifier_questions": orchestrator.state.modifier_questions,
+            "modifier_answers": orchestrator.state.modifier_answers,
+            "current_modifier_index": orchestrator.state.current_modifier_index,
+            "datetime_attempts": orchestrator.state.datetime_attempts,
+            "datetime_validation_state": orchestrator.state.datetime_validation_state,
+            "last_processed_input": orchestrator.state.last_processed_input,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        state_key = f"orchestrator-state/{connection_id}/state.json"
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=state_key,
+            Body=json.dumps(state_data, indent=2),
+            ContentType='application/json'
+        )
+        logger.info(f"💾 Orchestrator state saved: {state_key}")
+        
+    except Exception as e:
+        logger.error(f"❗ Failed to save orchestrator state: {e}")
+
+def load_orchestrator_state(connection_id: str) -> TaskOrchestrator:
+    """Load orchestrator state from S3"""
+    try:
+        state_key = f"orchestrator-state/{connection_id}/state.json"
+        response = s3.get_object(Bucket=BUCKET, Key=state_key)
+        state_data = json.loads(response['Body'].read().decode('utf-8'))
+        
+        # Recreate orchestrator
+        orchestrator = TaskOrchestrator(connection_id)
+        
+        # Restore state
+        orchestrator.state.phase = ConversationPhase(state_data["phase"])  # Convert string back to enum
+        orchestrator.state.sub_step = state_data.get("sub_step", 0)
+        orchestrator.state.collected_data = state_data.get("collected_data", {})
+        orchestrator.state.pending_questions = state_data.get("pending_questions", [])
+        orchestrator.state.analytics_result = state_data.get("analytics_result")
+        orchestrator.state.location_attempts = state_data.get("location_attempts", 0)
+        orchestrator.state.map_processing_started = state_data.get("map_processing_started", False)
+        orchestrator.state.questions_asked = state_data.get("questions_asked", {"datetime": False, "description": False})
+        orchestrator.state.user_language = state_data.get("user_language")
+        orchestrator.state.awaiting_user_input_for = state_data.get("awaiting_user_input_for")
+        orchestrator.state.modifier_questions = state_data.get("modifier_questions", [])
+        orchestrator.state.modifier_answers = state_data.get("modifier_answers", {})
+        orchestrator.state.current_modifier_index = state_data.get("current_modifier_index", 0)
+        orchestrator.state.datetime_attempts = state_data.get("datetime_attempts", 0)
+        orchestrator.state.datetime_validation_state = state_data.get("datetime_validation_state", "initial")
+        orchestrator.state.last_processed_input = state_data.get("last_processed_input")
+        
+        logger.info(f"✅ Orchestrator state loaded: phase={orchestrator.state.phase}, step={orchestrator.state.sub_step}")
+        return orchestrator
+        
+    except s3.exceptions.NoSuchKey:
+        logger.info(f"No existing orchestrator state for {connection_id}, creating new")
+        return TaskOrchestrator(connection_id)
+    except Exception as e:
+        logger.error(f"❗ Failed to load orchestrator state: {e}")
+        return TaskOrchestrator(connection_id)
+
 
 def store_interactive_state(connection_id, conversation_state):
     """Store that this connection is in interactive analytics mode"""

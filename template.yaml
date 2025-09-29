@@ -19,6 +19,10 @@ Parameters:
     Type: String
     Default: "0"
     Description: Deployment timestamp to force updates
+  ImageTag:                      # <<< ADD
+    Type: String
+    Default: "latest"
+    Description: ECR image tag for deployments
 
 Resources:
   ProcessRoadmapFunction:
@@ -60,7 +64,8 @@ Resources:
       TaskRoleArn: !GetAtt ECSTaskRole.Arn 
       ContainerDefinitions:
         - Name: field-generator
-          Image: 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/field-generator:latest
+          Image: !Sub "118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/field-generator:${ImageTag}"   # <<< MODIFIED
+          #Image: 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/field-generator:latest
           EntryPoint: ["python", "docker-entrypoint.py"]
           Command: []
           Environment:
@@ -157,7 +162,8 @@ Resources:
       TaskRoleArn: !GetAtt SvgAnimationTaskRole.Arn  # New role with different permissions
       ContainerDefinitions:
         - Name: svg-animation-generator
-          Image: 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/svg-animation-generator:latest
+          #Image: 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/svg-animation-generator:latest
+          Image: !Sub "118028261233.dkr.ecr.ap-northeast-1.amazonaws.com/svg-animation-generator:${ImageTag}"  # <<< ADD
           EntryPoint: ["python", "svg_generator.py"]
           Command: []
           Environment:
