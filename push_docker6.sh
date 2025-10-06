@@ -50,4 +50,5 @@ sam deploy \
   --parameter-overrides \
     VpcId=vpc-1c71077b \
     SubnetId=subnet-02efc25934d31a888 \
-    ImageTag=$IMAGE_TAG
+    ImageTag=$IMAGE_TAG \
+    DeployTime=$(date +%s)

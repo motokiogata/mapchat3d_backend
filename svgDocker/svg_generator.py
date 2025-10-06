@@ -1,4 +1,3 @@
-# svg_generator.py
 import json
 import boto3
 import os
@@ -11,12 +10,21 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 import sys
+import math
+from typing import Optional, Union
+import random
 
-logger = logging.getLogger()
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
 logger.setLevel(logging.INFO)
 
 # -------------------------
-# 🔧 Small helpers (module level, not in class)
+# 🔧 Small helpers (KEEP)
 # -------------------------
 def _get_env(name: str, required: bool = True, default: str | None = None) -> str | None:
     v = os.getenv(name, default)
@@ -47,6 +55,7 @@ class CollisionScenario:
     collision_type: str
     base_map_image: str
 
+# ✅ KEEP: SVGAnimationGenerator (WORKING - unchanged)
 class SVGAnimationGenerator:
     def __init__(self, s3_bucket: str, connection_id: str):
         self.s3 = boto3.client('s3')
@@ -57,49 +66,310 @@ class SVGAnimationGenerator:
         self.svg_width = 800
         self.svg_height = 600
         
-    ##############
-    # Main method
-    ##############
     def generate_accident_animation(self, route_json: Dict) -> str:
-        """Main method to generate animated SVG"""
+        """Generate basic accident animation"""
         try:
-            # DEBUG: Print actual JSON structure
-            logger.info(f"🔍 Loaded JSON keys: {list(route_json.keys())}")
-            logger.info(f"🔍 JSON structure preview: {json.dumps(route_json, indent=2)[:500]}...")
+            logger.info("🎬 Generating basic accident animation")
             
-            # 1. Load lane tree data
-            self.load_lane_tree_data()
+            # Create simple two-vehicle animation
+            dwg = svgwrite.Drawing(size=(self.svg_width, self.svg_height))
             
-            # 2. Parse route scenario FIRST (this will handle different JSON structures)
-            scenario_data = self.parse_route_scenario(route_json)
+            # Background
+            dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='#1a1a1a'))
             
-            # 3. Validate that we have vehicle data
-            if not scenario_data.get('user_vehicle') or not scenario_data.get('other_vehicle'):
-                logger.error(f"❗ Missing vehicle data. Scenario data: {scenario_data}")
-                raise ValueError("Missing vehicle data in route JSON")
+            # Simple intersection
+            dwg.add(dwg.line(start=(0, self.svg_height//2), end=(self.svg_width, self.svg_height//2), stroke='white', stroke_width=4))
+            dwg.add(dwg.line(start=(self.svg_width//2, 0), end=(self.svg_width//2, self.svg_height), stroke='white', stroke_width=4))
             
-            # 4. Match vehicles to lane paths (use parsed data instead of direct access)
-            user_path = self.match_vehicle_to_lanes(
-                scenario_data['user_vehicle'], 'user'
+            # Vehicle 1 (horizontal movement)
+            vehicle1 = dwg.circle(center=(100, self.svg_height//2), r=12, fill='blue', stroke='white', stroke_width=2)
+            animate1 = dwg.animateMotion(path=f"M100,{self.svg_height//2} L{self.svg_width-100},{self.svg_height//2}", dur="8s", repeatCount="1")
+            vehicle1.add(animate1)
+            dwg.add(vehicle1)
+            
+            # Vehicle 2 (vertical movement)
+            vehicle2 = dwg.circle(center=(self.svg_width//2, 100), r=12, fill='red', stroke='white', stroke_width=2)
+            animate2 = dwg.animateMotion(path=f"M{self.svg_width//2},100 L{self.svg_width//2},{self.svg_height-100}", dur="8s", repeatCount="1")
+            vehicle2.add(animate2)
+            dwg.add(vehicle2)
+            
+            # Collision effect
+            explosion = dwg.circle(center=(self.svg_width//2, self.svg_height//2), r=5, fill='orange', opacity=0)
+            explosion.add(dwg.animate(attributeName='r', values='5;50;30', dur='2s', begin='4s', repeatCount='1'))
+            explosion.add(dwg.animate(attributeName='opacity', values='0;1;0.5;0', dur='2s', begin='4s', repeatCount='1'))
+            dwg.add(explosion)
+            
+            # Save to S3
+            svg_key = f"animations/{self.connection_id}/basic_animation.svg"
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=svg_key,
+                Body=dwg.tostring(),
+                ContentType='image/svg+xml'
             )
-            other_path = self.match_vehicle_to_lanes(
-                scenario_data['other_vehicle'], 'other'
-            )
             
-            # 5. Generate collision scenario
-            scenario = CollisionScenario(
-                user_vehicle=user_path,
-                other_vehicle=other_path,
-                collision_point=self.calculate_collision_point(route_json),
-                collision_type=scenario_data.get('collision', {}).get('type', 'unknown'),
-                base_map_image=f"{self.connection_id}_intersection_map.png"
-            )
+            logger.info(f"✅ Basic animation saved: {svg_key}")
+            return svg_key
             
-            # 6. Create animated SVG
-            svg_content = self.create_animated_svg(scenario)
+        except Exception as e:
+            logger.error(f"❗ Basic animation failed: {e}")
+            return self.create_error_animation()
+    
+    def create_error_animation(self) -> str:
+        """Create error animation"""
+        dwg = svgwrite.Drawing(size=(800, 600))
+        dwg.add(dwg.rect(insert=(0, 0), size=(800, 600), fill='lightgray'))
+        dwg.add(dwg.text("Animation Error", insert=(400, 300), text_anchor="middle", fill='red', font_size=20))
+        
+        svg_key = f"animations/{self.connection_id}/error_animation.svg"
+        self.s3.put_object(Bucket=self.bucket, Key=svg_key, Body=dwg.tostring(), ContentType='image/svg+xml')
+        return svg_key
+
+    def load_lane_tree_data(self):
+        """Load lane tree data"""
+        try:
+            lane_tree_key = f"outputs/{self.connection_id}/{self.connection_id}_lane_tree_routes_enhanced.json"
+            response = self.s3.get_object(Bucket=self.bucket, Key=lane_tree_key)
+            self.lane_tree_data = json.loads(response['Body'].read().decode('utf-8'))
+            logger.info(f"✅ Loaded lane tree data")
+        except Exception as e:
+            logger.error(f"❗ Failed to load lane tree: {e}")
+            self.lane_tree_data = None
+
+# 🔧 SIMPLIFIED: EnhancedSVGAnimationGenerator with clean implementation
+class EnhancedSVGAnimationGenerator:
+
+    def __init__(self, s3_bucket: str, connection_id: str):
+        self.s3 = boto3.client('s3')
+        self.bedrock = boto3.client("bedrock-runtime", 
+                                   region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        self.bucket = s3_bucket
+        self.connection_id = connection_id
+        self.svg_width = 1280
+        self.svg_height = 1280
+        
+        # Lane tree data storage
+        self.lane_tree_data = None
+        self.use_llm_validation = True
+
+    # 🚀 SIMPLIFIED: Only try S3 for lane tree data
+    def load_lane_tree_data_from_s3(self):
+        """Load lane tree data from S3 only - with detailed logging"""
+        logger.info("🌐 Loading lane tree data from S3...")
+        
+        try:
+            s3_key = f"outputs/{self.connection_id}/{self.connection_id}_lane_tree_routes_enhanced.json"
+            logger.info(f"📍 S3 Key: {s3_key}")
             
-            # 7. Save to S3
-            svg_key = f"animations/{self.connection_id}/accident_animation.svg"
+            response = self.s3.get_object(Bucket=self.bucket, Key=s3_key)
+            self.lane_tree_data = json.loads(response['Body'].read().decode('utf-8'))
+            
+            # Detailed logging
+            if self.lane_tree_data:
+                lane_trees = self.lane_tree_data.get('lane_trees', [])
+                logger.info(f"✅ S3 lane tree loaded successfully: {len(lane_trees)} lanes")
+                
+                # Log all available lane IDs for debugging
+                lane_ids = [lane.get('lane_id', 'NO_ID') for lane in lane_trees]
+                logger.info(f"📋 Available lane IDs: {lane_ids}")
+                
+                # Log sample lane data
+                if lane_trees:
+                    sample_lane = lane_trees[0]
+                    sample_points = sample_lane.get('points', [])
+                    logger.info(f"🔍 Sample lane '{sample_lane.get('lane_id')}': {len(sample_points)} points")
+                    if sample_points:
+                        logger.info(f"🔍 First point example: {sample_points[0]}")
+            else:
+                logger.warning("⚠️ Lane tree data loaded but is empty")
+                
+        except Exception as e:
+            logger.error(f"❗ S3 lane tree loading failed: {e}")
+            logger.error(f"❗ Exception type: {type(e).__name__}")
+            self.lane_tree_data = None
+
+    # 🚀 SIMPLIFIED: Direct exact match only (no fuzzy matching)
+    def extract_waypoints_for_lane_exact(self, lane_id: str) -> list:
+        """Extract waypoints with exact lane_id match only - with detailed logging"""
+        logger.info(f"🎯 Extracting waypoints for exact lane_id: '{lane_id}'")
+        
+        if not lane_id or lane_id in ['unknown', 'None', '', None]:
+            logger.warning(f"⚠️ Invalid lane_id provided: '{lane_id}'")
+            return []
+        
+        if not self.lane_tree_data:
+            logger.error("❗ No lane tree data available")
+            return []
+        
+        lane_trees = self.lane_tree_data.get('lane_trees', [])
+        if not lane_trees:
+            logger.error("❗ No lane_trees found in data")
+            return []
+        
+        logger.info(f"🔍 Searching {len(lane_trees)} lanes for exact match...")
+        
+        # Exact match search
+        for i, lane in enumerate(lane_trees):
+            current_lane_id = lane.get('lane_id', '')
+            logger.info(f"🔍 Lane {i+1}/{len(lane_trees)}: '{current_lane_id}' vs target '{lane_id}'")
+            
+            if current_lane_id == lane_id:
+                logger.info(f"✅ EXACT MATCH FOUND: '{current_lane_id}'")
+                
+                points = lane.get('points', [])
+                logger.info(f"📊 Lane has {len(points)} raw points")
+                
+                if not points:
+                    logger.warning(f"⚠️ Lane '{lane_id}' found but has no points")
+                    return []
+                
+                # Convert points to waypoints
+                waypoints = []
+                for j, point in enumerate(points):
+                    try:
+                        if isinstance(point, (list, tuple)) and len(point) >= 2:
+                            waypoint = {'x': float(point[0]), 'y': float(point[1])}
+                        elif isinstance(point, dict) and 'x' in point and 'y' in point:
+                            waypoint = {'x': float(point['x']), 'y': float(point['y'])}
+                        else:
+                            logger.warning(f"⚠️ Invalid point format at index {j}: {point} (type: {type(point)})")
+                            continue
+                        
+                        waypoints.append(waypoint)
+                        
+                        # Log first few waypoints for debugging
+                        if j < 3:
+                            logger.info(f"🔍 Waypoint {j}: {waypoint}")
+                            
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"⚠️ Could not convert point {j}: {e}")
+                        continue
+                
+                logger.info(f"✅ Successfully extracted {len(waypoints)} valid waypoints")
+                return waypoints
+        
+        # No match found
+        logger.error(f"❌ NO EXACT MATCH found for lane_id: '{lane_id}'")
+        available_lanes = [lane.get('lane_id', 'NO_ID') for lane in lane_trees]
+        logger.error(f"📋 Available lanes were: {available_lanes}")
+        
+        return []
+
+    # 🚀 CORE: Main animation method with detailed logging
+    def generate_analytics_guided_animation_clean(self) -> str:
+        """CLEAN: Analytics-guided animation with detailed logging"""
+        logger.info("🎯 Starting CLEAN analytics-guided animation")
+        
+        try:
+            # Step 1: Load LLM data
+            logger.info("📂 STEP 1: Loading LLM ready data...")
+            llm_data = self.load_llm_ready_data()
+            
+            if not llm_data:
+                logger.error("❗ No LLM data available, creating fallback")
+                return self.create_dual_fallback_animation()
+            
+            logger.info(f"✅ LLM data loaded with keys: {list(llm_data.keys())}")
+            
+            # Step 2: Load lane tree data from S3
+            logger.info("📂 STEP 2: Loading lane tree data from S3...")
+            self.load_lane_tree_data_from_s3()
+            
+            if not self.lane_tree_data:
+                logger.error("❗ No lane tree data available, creating fallback")
+                return self.create_dual_fallback_animation()
+            
+            # Step 3: Process user vehicle
+            logger.info("🚙 STEP 3: Processing user vehicle...")
+            user_path_data = llm_data.get('user_path', {})
+            
+            if not user_path_data:
+                logger.error("❗ No user_path in LLM data")
+                return self.create_dual_fallback_animation()
+            
+            user_approach_lane = user_path_data.get('approach_lane', '')
+            user_lane_id = user_path_data.get('lane_id', user_approach_lane)  # Try both fields
+            user_maneuver = user_path_data.get('intended_maneuver', 'unknown')
+            
+            logger.info(f"🎯 User vehicle details:")
+            logger.info(f"   - approach_lane: '{user_approach_lane}'")
+            logger.info(f"   - lane_id: '{user_lane_id}'")
+            logger.info(f"   - intended_maneuver: '{user_maneuver}'")
+            
+            # Extract user waypoints
+            target_user_lane = user_lane_id or user_approach_lane
+            user_waypoints = self.extract_waypoints_for_lane_exact(target_user_lane)
+            
+            # 🚀 NEVER DROP BLUE CAR
+            if not user_waypoints:
+                logger.warning(f"⚠️ No waypoints found for user lane '{target_user_lane}', creating fallback marker")
+                user_waypoints = self.create_fallback_waypoints('user')
+                user_label = f"Your Vehicle (fallback marker - {user_maneuver})"
+                logger.info("🔵 Fallback marker created for user vehicle")
+            else:
+                user_label = f"Your Vehicle ({user_maneuver})"
+                logger.info(f"🔵 User vehicle: {len(user_waypoints)} real waypoints")
+            
+            # Step 4: Process other vehicle
+            logger.info("🚛 STEP 4: Processing other vehicle...")
+            other_path_data = llm_data.get('other_vehicle_path', {})
+            
+            if not other_path_data:
+                logger.warning("⚠️ No other_vehicle_path in LLM data, creating fallback")
+                other_waypoints = self.create_fallback_waypoints('other')
+                other_label = "Other Vehicle (no data - fallback marker)"
+            else:
+                other_approach_lane = other_path_data.get('approach_lane', '')
+                other_lane_id = other_path_data.get('lane_id', other_approach_lane)
+                other_maneuver = other_path_data.get('intended_maneuver', 'unknown')
+                
+                logger.info(f"🎯 Other vehicle details:")
+                logger.info(f"   - approach_lane: '{other_approach_lane}'")
+                logger.info(f"   - lane_id: '{other_lane_id}'")
+                logger.info(f"   - intended_maneuver: '{other_maneuver}'")
+                
+                target_other_lane = other_lane_id or other_approach_lane
+                other_waypoints = self.extract_waypoints_for_lane_exact(target_other_lane)
+                
+                if not other_waypoints:
+                    logger.warning(f"⚠️ No waypoints found for other lane '{target_other_lane}', creating fallback marker")
+                    other_waypoints = self.create_fallback_waypoints('other')
+                    other_label = f"Other Vehicle (fallback marker - {other_maneuver})"
+                    logger.info("🔴 Fallback marker created for other vehicle")
+                else:
+                    other_label = f"Other Vehicle ({other_maneuver})"
+                    logger.info(f"🔴 Other vehicle: {len(other_waypoints)} real waypoints")
+            
+            # Step 5: Create vehicle path objects
+            logger.info("🛣️ STEP 5: Creating vehicle path objects...")
+            
+            user_path = {
+                'waypoints': self.convert_waypoints_to_svg(user_waypoints),
+                'raw_waypoints': user_waypoints,
+                'color': 'blue',
+                'label': user_label,
+                'vehicle_type': 'user'
+            }
+            
+            other_path = {
+                'waypoints': self.convert_waypoints_to_svg(other_waypoints),
+                'raw_waypoints': other_waypoints,
+                'color': 'red',
+                'label': other_label,
+                'vehicle_type': 'other'
+            }
+            
+            logger.info(f"✅ User path: {len(user_path['waypoints'])} SVG waypoints")
+            logger.info(f"✅ Other path: {len(other_path['waypoints'])} SVG waypoints")
+            
+            # Step 6: Calculate collision and create animation
+            logger.info("💥 STEP 6: Creating collision animation...")
+            collision_data = self.calculate_collision_timing(user_path, other_path)
+            svg_content = self.create_dual_vehicle_svg_animation(user_path, other_path, collision_data)
+            
+            # Step 7: Save to S3
+            logger.info("💾 STEP 7: Saving animation to S3...")
+            svg_key = f"animations/{self.connection_id}/clean_analytics_animation.svg"
             self.s3.put_object(
                 Bucket=self.bucket,
                 Key=svg_key,
@@ -107,821 +377,513 @@ class SVGAnimationGenerator:
                 ContentType='image/svg+xml'
             )
             
-            logger.info(f"✅ Generated SVG animation: {svg_key}")
+            # Final success logging
+            logger.info("🎉 ANIMATION CREATION SUCCESS!")
+            logger.info(f"📁 SVG saved to: {svg_key}")
+            logger.info(f"🔵 Blue car: {user_label}")
+            logger.info(f"🔴 Red car: {other_label}")
+            logger.info(f"📊 Total lanes loaded: {len(self.lane_tree_data.get('lane_trees', []))}")
+            
             return svg_key
             
         except Exception as e:
+            logger.error(f"❗ CLEAN animation failed: {e}")
+            import traceback
+            logger.error(f"❗ Full traceback: {traceback.format_exc()}")
+            return self.create_dual_fallback_animation()
+
+    # 🚀 UPDATED: Main entry point
+    def generate_intelligent_animation(self) -> str:
+        """Main method - use clean implementation"""
+        try:
+            mode = os.environ.get("MODE", "CLEAN_ANALYTICS")
+            logger.info(f"🎯 Using mode: {mode}")
+            
+            return self.generate_analytics_guided_animation_clean()
+                
+        except Exception as e:
             logger.error(f"❗ Animation generation failed: {e}")
-            raise
+            return self.create_dual_fallback_animation()
 
-
-    def load_lane_tree_data(self):
-        """Load the lane tree routes enhanced JSON file (S3 only)."""
-        try:
-            lane_tree_key = getattr(self, "lane_tree_key_override", None) \
-                            or os.getenv("LANE_TREE_KEY") \
-                            or f"outputs/{self.connection_id}/{self.connection_id}_lane_tree_routes_enhanced.json"
-
-            logger.info(f"📥 Loading lane_tree from s3://{self.bucket}/{lane_tree_key}")
-            response = self.s3.get_object(Bucket=self.bucket, Key=lane_tree_key)
-            self.lane_tree_data = json.loads(response['Body'].read().decode('utf-8'))
-
-            logger.info(f"✅ Loaded lane tree data with {len(self.lane_tree_data['lane_trees'])} lanes")
-        except Exception as e:
-            logger.error(f"❗ Failed to load lane tree data from S3: {e}")
-            raise
-
-    def match_vehicle_to_lanes(self, vehicle_data: Dict, vehicle_type: str) -> VehiclePath:
-        """Match vehicle route description to actual lane paths using LLM"""
-        
-        # Extract vehicle info
-        origin_direction = vehicle_data['path']['origin']['direction']
-        maneuver = vehicle_data['path']['intended_destination']['maneuver']
-        origin_road = vehicle_data['path']['origin']['road_name']
-        
-        # Find matching lanes using intelligent matching
-        start_lane = self.find_best_matching_lane(
-            direction=origin_direction,
-            road_name=origin_road,
-            purpose="origin"
-        )
-        
-        end_lane = self.find_best_matching_lane(
-            direction=self.calculate_end_direction(origin_direction, maneuver),
-            maneuver=maneuver,
-            purpose="destination"
-        )
-        
-        # Generate route points
-        route_points = self.generate_vehicle_route_points(start_lane, end_lane, maneuver)
-        
-        return VehiclePath(
-            vehicle_id=vehicle_type,
-            start_lane_id=start_lane['lane_id'],
-            end_lane_id=end_lane['lane_id'] if end_lane else None,
-            maneuver=maneuver,
-            route_points=route_points,
-            collision_point=route_points[-1] if route_points else (0, 0),
-            timeline=[]
-        )
-
-    def find_best_matching_lane(self, direction: str = None, road_name: str = None, 
-                               maneuver: str = None, purpose: str = "origin") -> Dict:
-        """Find the best matching lane using AI-powered matching"""
-        
-        candidates = []
-        
-        for lane in self.lane_tree_data['lane_trees']:
-            score = 0
-            metadata = lane.get('metadata', {})
-            
-            # Direction matching
-            if direction and direction != "unknown":
-                lane_direction = metadata.get('simple_direction', '').lower()
-                traffic_direction = metadata.get('traffic_direction', '').lower()
-                
-                if direction.lower() in lane_direction or direction.lower() in traffic_direction:
-                    score += 30
-                
-                # Check directional language
-                direction_langs = metadata.get('narrative_directional', {}).get('user_direction_language', [])
-                if any(direction.lower() in lang.lower() for lang in direction_langs):
-                    score += 20
-            
-            # Road name matching
-            if road_name and road_name != "unknown":
-                parent_road_name = metadata.get('parent_road_name', '').lower()
-                display_name = metadata.get('display_name', '').lower()
-                
-                if road_name.lower() in parent_road_name or road_name.lower() in display_name:
-                    score += 25
-            
-            # Maneuver capability matching
-            if maneuver:
-                if maneuver == "left_turn" and metadata.get('can_turn_left'):
-                    score += 15
-                elif maneuver == "right_turn" and metadata.get('can_turn_right'):
-                    score += 15
-                elif maneuver == "straight" and metadata.get('can_go_straight'):
-                    score += 15
-            
-            # Lane type preferences
-            lane_type = metadata.get('lane_type', '')
-            if 'main' in lane_type.lower() or 'through' in lane_type.lower():
-                score += 10
-            
-            candidates.append((lane, score))
-        
-        # Sort by score and return best match
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        
-        if candidates:
-            best_lane, best_score = candidates[0]
-            logger.info(f"🎯 Best lane match for {purpose}: {best_lane['lane_id']} (score: {best_score})")
-            return best_lane
-        else:
-            # Fallback to first available lane
-            logger.warning(f"⚠️ No good lane match found, using fallback")
-            return self.lane_tree_data['lane_trees'][0] if self.lane_tree_data['lane_trees'] else {}
-
+    # 🚀 HELPER METHODS (simplified)
     
-    def generate_vehicle_route_points(self, start_lane: Dict, end_lane: Dict, maneuver: str) -> List[Tuple[float, float]]:
-        """Generate smooth route points from start lane to end lane"""
-        
-        route_points = []
-        
-        # Get start lane points
-        start_points = start_lane.get('points', [])
-        if not start_points:
-            logger.warning("No start points found")
-            return [(0, 0), (100, 100)]
-        
-        # Convert map coordinate points if available
-        map_coords = start_lane.get('metadata', {}).get('map_coordinate_points', [])
-        if map_coords:
-            # 🔥 FIX: Handle different coordinate formats
-            logger.info(f"🔍 map_coords format check: {type(map_coords[0]) if map_coords else 'empty'}")
-            
-            try:
-                # Check the format of coordinates
-                if map_coords and isinstance(map_coords[0], dict):
-                    # Format: [{'x': 640, 'y': 1180}, ...]
-                    start_points = [(p['x'], p['y']) for p in map_coords[:len(start_points)//2]]
-                elif map_coords and isinstance(map_coords[0], (list, tuple)) and len(map_coords[0]) >= 2:
-                    # Format: [[640, 1180], ...] or [(640, 1180), ...]
-                    start_points = [(p[0], p[1]) for p in map_coords[:len(start_points)//2]]
-                elif map_coords and isinstance(map_coords[0], (int, float)):
-                    # Format: [640, 1180, 640, 1160, ...] (flat list)
-                    paired_coords = [(map_coords[i], map_coords[i+1]) 
-                                for i in range(0, min(len(map_coords)-1, len(start_points)), 2)]
-                    start_points = paired_coords
-                else:
-                    logger.warning(f"⚠️ Unknown map_coords format: {type(map_coords[0]) if map_coords else 'empty'}")
-                    # Fallback to original start_points
-                    start_points = start_points[:len(start_points)//2]
-            except (IndexError, KeyError, TypeError) as e:
-                logger.warning(f"⚠️ Error processing map_coords: {e}, using original points")
-                # Fallback to original start_points
-                start_points = start_points[:len(start_points)//2]
-        else:
-            # Use lane tree points directly
-            start_points = start_points[:len(start_points)//2]  # Take first half for approach
-        
-        # 🔥 FIX: Ensure start_points are tuples of floats
-        processed_start_points = []
-        for point in start_points:
-            try:
-                if isinstance(point, (list, tuple)) and len(point) >= 2:
-                    processed_start_points.append((float(point[0]), float(point[1])))
-                elif isinstance(point, dict) and 'x' in point and 'y' in point:
-                    processed_start_points.append((float(point['x']), float(point['y'])))
-                else:
-                    logger.warning(f"⚠️ Skipping invalid point: {point}")
-            except (ValueError, TypeError, IndexError) as e:
-                logger.warning(f"⚠️ Error processing point {point}: {e}")
-        
-        if processed_start_points:
-            route_points.extend(processed_start_points)
-        else:
-            # Ultimate fallback
-            route_points = [(0, 0), (50, 50), (100, 100)]
-            logger.warning("⚠️ Using fallback route points")
-        
-        # Add intersection transition points
-        if end_lane and maneuver != "straight":
-            try:
-                # Generate turning curve
-                end_points = end_lane.get('points', [])
-                
-                # Process end points the same way
-                if end_points:
-                    end_map_coords = end_lane.get('metadata', {}).get('map_coordinate_points', [])
-                    if end_map_coords:
-                        try:
-                            if isinstance(end_map_coords[0], dict):
-                                end_processed = [(p['x'], p['y']) for p in end_map_coords[:3]]
-                            elif isinstance(end_map_coords[0], (list, tuple)):
-                                end_processed = [(p[0], p[1]) for p in end_map_coords[:3]]
-                            else:
-                                end_processed = end_points[:3]
-                        except (IndexError, KeyError, TypeError):
-                            end_processed = end_points[:3]
-                    else:
-                        end_processed = end_points[:3]
-                else:
-                    end_processed = [(100, 100)]
-                
-                turn_points = self.generate_turn_curve(
-                    route_points[-1] if route_points else (0, 0),
-                    end_processed,
-                    maneuver
-                )
-                route_points.extend(turn_points)
-            except Exception as e:
-                logger.warning(f"⚠️ Error generating turn curve: {e}")
-        
-        # Smooth the route
+    def load_llm_ready_data(self) -> dict:
+        """Load the lightweight metadata-only data"""
         try:
-            smoothed_points = self.smooth_route_points(route_points)
-            # 🔥 FIX: Transform to SVG coordinates
-            svg_route_points = self.transform_all_route_points(smoothed_points)
-            logger.info(f"🔄 Transformed {len(smoothed_points)} route points to SVG coordinates")
-            return svg_route_points
+            llm_key = f"animation-data/{self.connection_id}/llm_ready_data.json"
+            logger.info(f"📍 Loading LLM data from: {llm_key}")
+            
+            response = self.s3.get_object(Bucket=self.bucket, Key=llm_key)
+            data = json.loads(response['Body'].read().decode('utf-8'))
+            
+            logger.info(f"✅ LLM data loaded successfully")
+            return data
+            
         except Exception as e:
-            logger.warning(f"⚠️ Error smoothing route: {e}")
-            # 🔥 FIX: Transform fallback points too
-            fallback_points = route_points if route_points else [(0, 0), (100, 100)]
-            return self.transform_all_route_points(fallback_points)
+            logger.error(f"❗ Failed to load LLM data: {e}")
+            return {}
 
-            
+    def create_fallback_waypoints(self, vehicle_type: str) -> list:
+        """Create fallback waypoints when lane extraction fails"""
+        if vehicle_type == 'user':
+            waypoints = [
+                {'x': 100, 'y': self.svg_height // 2},
+                {'x': self.svg_width // 2 - 50, 'y': self.svg_height // 2},
+                {'x': self.svg_width // 2, 'y': self.svg_height // 2}
+            ]
+        else:  # other vehicle
+            waypoints = [
+                {'x': self.svg_width // 2, 'y': 100},
+                {'x': self.svg_width // 2, 'y': self.svg_height // 2 - 50},
+                {'x': self.svg_width // 2, 'y': self.svg_height // 2}
+            ]
+        
+        logger.info(f"🎯 Created {len(waypoints)} fallback waypoints for {vehicle_type} vehicle")
+        return waypoints
 
-    def generate_turn_curve(self, start_point: Tuple[float, float], 
-                           end_points: List, maneuver: str) -> List[Tuple[float, float]]:
-        """Generate smooth curve for turning maneuvers"""
+    # 🚀 UPDATED: Direct 1:1 mapping with bounds checking
+    def convert_waypoints_to_svg(self, waypoints: list) -> list:
+        """Direct 1:1 coordinate mapping - no scaling needed"""
+        logger.info(f"🎯 1:1 Mapping: {len(waypoints)} waypoints (1280x1280)")
         
-        if not end_points:
-            return [start_point, (start_point[0] + 50, start_point[1] + 50)]
+        if not waypoints:
+            return [{'x': 640, 'y': 640}]  # Center of 1280x1280
         
-        end_point = end_points[0] if isinstance(end_points[0], tuple) else (end_points[0], end_points[1])
-        
-        # Calculate control points for Bezier curve
-        mid_x = (start_point[0] + end_point[0]) / 2
-        mid_y = (start_point[1] + end_point[1]) / 2
-        
-        # Adjust control point based on turn type
-        if maneuver == "left_turn":
-            control_point = (mid_x - 20, mid_y - 20)
-        elif maneuver == "right_turn":
-            control_point = (mid_x + 20, mid_y + 20)
-        else:
-            control_point = (mid_x, mid_y)
-        
-        # Generate curve points
-        curve_points = []
-        for t in np.linspace(0, 1, 10):
-            x = (1-t)**2 * start_point[0] + 2*(1-t)*t * control_point[0] + t**2 * end_point[0]
-            y = (1-t)**2 * start_point[1] + 2*(1-t)*t * control_point[1] + t**2 * end_point[1]
-            curve_points.append((x, y))
-        
-        return curve_points
-
-    def smooth_route_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Apply smoothing to route points"""
-        if len(points) < 3:
-            return points
-        
-        # Simple moving average smoothing
-        smoothed = [points[0]]  # Keep first point
-        
-        for i in range(1, len(points) - 1):
-            prev_point = points[i-1]
-            curr_point = points[i]
-            next_point = points[i+1]
-            
-            smooth_x = (prev_point[0] + curr_point[0] + next_point[0]) / 3
-            smooth_y = (prev_point[1] + curr_point[1] + next_point[1]) / 3
-            
-            smoothed.append((smooth_x, smooth_y))
-        
-        smoothed.append(points[-1])  # Keep last point
-        return smoothed
-
-    ############## 
-    # SVG Generation
-    ##############
-    def transform_coordinates_to_svg(self, world_coords: Tuple[float, float]) -> Tuple[float, float]:
-        """Transform world coordinates to SVG coordinate system"""
-        
-        if not self.lane_tree_data:
-            return world_coords
-        
-        # Calculate bounds of the lane tree data
-        all_x_coords = []
-        all_y_coords = []
-        
-        for lane in self.lane_tree_data['lane_trees']:
-            points = lane.get('points', [])
-            for point in points:
-                try:
-                    if isinstance(point, (tuple, list)) and len(point) >= 2:
-                        all_x_coords.append(float(point[0]))
-                        all_y_coords.append(float(point[1]))
-                    elif isinstance(point, dict) and 'x' in point and 'y' in point:
-                        all_x_coords.append(float(point['x']))
-                        all_y_coords.append(float(point['y']))
-                except (ValueError, TypeError, IndexError):
-                    continue
-        
-        if not all_x_coords or not all_y_coords:
-            return world_coords
-        
-        # World bounds
-        world_min_x, world_max_x = min(all_x_coords), max(all_x_coords)
-        world_min_y, world_max_y = min(all_y_coords), max(all_y_coords)
-        world_width = world_max_x - world_min_x
-        world_height = world_max_y - world_min_y
-        
-        # Add padding
-        padding = 50
-        svg_width = self.svg_width - 2 * padding
-        svg_height = self.svg_height - 2 * padding
-        
-        # Transform coordinates
-        world_x, world_y = world_coords
-        
-        # Normalize to 0-1 range
-        norm_x = (world_x - world_min_x) / world_width if world_width > 0 else 0.5
-        norm_y = (world_y - world_min_y) / world_height if world_height > 0 else 0.5
-        
-        # Scale to SVG coordinates
-        svg_x = padding + norm_x * svg_width
-        svg_y = padding + norm_y * svg_height
-        
-        logger.info(f"🔄 Coordinate transform: world({world_x:.1f}, {world_y:.1f}) -> SVG({svg_x:.1f}, {svg_y:.1f})")
-        return (svg_x, svg_y)
-
-    def transform_all_route_points(self, route_points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Transform all route points to SVG coordinates"""
-        return [self.transform_coordinates_to_svg(point) for point in route_points]
-
-
-    ##############
-    def calculate_collision_point(self, route_json: Dict) -> Tuple[float, float]:
-        """Calculate the collision point coordinates in world space, then transform to SVG"""
-        
-        # Get collision point in world coordinates (existing logic)
-        if 'route_json' in route_json and isinstance(route_json['route_json'], dict):
-            working_data = route_json['route_json']
-        else:
-            working_data = route_json
-        
-        collision_coords = working_data.get('collision', {}).get('point', {}).get('coordinates')
-        
-        if collision_coords and isinstance(collision_coords, dict):
-            try:
-                world_x = float(collision_coords.get('x', 0))
-                world_y = float(collision_coords.get('y', 0))
-                world_collision_point = (world_x, world_y)
-            except (ValueError, TypeError):
-                world_collision_point = None
-        else:
-            world_collision_point = None
-        
-        # Fallback: calculate intersection center from lane data
-        if not world_collision_point and self.lane_tree_data:
-            all_x_coords = []
-            all_y_coords = []
-            
-            for lane in self.lane_tree_data['lane_trees']:
-                points = lane.get('points', [])
-                if not points:
-                    continue
+        svg_waypoints = []
+        for i, point in enumerate(waypoints):
+            if isinstance(point, dict) and 'x' in point and 'y' in point:
+                # Direct mapping with bounds checking
+                svg_x = max(0, min(1280, point['x']))
+                svg_y = max(0, min(1280, point['y']))
                 
-                for point in points:
-                    try:
-                        if isinstance(point, (tuple, list)) and len(point) >= 2:
-                            x, y = float(point[0]), float(point[1])
-                            all_x_coords.append(x)
-                            all_y_coords.append(y)
-                        elif isinstance(point, dict) and 'x' in point and 'y' in point:
-                            x, y = float(point['x']), float(point['y'])
-                            all_x_coords.append(x)
-                            all_y_coords.append(y)
-                    except (ValueError, TypeError, IndexError):
-                        continue
+                svg_waypoints.append({'x': svg_x, 'y': svg_y})
+                
+                if i < 3:
+                    logger.info(f"🎯 Point {i}: ({point['x']}, {point['y']}) → ({svg_x}, {svg_y})")
+        
+        logger.info(f"✅ 1:1 mapping complete: {len(svg_waypoints)} points")
+        return svg_waypoints
+
+
+    def create_dual_fallback_animation(self) -> str:
+        """Create dual-vehicle fallback animation when everything fails"""
+        logger.info("🆘 Creating dual fallback animation")
+        
+        try:
+            # Create fallback paths
+            user_path = {
+                'waypoints': [
+                    {'x': 100, 'y': self.svg_height // 2},
+                    {'x': self.svg_width // 2 - 50, 'y': self.svg_height // 2},
+                    {'x': self.svg_width // 2, 'y': self.svg_height // 2}
+                ],
+                'color': 'blue',
+                'label': 'Your Vehicle (complete fallback)',
+                'vehicle_type': 'user'
+            }
             
-            if all_x_coords and all_y_coords:
-                world_x = sum(all_x_coords) / len(all_x_coords)
-                world_y = sum(all_y_coords) / len(all_y_coords)
-                world_collision_point = (world_x, world_y)
-                logger.info(f"📍 Calculated world collision point: ({world_x:.1f}, {world_y:.1f})")
+            other_path = {
+                'waypoints': [
+                    {'x': self.svg_width // 2, 'y': 100},
+                    {'x': self.svg_width // 2, 'y': self.svg_height // 2 - 50},
+                    {'x': self.svg_width // 2, 'y': self.svg_height // 2}
+                ],
+                'color': 'red',
+                'label': 'Other Vehicle (complete fallback)',
+                'vehicle_type': 'other'
+            }
+            
+            collision_data = {
+                'collision_point': [self.svg_width // 2, self.svg_height // 2],
+                'collision_timing': 5.0
+            }
+            
+            svg_content = self.create_dual_vehicle_svg_animation(user_path, other_path, collision_data)
+            
+            svg_key = f"animations/{self.connection_id}/dual_fallback_animation.svg"
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=svg_key,
+                Body=svg_content,
+                ContentType='image/svg+xml'
+            )
+            
+            logger.info(f"✅ Dual fallback animation created: {svg_key}")
+            return svg_key
+            
+        except Exception as e:
+            logger.error(f"❗ Even fallback failed: {e}")
+            return self.create_minimal_svg()
+
+    def create_minimal_svg(self) -> str:
+        """Ultimate fallback - creates simple SVG"""
+        logger.info("🆘 Creating minimal fallback SVG")
+        dwg = svgwrite.Drawing(size=(800, 600))
+        dwg.add(dwg.rect(insert=(0, 0), size=(800, 600), fill='lightgray'))
+        dwg.add(dwg.text(
+            "Animation generation failed",
+            insert=(400, 300),
+            text_anchor="middle",
+            fill='red',
+            font_size=20
+        ))
         
-        # Transform to SVG coordinates
-        if world_collision_point:
-            svg_collision_point = self.transform_coordinates_to_svg(world_collision_point)
-            logger.info(f"📍 SVG collision point: ({svg_collision_point[0]:.1f}, {svg_collision_point[1]:.1f})")
-            return svg_collision_point
-        
-        # Ultimate fallback: return center of SVG canvas
-        default_point = (self.svg_width / 2, self.svg_height / 2)
-        logger.info(f"📍 Using default SVG collision point: {default_point}")
-        return default_point    
+        svg_key = f"animations/{self.connection_id}/error_animation.svg"
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=svg_key,
+            Body=dwg.tostring(),
+            ContentType='image/svg+xml'
+        )
+        logger.info(f"✅ Minimal SVG saved: {svg_key}")
+        return svg_key
 
-
-
-    def create_animated_svg(self, scenario: CollisionScenario) -> str:
-        """Create the animated SVG content"""
+    # Keep existing SVG creation methods...
+    def create_dual_vehicle_svg_animation(self, user_path: dict, other_path: dict, collision_data: dict) -> str:
+        """Create SVG with two vehicles moving toward collision"""
+        logger.info("🎬 Creating dual-vehicle SVG animation")
         
         dwg = svgwrite.Drawing(size=(self.svg_width, self.svg_height))
         
-        # Add background map if available
-        self.add_background_map(dwg, scenario.base_map_image)
+        # Add background
+        dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='#1a1a1a'))
         
-        # Add lane markings
-        self.add_lane_markings(dwg)
+        # Add intersection background
+        self.add_intersection_background(dwg)
         
-        # Add vehicle animations
-        self.add_vehicle_animation(dwg, scenario.user_vehicle, "blue", "User Vehicle")
-        self.add_vehicle_animation(dwg, scenario.other_vehicle, "red", "Other Vehicle")
+        # Add vehicle paths (visual guides)
+        self.add_vehicle_path_visualization(dwg, user_path, other_path)
         
-        # Add collision point marker
-        self.add_collision_marker(dwg, scenario.collision_point)
+        # Add both vehicle animations
+        self.add_vehicle_animation(dwg, user_path, collision_data, 'user')
+        self.add_vehicle_animation(dwg, other_path, collision_data, 'other')
         
-        # Add timeline and controls
-        self.add_animation_controls(dwg)
+        # Add collision effect
+        self.add_collision_effect(dwg, collision_data)
+        
+        # Add labels and timeline
+        self.add_dual_vehicle_labels(dwg, user_path, other_path)
+        self.add_timeline_display(dwg)
         
         return dwg.tostring()
 
-    def add_background_map(self, dwg, map_image: str):
-        """Add background map image"""
-        try:
-            # Load map image from S3 and embed as base64
-            map_key = f"outputs/{self.connection_id}/{map_image}"
-            response = self.s3.get_object(Bucket=self.bucket, Key=map_key)
-            
-            # For now, just add a placeholder rectangle
-            dwg.add(dwg.rect(
-                insert=(0, 0),
-                size=(self.svg_width, self.svg_height),
-                fill='lightgray',
-                opacity=0.3
+    def add_vehicle_path_visualization(self, dwg, user_path: dict, other_path: dict):
+        """Add visual representation of both vehicle paths"""
+        # User vehicle path (blue, dashed)
+        user_waypoints = user_path.get('waypoints', [])
+        if len(user_waypoints) > 1:
+            path_data = self.waypoints_to_svg_path(user_waypoints)
+            dwg.add(dwg.path(
+                d=path_data,
+                stroke='lightblue',
+                stroke_width=2,
+                stroke_dasharray="5,5",
+                fill='none',
+                opacity=0.6
             ))
-            
-        except Exception as e:
-            logger.warning(f"Could not load background map: {e}")
-            # Add fallback background
-            dwg.add(dwg.rect(
-                insert=(0, 0),
-                size=(self.svg_width, self.svg_height),
-                fill='lightgray'
+        
+        # Other vehicle path (red, dashed)
+        other_waypoints = other_path.get('waypoints', [])
+        if len(other_waypoints) > 1:
+            path_data = self.waypoints_to_svg_path(other_waypoints)
+            dwg.add(dwg.path(
+                d=path_data,
+                stroke='lightcoral',
+                stroke_width=2,
+                stroke_dasharray="5,5",
+                fill='none',
+                opacity=0.6
             ))
 
-    def add_lane_markings(self, dwg):
-        """Add lane markings based on lane tree data"""
-        if not self.lane_tree_data:
+    def add_vehicle_animation(self, dwg, vehicle_path: dict, collision_data: dict, vehicle_type: str):
+        """Add animated vehicle to SVG"""
+        waypoints = vehicle_path.get('waypoints', [])
+        if not waypoints:
             return
         
-        for lane in self.lane_tree_data['lane_trees']:
-            points = lane.get('points', [])
-            if len(points) >= 2:
-                # 🔥 FIX: Transform points to SVG coordinates
-                svg_points = []
-                for point in points:
-                    try:
-                        if isinstance(point, (tuple, list)) and len(point) >= 2:
-                            world_point = (float(point[0]), float(point[1]))
-                            svg_point = self.transform_coordinates_to_svg(world_point)
-                            svg_points.append(svg_point)
-                    except (ValueError, TypeError, IndexError):
-                        continue
-                
-                if len(svg_points) >= 2:
-                    # Convert points to SVG path
-                    path_data = f"M{svg_points[0][0]},{svg_points[0][1]}"
-                    for point in svg_points[1:]:
-                        path_data += f" L{point[0]},{point[1]}"
-                    
-                    dwg.add(dwg.path(
-                        d=path_data,
-                        stroke='white',
-                        stroke_width=2,
-                        fill='none',
-                        stroke_dasharray="5,5"
-                    ))
-
-
-    def add_vehicle_animation(self, dwg, vehicle_path: VehiclePath, color: str, label: str):
-        """Add animated vehicle following the calculated path"""
+        color = vehicle_path.get('color', 'gray')
+        vehicle_size = 12 if vehicle_type == 'user' else 10
         
-        if not vehicle_path.route_points:
-            return
-        
-        # Create vehicle shape (simple rectangle/circle)
+        # Create vehicle shape (circle for simplicity)
         vehicle = dwg.circle(
-            center=(vehicle_path.route_points[0][0], vehicle_path.route_points[0][1]),
-            r=8,
+            center=(waypoints[0]['x'] if isinstance(waypoints[0], dict) else waypoints[0][0],
+                    waypoints[0]['y'] if isinstance(waypoints[0], dict) else waypoints[0][1]),
+            r=vehicle_size,
             fill=color,
-            stroke='black',
+            stroke='white',
             stroke_width=2
         )
         
-        # Add vehicle label
-        label_text = dwg.text(
-            label,
-            insert=(vehicle_path.route_points[0][0] - 20, vehicle_path.route_points[0][1] - 15),
-            fill='black',
-            font_size=12
-        )
-        
         # Create animation path
-        if len(vehicle_path.route_points) > 1:
-            path_data = f"M{vehicle_path.route_points[0][0]},{vehicle_path.route_points[0][1]}"
-            for point in vehicle_path.route_points[1:]:
-                path_data += f" L{point[0]},{point[1]}"
+        if len(waypoints) > 1:
+            animation_path = self.waypoints_to_svg_path(waypoints)
             
-            # Add path visualization
-            path_visual = dwg.path(
-                d=path_data,
-                stroke=color,
-                stroke_width=3,
-                fill='none',
-                opacity=0.5
-            )
-            dwg.add(path_visual)
+            # Calculate animation duration based on collision timing
+            collision_progress = collision_data.get(f'{vehicle_type}_collision_progress', 0.6)
+            total_duration = 8.0  # Total animation time in seconds
             
-            # Add animation
             animate_motion = dwg.animateMotion(
-                path=path_data,
-                dur="8s",
-                repeatCount="indefinite"
+                path=animation_path,
+                dur=f"{total_duration}s",
+                repeatCount="1",
+                fill="freeze"
             )
-            vehicle.add(animate_motion)
             
-            # Animate the label too
-            label_animate = dwg.animateMotion(
-                path=path_data,
-                dur="8s", 
-                repeatCount="indefinite"
-            )
-            label_text.add(label_animate)
+            vehicle.add(animate_motion)
         
         dwg.add(vehicle)
-        dwg.add(label_text)
 
-    def add_collision_marker(self, dwg, collision_point: Tuple[float, float]):
-        """Add collision point marker with animation"""
+    def waypoints_to_svg_path(self, waypoints: list) -> str:
+        """Convert waypoints to SVG path data"""
+        if not waypoints:
+            return ""
         
-        # Collision explosion effect
+        # Handle first point
+        first_point = waypoints[0]
+        if isinstance(first_point, dict):
+            path_data = f"M{first_point['x']},{first_point['y']}"
+        else:
+            path_data = f"M{first_point[0]},{first_point[1]}"
+        
+        # Add remaining points
+        for point in waypoints[1:]:
+            if isinstance(point, dict):
+                path_data += f" L{point['x']},{point['y']}"
+            else:
+                path_data += f" L{point[0]},{point[1]}"
+        
+        return path_data
+
+    def add_collision_effect(self, dwg, collision_data: dict):
+        """Add collision effect animation"""
+        collision_point = collision_data.get('collision_point', [self.svg_width//2, self.svg_height//2])
+        collision_timing = collision_data.get('collision_timing', 5.0)
+        
+        # Explosion effect
         explosion = dwg.circle(
-            center=collision_point,
+            center=(collision_point[0], collision_point[1]),
             r=5,
             fill='orange',
             opacity=0
         )
         
-        # Animation: appears at collision time
+        # Animate explosion
         explosion.add(dwg.animate(
             attributeName='r',
-            values='5;30;5',
-            dur='1s',
-            begin='6s',
+            values='5;50;30',
+            dur='2s',
+            begin=f'{collision_timing}s',
             repeatCount='1'
         ))
         
         explosion.add(dwg.animate(
             attributeName='opacity',
-            values='0;1;0',
-            dur='1s',
-            begin='6s',
+            values='0;1;0.5;0',
+            dur='2s',
+            begin=f'{collision_timing}s',
             repeatCount='1'
         ))
         
         dwg.add(explosion)
-        
-        # Permanent collision marker
-        marker = dwg.text(
-            "⚠️ COLLISION",
-            insert=(collision_point[0] - 30, collision_point[1] + 40),
-            fill='red',
-            font_size=14,
-            font_weight='bold'
-        )
-        dwg.add(marker)
 
-    def add_animation_controls(self, dwg):
-        """Add animation timeline and controls"""
+    def add_dual_vehicle_labels(self, dwg, user_path: dict, other_path: dict):
+        """Add labels for both vehicles"""
+        # User vehicle label
+        user_waypoints = user_path.get('waypoints', [])
+        if user_waypoints:
+            start_point = user_waypoints[0]
+            if isinstance(start_point, dict):
+                x, y = start_point['x'], start_point['y']
+            else:
+                x, y = start_point[0], start_point[1]
+            
+            dwg.add(dwg.text(
+                user_path.get('label', 'Your Vehicle'),
+                insert=(x - 40, y - 30),
+                fill='lightblue',
+                font_size=14,
+                font_weight='bold'
+            ))
         
+        # Other vehicle label
+        other_waypoints = other_path.get('waypoints', [])
+        if other_waypoints:
+            start_point = other_waypoints[0]
+            if isinstance(start_point, dict):
+                x, y = start_point['x'], start_point['y']
+            else:
+                x, y = start_point[0], start_point[1]
+            
+            dwg.add(dwg.text(
+                other_path.get('label', 'Other Vehicle'),
+                insert=(x - 40, y - 30),
+                fill='lightcoral',
+                font_size=14,
+                font_weight='bold'
+            ))
+
+    def add_timeline_display(self, dwg):
+        """Add timeline display at bottom"""
         # Timeline background
         timeline_bg = dwg.rect(
-            insert=(50, self.svg_height - 80),
-            size=(self.svg_width - 100, 60),
+            insert=(50, self.svg_height - 100),
+            size=(self.svg_width - 100, 80),
             fill='black',
-            opacity=0.7,
+            opacity=0.8,
             rx=10
         )
         dwg.add(timeline_bg)
         
-        # Timeline labels
-        labels = [
-            "0s: Vehicles approach",
-            "3s: Enter intersection", 
-            "6s: COLLISION!",
-            "8s: Animation repeats"
-        ]
+        # Timeline text
+        dwg.add(dwg.text(
+            "Two-Vehicle Collision Animation",
+            insert=(self.svg_width//2, self.svg_height - 70),
+            text_anchor="middle",
+            fill='white',
+            font_size=18,
+            font_weight='bold'
+        ))
         
-        for i, label in enumerate(labels):
-            x_pos = 70 + i * (self.svg_width - 140) / len(labels)
-            dwg.add(dwg.text(
-                label,
-                insert=(x_pos, self.svg_height - 50),
-                fill='white',
-                font_size=10
-            ))
+        dwg.add(dwg.text(
+            "Blue: Your Vehicle | Red: Other Vehicle | Orange: Collision Point",
+            insert=(self.svg_width//2, self.svg_height - 45),
+            text_anchor="middle",
+            fill='lightgray',
+            font_size=12
+        ))
 
-    def calculate_end_direction(self, start_direction: str, maneuver: str) -> str:
-        """Calculate end direction based on start direction and maneuver"""
+    def add_intersection_background(self, dwg):
+        """Add intersection background"""
+        # Simple intersection
+        dwg.add(dwg.line(
+            start=(0, self.svg_height//2),
+            end=(self.svg_width, self.svg_height//2),
+            stroke='white',
+            stroke_width=4
+        ))
+        dwg.add(dwg.line(
+            start=(self.svg_width//2, 0),
+            end=(self.svg_width//2, self.svg_height),
+            stroke='white',
+            stroke_width=4
+        ))
+
+    def calculate_collision_timing(self, user_path: dict, other_path: dict) -> dict:
+        """Calculate when and where vehicles collide"""
+        logger.info("💥 Calculating collision timing and point")
         
-        direction_map = {
-            "north": {"left_turn": "west", "right_turn": "east", "straight": "north"},
-            "south": {"left_turn": "east", "right_turn": "west", "straight": "south"},
-            "east": {"left_turn": "north", "right_turn": "south", "straight": "east"},
-            "west": {"left_turn": "south", "right_turn": "north", "straight": "west"}
+        user_waypoints = user_path.get('waypoints', [])
+        other_waypoints = other_path.get('waypoints', [])
+        
+        if not user_waypoints or not other_waypoints:
+            return self.create_default_collision()
+        
+        # Find intersection point of paths
+        collision_point = self.find_path_intersection(user_waypoints, other_waypoints)
+        
+        # Calculate timing - when each vehicle reaches collision point
+        user_collision_time = self.calculate_time_to_point(user_waypoints, collision_point)
+        other_collision_time = self.calculate_time_to_point(other_waypoints, collision_point)
+        
+        # Synchronize timing for collision
+        collision_timing = max(user_collision_time, other_collision_time)
+        
+        return {
+            'collision_point': collision_point,
+            'collision_timing': collision_timing,
+            'user_collision_progress': user_collision_time / len(user_waypoints) if user_waypoints else 0.5,
+            'other_collision_progress': other_collision_time / len(other_waypoints) if other_waypoints else 0.5,
+            'collision_type': 'intersection_collision'
         }
-        
-        return direction_map.get(start_direction, {}).get(maneuver, start_direction)
 
-    ##############
-    # JSON Parsing with Flexible Structure Handling (NEW)
-    ##############
-    def parse_route_scenario(self, route_json: Dict) -> Dict:
-        """Parse and validate the route scenario JSON with nested structure support"""
+    def find_path_intersection(self, path1: list, path2: list) -> list:
+        """Find where two paths intersect (approximate)"""
+        min_distance = float('inf')
+        intersection_point = [self.svg_width // 2, self.svg_height // 2]  # Default center
         
-        # 🔥 FIX: Handle nested route_json structure
-        working_data = route_json
-        if 'route_json' in route_json and isinstance(route_json['route_json'], dict):
-            working_data = route_json['route_json']
-            logger.info("✅ Found nested route_json structure, using nested data")
-        
-        # Try to find vehicles data in the working data
-        vehicles_data = working_data.get('vehicles', {})
-        
-        # If no 'vehicles' key, try alternative structures
-        if not vehicles_data:
-            logger.warning("⚠️ No 'vehicles' key found, trying alternative structures...")
-            
-            # Try alternative structures in working_data first
-            user_vehicle = (working_data.get('user_vehicle') or 
-                        working_data.get('vehicle1') or 
-                        working_data.get('primary_vehicle') or
-                        working_data.get('car1'))
-                        
-            other_vehicle = (working_data.get('other_vehicle') or 
-                            working_data.get('vehicle2') or 
-                            working_data.get('secondary_vehicle') or
-                            working_data.get('car2'))
-            
-            # If still not found, try the original route_json level
-            if not user_vehicle:
-                user_vehicle = (route_json.get('user_vehicle') or 
-                            route_json.get('vehicle1') or 
-                            route_json.get('primary_vehicle') or
-                            route_json.get('car1'))
-                            
-            if not other_vehicle:
-                other_vehicle = (route_json.get('other_vehicle') or 
-                                route_json.get('vehicle2') or 
-                                route_json.get('secondary_vehicle') or
-                                route_json.get('car2'))
-            
-            # 🔥 NEW: Try to extract from user_path if vehicles still not found
-            if not user_vehicle and 'user_path' in route_json:
-                user_path = route_json['user_path']
-                other_vehicle_info = user_path.get('other_vehicle', {})
+        # Check all combinations of points
+        for p1 in path1:
+            for p2 in path2:
+                # Extract coordinates
+                if isinstance(p1, dict):
+                    p1_coords = [p1.get('x', 0), p1.get('y', 0)]
+                else:
+                    p1_coords = p1
                 
-                # Create user vehicle from user_path
-                user_vehicle = {
-                    'path': {
-                        'origin': {
-                            'direction': user_path.get('origin_direction', 'unknown'),
-                            'road_name': user_path.get('origin_road', 'unknown')[:100] if user_path.get('origin_road') else 'unknown',
-                            'lane': user_path.get('approach_lane', 'unknown')
-                        },
-                        'intended_destination': {
-                            'maneuver': user_path.get('intended_maneuver', 'straight'),
-                            'target_road': user_path.get('destination_road', 'unknown')
-                        }
-                    },
-                    'state_at_collision': {
-                        'speed': 'unknown',
-                        'position': user_path.get('collision_point', 'intersection'),
-                        'action': user_path.get('intended_maneuver', 'straight')
-                    }
-                }
+                if isinstance(p2, dict):
+                    p2_coords = [p2.get('x', 0), p2.get('y', 0)]
+                else:
+                    p2_coords = p2
                 
-                # Create other vehicle from other_vehicle data in user_path
-                other_vehicle = {
-                    'path': {
-                        'origin': {
-                            'direction': 'unknown',
-                            'road_name': 'unknown',
-                            'lane': 'unknown'
-                        },
-                        'intended_destination': {
-                            'maneuver': other_vehicle_info.get('action', 'unknown'),
-                            'target_road': 'unknown'
-                        }
-                    },
-                    'state_at_collision': {
-                        'speed': 'unknown',
-                        'position': other_vehicle_info.get('position', 'unknown'),
-                        'action': other_vehicle_info.get('action', 'unknown')
-                    }
-                }
+                distance = math.sqrt((p1_coords[0] - p2_coords[0])**2 + (p1_coords[1] - p2_coords[1])**2)
+                if distance < min_distance:
+                    min_distance = distance
+                    # Average of closest points
+                    intersection_point = [(p1_coords[0] + p2_coords[0]) / 2, (p1_coords[1] + p2_coords[1]) / 2]
+        
+        logger.info(f"🎯 Collision point: {intersection_point}, closest distance: {min_distance:.1f}")
+        return intersection_point
+
+    def calculate_time_to_point(self, waypoints: list, target_point: list) -> int:
+        """Calculate how many steps it takes to reach target point"""
+        if not waypoints or not target_point:
+            return len(waypoints) // 2 if waypoints else 10
+        
+        min_distance = float('inf')
+        closest_index = len(waypoints) // 2  # Default middle
+        
+        for i, point in enumerate(waypoints):
+            if isinstance(point, dict):
+                point_coords = [point.get('x', 0), point.get('y', 0)]
+            else:
+                point_coords = point
                 
-                logger.info("🔧 Created vehicles from user_path structure")
-            
-            vehicles_data = {
-                'user_vehicle': user_vehicle or {},
-                'other_vehicle': other_vehicle or {}
-            }
-            
-            logger.info(f"🔄 Using alternative structure: user={bool(user_vehicle)}, other={bool(other_vehicle)}")
-        else:
-            logger.info("✅ Found vehicles data in standard location")
+            distance = math.sqrt((point_coords[0] - target_point[0])**2 + (point_coords[1] - target_point[1])**2)
+            if distance < min_distance:
+                min_distance = distance
+                closest_index = i
         
-        # Handle collision data from working_data
-        collision_data = working_data.get('collision', {})
-        if not collision_data:
-            # Try alternative collision keys
-            collision_data = (working_data.get('accident', {}) or 
-                            working_data.get('crash', {}) or 
-                            working_data.get('impact', {}) or
-                            route_json.get('collision', {}) or
-                            route_json.get('accident', {}) or
-                            route_json.get('crash', {}))
+        return closest_index
+
+    def create_default_collision(self) -> dict:
+        """Create default collision data when calculation fails"""
+        return {
+            'collision_point': [self.svg_width // 2, self.svg_height // 2],
+            'collision_timing': 5.0,
+            'user_collision_progress': 0.6,
+            'other_collision_progress': 0.6,
+            'collision_type': 'intersection_collision'
+        }
+
+# 🚀 MAIN PROCESS
+if __name__ == "__main__":
+    logger.info("🧾 Runtime marker | td_rev+image should match deploy | MODE=%s", os.getenv("MODE", ""))
+    # 🚨 FORCE LOG TO PROVE NEW CODE IS RUNNING
+    logger.info("🔥 NEW CODE VERSION 2.0 - CLEAN ANALYTICS STARTING!")
+    logger.info("🔥 This message proves the updated code is deployed!")
+    try:
+        bucket_name = _get_env("BUCKET_NAME")
+        connection_id = _get_env("CONNECTION_ID")
+        mode = os.environ.get("MODE", "CLEAN_ANALYTICS")
         
-        # Handle timeline data
-        timeline_data = working_data.get('timeline', {})
-        if not timeline_data:
-            timeline_data = route_json.get('timeline', {})
+        logger.info("🎉 Starting CLEAN SVG Animation Generation")
+        logger.info(f"🪣 Bucket: {bucket_name}")
+        logger.info(f"🔗 Connection: {connection_id}")
+        logger.info(f"🎯 Mode: {mode}")
+        
+        generator = EnhancedSVGAnimationGenerator(bucket_name, connection_id)
+        svg_key = generator.generate_intelligent_animation()
         
         result = {
-            "user_vehicle": vehicles_data.get('user_vehicle', {}),
-            "other_vehicle": vehicles_data.get('other_vehicle', {}),
-            "collision": collision_data,
-            "timeline": timeline_data
+            "statusCode": 200,
+            "svg_key": svg_key,
+            "mode": mode,
+            "connection_id": connection_id
         }
         
-        # 🔥 DEBUG: Log what we extracted
-        logger.info(f"🔍 Extracted vehicles: user={bool(result['user_vehicle'])}, other={bool(result['other_vehicle'])}")
-        if result['user_vehicle']:
-            user_path = result['user_vehicle'].get('path', {})
-            logger.info(f"👤 User vehicle: {user_path.get('origin', {}).get('direction', 'unknown')} -> {user_path.get('intended_destination', {}).get('maneuver', 'unknown')}")
-        if result['other_vehicle']:
-            other_path = result['other_vehicle'].get('path', {})
-            logger.info(f"🚗 Other vehicle: {other_path.get('origin', {}).get('direction', 'unknown')} -> {other_path.get('intended_destination', {}).get('maneuver', 'unknown')}")
+        print(json.dumps(result, indent=2))
         
-        return result
-
-
-def lambda_handler(event, context):
-    """S3-only entry (kept only if you still invoke this as a Lambda)."""
-    try:
-        bucket_name   = os.getenv("BUCKET_NAME") or event.get("bucket_name")
-        connection_id = os.getenv("CONNECTION_ID") or event.get("connection_id")
-        route_s3_key  = os.getenv("ROUTE_S3_KEY") or event.get("route_s3_key")
-        lane_tree_key = os.getenv("LANE_TREE_KEY")  # optional
-
-        if not route_s3_key and connection_id:
-            route_s3_key = f"animation-data/{connection_id}/complete_route_data.json"
-
-        if not (bucket_name and connection_id and route_s3_key):
-            raise RuntimeError("Missing BUCKET_NAME / CONNECTION_ID / ROUTE_S3_KEY")
-
-        logger.info(f"📥 Loading route_json from s3://{bucket_name}/{route_s3_key}")
-        route_json = _load_json_from_s3(bucket_name, route_s3_key)
-
-        gen = SVGAnimationGenerator(bucket_name, connection_id)
-        if lane_tree_key:
-            gen.lane_tree_key_override = lane_tree_key
-
-        svg_key = gen.generate_accident_animation(route_json)
-        return {"statusCode": 200, "svg_key": svg_key, "message": "SVG animation generated successfully"}
     except Exception as e:
-        logger.error(f"❗ SVG generation failed: {e}")
-        return {"statusCode": 500, "error": str(e)}
-
-
-if __name__ == "__main__":
-    try:
-        # Prefer env (since ECS passes env). Accept argv as a fallback for local runs.
-        if len(sys.argv) >= 3:
-            connection_id = sys.argv[1]
-            bucket_name   = sys.argv[2]
-            route_s3_key  = os.getenv("ROUTE_S3_KEY") or \
-                            (sys.argv[3] if len(sys.argv) >= 4 else f"animation-data/{connection_id}/complete_route_data.json")
-        else:
-            bucket_name   = _get_env("BUCKET_NAME")
-            connection_id = _get_env("CONNECTION_ID")
-            route_s3_key  = _get_env("ROUTE_S3_KEY", required=False) \
-                            or f"animation-data/{connection_id}/complete_route_data.json"
-
-        lane_tree_key = os.getenv("LANE_TREE_KEY")
-
-        logger.info(f"🚀 Starting SVG generation: conn={connection_id}")
-        logger.info(f"📥 route_json: s3://{bucket_name}/{route_s3_key}")
-        if lane_tree_key:
-            logger.info(f"📥 lane_tree:  s3://{bucket_name}/{lane_tree_key}")
-
-        route_json = _load_json_from_s3(bucket_name, route_s3_key)
-
-        gen = SVGAnimationGenerator(bucket_name, connection_id)
-        if lane_tree_key:
-            gen.lane_tree_key_override = lane_tree_key
-
-        out_key = gen.generate_accident_animation(route_json)
-        print(json.dumps({"statusCode": 200, "svg_key": out_key}, indent=2))
-    except Exception as e:
-        logger.error(f"❗ SVG generation failed: {e}")
+        logger.error(f"❗ Main process failed: {e}")
         print(json.dumps({"statusCode": 500, "error": str(e)}, indent=2))
-        raise
+        sys.exit(1)

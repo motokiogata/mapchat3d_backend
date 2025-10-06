@@ -153,7 +153,6 @@ Resources:
     Type: AWS::ECS::TaskDefinition
     Description: Fargate Task Definition for SVG Animation Generator
     Properties:
-      Family: svg-animation-generator  
       RequiresCompatibilities:
         - FARGATE
       Cpu: "1024"  # Less CPU than field generator
@@ -172,8 +171,6 @@ Resources:
               Value: !Ref FieldGenOutputBucket
             - Name: CONNECTION_ID
               Value: "will-be-overridden-at-runtime"
-            - Name: DEPLOY_TIME                  # ★ forces CFN to see a change every deploy
-              Value: !Ref DeployTime  
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -569,7 +566,7 @@ Resources:
         Variables:
           FIELD_OUTPUT_BUCKET: !Ref FieldGenOutputBucket
           CLUSTER_NAME: !Ref FargateCluster                    # Add this
-          SVG_TASK_DEF: "svg-animation-generator"
+          SVG_TASK_DEF: !Ref SvgAnimationTaskDefinition        # Add this
           SUBNET_ID: !Ref SubnetId                             # Add this
           SECURITY_GROUP: !Ref FargateSecurityGroup            # Add this
       Policies:
@@ -604,9 +601,8 @@ Resources:
             Action:
               - ecs:RunTask
               - ecs:DescribeTasks
-              - ecs:DescribeTaskDefinition        # (optional for debug)
             Resource: 
-              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/svg-animation-generator:*"
+              - !Ref SvgAnimationTaskDefinition
               - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${FargateCluster}/*"
           - Effect: Allow
             Action:

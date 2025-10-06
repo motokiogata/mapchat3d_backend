@@ -125,7 +125,7 @@ class ConversationPhase(Enum):
 class TaskState:
     phase: ConversationPhase
     sub_step: int = 0
-    collected_data: Dict[str, Any] = None
+    collected_data: Dict[str, Any] = None  # This will contain both "datetime" and "normalized_datetime"
     pending_questions: List[str] = None
     analytics_result: Dict[str, Any] = None
     location_attempts: int = 0
@@ -363,24 +363,28 @@ class TaskOrchestrator:
         if user_input and user_input.strip():
             # Determine which question this answers
             if not self.state.questions_asked["datetime"]:
-                # Validate datetime specificity
+                # Validate datetime specificity AND get normalized datetime
                 validation = validate_datetime_specificity(user_input)
                 
                 if validation["is_specific"]:
-                    # Datetime is specific enough
-                    self.state.collected_data["datetime"] = user_input
+                    # Store BOTH raw input and normalized datetime
+                    self.state.collected_data["datetime"] = user_input  # Raw input
+                    self.state.collected_data["normalized_datetime"] = validation["normalized_datetime"]  # NEW
                     self.state.questions_asked["datetime"] = True
                     self.state.datetime_validation_state = "completed"
-                    logger.info(f"✅ Accepted specific datetime: {user_input}")
+                    logger.info(f"✅ Accepted datetime: '{user_input}' -> normalized: '{validation['normalized_datetime']}'")
                 else:
                     # Not specific enough, ask for more details
                     self.state.datetime_attempts += 1
                     self.state.datetime_validation_state = "needs_clarification"
                     
                     if self.state.datetime_attempts >= 3:
-                        # After 3 attempts, accept what we have
+                        # After 3 attempts, accept and try to normalize what we have
                         logger.info(f"⚠️ Accepting datetime after 3 attempts: {user_input}")
                         self.state.collected_data["datetime"] = user_input
+                        # Try to get normalized version even if not perfect
+                        normalized = validation.get("normalized_datetime", "unknown")
+                        self.state.collected_data["normalized_datetime"] = normalized
                         self.state.questions_asked["datetime"] = True
                         self.state.datetime_validation_state = "completed"
                     else:
@@ -873,13 +877,14 @@ def understand_option_selection(user_input: str, options: list, context: str) ->
     
 def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
     """
-    Validate if the user provided specific enough datetime information.
+    Validate if the user provided specific enough datetime information AND return normalized datetime.
     Returns: {
         "is_specific": bool,
         "has_date": bool, 
         "has_time": bool,
         "missing_info": str,
-        "follow_up_question": str
+        "follow_up_question": str,
+        "normalized_datetime": str  # NEW: yyyy/mm/dd hh:mm format
     }
     """
     try:
@@ -890,16 +895,19 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
         prompt = (
             time_context +
             f"Analyze this user input about accident timing: \"{user_input}\"\n\n"
-            "Determine:\n"
-            "1. Does it include a specific DATE (not just 'yesterday', 'today')?\n"
-            "2. Does it include a specific TIME with at least HOUR (like '3 PM', '15:30', 'around 2 o'clock')?\n"
-            "3. What specific information is missing?\n\n"
+            "Your tasks:\n"
+            "1. Determine if it includes specific DATE and TIME information\n"
+            "2. Convert it to normalized format yyyy/mm/dd hh:mm (use JST timezone)\n"
+            "3. If relative dates like 'yesterday', 'today' are used, convert to actual dates\n"
+            "4. If approximate times like 'around 3 PM' are given, use the closest hour (15:00)\n"
+            "5. If time is missing but date is clear, estimate reasonable time or use 12:00\n\n"
             "Respond ONLY with a JSON object like:\n"
             "{\n"
             '  "has_specific_date": true/false,\n'
             '  "has_specific_time": true/false,\n'
             '  "missing_info": "date and time" or "specific time" or "specific date" or "none",\n'
-            '  "is_sufficient": true/false\n'
+            '  "is_sufficient": true/false,\n'
+            '  "normalized_datetime": "2024/01/15 15:00" or "unknown"\n'
             "}\n"
             "No other text or formatting."
         )
@@ -910,7 +918,7 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
             accept="application/json",
             body=json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 150,
+                "max_tokens": 200,
                 "temperature": 0.1,
                 "messages": [{"role": "user", "content": prompt}]
             })
@@ -938,7 +946,8 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
                 "has_date": validation_result.get("has_specific_date", False),
                 "has_time": validation_result.get("has_specific_time", False),
                 "missing_info": validation_result.get("missing_info", ""),
-                "follow_up_question": follow_up
+                "follow_up_question": follow_up,
+                "normalized_datetime": validation_result.get("normalized_datetime", "unknown")  # NEW
             }
             
         except json.JSONDecodeError:
@@ -948,7 +957,8 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
                 "has_date": False,
                 "has_time": False,
                 "missing_info": "date and time",
-                "follow_up_question": "Could you please provide the specific date and time of the accident?"
+                "follow_up_question": "Could you please provide the specific date and time of the accident?",
+                "normalized_datetime": "unknown"  # NEW
             }
             
     except Exception as e:
@@ -958,9 +968,9 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
             "has_date": False,
             "has_time": False,
             "missing_info": "date and time",
-            "follow_up_question": "Could you please provide the date and time of the accident?"
+            "follow_up_question": "Could you please provide the date and time of the accident?",
+            "normalized_datetime": "unknown"  # NEW
         }
-
 
 
 def handle_send_message(event):
@@ -1991,6 +2001,21 @@ def find_similar_cases(full_context):
 
 def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None):
     try:
+        # ✅ NEW: Get normalized datetime from orchestrator if available
+        final_datetime = datetime_str  # Default to the passed datetime_str
+        
+        if connection_id in orchestrators:
+            orchestrator = orchestrators[connection_id]
+            normalized_dt = orchestrator.state.collected_data.get("normalized_datetime")
+            
+            # Use normalized datetime if it exists and is valid
+            if normalized_dt and normalized_dt != "unknown":
+                final_datetime = normalized_dt
+                logger.info(f"✅ Using normalized datetime: '{datetime_str}' -> '{final_datetime}'")
+            else:
+                logger.info(f"⚠️ Using fallback datetime: '{final_datetime}'")
+        
+        # Rest of your existing code remains exactly the same
         item = table.get_item(Key={"connection_id": connection_id}).get("Item")
         
         similar_data = None
@@ -2010,7 +2035,7 @@ def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None)
             update_expr = "SET #ts = :ts, lat = :lat, lon = :lon"
             expr_attr_names = {"#ts": "timestamp"}
             expr_attr_values = {
-                ":ts": datetime_str,
+                ":ts": final_datetime,  # ✅ CHANGED: Use final_datetime instead of datetime_str
                 ":lat": Decimal(str(location["lat"])),
                 ":lon": Decimal(str(location["lon"]))
             }
@@ -2028,7 +2053,7 @@ def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None)
             # Create new record
             new_item = {
                 "connection_id": connection_id,
-                "timestamp": datetime_str,
+                "timestamp": final_datetime,  # ✅ CHANGED: Use final_datetime instead of datetime_str
                 "lat": Decimal(str(location["lat"])),
                 "lon": Decimal(str(location["lon"]))
             }
@@ -2039,6 +2064,7 @@ def store_to_dynamodb(connection_id, datetime_str, location, similar_cases=None)
             
     except Exception as e:
         logger.error(f"❗ Failed to store to DynamoDB: {e}")
+
 
 # --- REST API Handlers ---
 def handle_check_processing_done(event):

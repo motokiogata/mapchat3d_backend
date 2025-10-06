@@ -11,275 +11,11 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client('s3')
-bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
-dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
-ecs_client = boto3.client('ecs', region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))  # ADD THIS LINE
+bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 table = dynamodb.Table("AccidentDataTable")
 
 class InteractiveTrafficAnalyzer:
-
-    def _identify_missing_fields(self, route_json: dict) -> list:
-        """
-        Identify which fields are missing or unknown in the route JSON
-        """
-        missing = []
-        
-        def check_dict(d, path=""):
-            for key, value in d.items():
-                current_path = f"{path}.{key}" if path else key
-                
-                if value is None or value == "unknown" or value == -1:
-                    missing.append(current_path)
-                elif isinstance(value, dict):
-                    check_dict(value, current_path)
-                elif isinstance(value, list):
-                    for i, item in enumerate(value):
-                        if isinstance(item, dict):
-                            check_dict(item, f"{current_path}[{i}]")
-        
-        check_dict(route_json)
-        return missing
-
-
-    def enhance_missing_values_with_llm(self, route_json):
-        """
-        SIMPLIFIED: Only enhance critical missing values, not everything
-        """
-        
-        # Check ONLY critical fields
-        critical_fields = {
-            "user_origin_direction": route_json.get("vehicles", {}).get("user_vehicle", {}).get("path", {}).get("origin", {}).get("direction"),
-            "other_origin_direction": route_json.get("vehicles", {}).get("other_vehicle", {}).get("path", {}).get("origin", {}).get("direction"),
-            "collision_type": route_json.get("collision", {}).get("type")
-        }
-        
-        missing_critical = [k for k, v in critical_fields.items() if v == "unknown" or v is None]
-        
-        if not missing_critical:
-            logger.info("✅ All critical fields present")
-            return route_json
-        
-        logger.info(f"🔍 Enhancing {len(missing_critical)} critical fields: {missing_critical}")
-        
-        # Prepare MINIMAL context
-        context = self._prepare_comprehensive_context()
-        
-        prompt = f"""
-        Fill ONLY these specific missing values in this accident analysis:
-        
-        CONVERSATION CONTEXT:
-        {context}
-        
-        MISSING VALUES TO FILL:
-        {json.dumps(missing_critical, indent=2)}
-        
-        AVAILABLE DATA:
-        - User road: {route_json.get("vehicles", {}).get("user_vehicle", {}).get("path", {}).get("origin", {}).get("road_name")}
-        - Other vehicle road: {route_json.get("vehicles", {}).get("other_vehicle", {}).get("path", {}).get("origin", {}).get("road_name")}
-        
-        OUTPUT FORMAT (JSON only):
-        {{
-            "user_origin_direction": "southeast",
-            "other_origin_direction": "northwest",
-            "collision_type": "intersection_collision"
-        }}
-        
-        No other text. Just the JSON object with these 3 fields.
-        """
-        
-        try:
-            response = self.call_bedrock(prompt, max_tokens=200)  # Much smaller!
-            result = self._extract_json_from_response(response)
-            
-            if result:
-                # Apply the enhancements
-                if "user_origin_direction" in result:
-                    route_json["vehicles"]["user_vehicle"]["path"]["origin"]["direction"] = result["user_origin_direction"]
-                
-                if "other_origin_direction" in result:
-                    route_json["vehicles"]["other_vehicle"]["path"]["origin"]["direction"] = result["other_origin_direction"]
-                
-                if "collision_type" in result:
-                    route_json["collision"]["type"] = result["collision_type"]
-                
-                logger.info("✅ LLM enhanced critical fields")
-            
-            return route_json
-                
-        except Exception as e:
-            logger.error(f"❗ LLM enhancement failed: {e}")
-            return route_json  # Return original if fails
-
-
-    def _prepare_comprehensive_context(self):
-        """Prepare all available context for LLM"""
-        context_parts = []
-        
-        # User responses
-        context_parts.append("USER RESPONSES:")
-        for key, value in self.responses.items():
-            context_parts.append(f"  {key}: {value}")
-        
-        # Key relationships mentioned
-        context_parts.append(f"\nUSER PATH DATA:")
-        context_parts.append(f"  Origin direction input: {self.user_path.get('origin_direction')}")
-        context_parts.append(f"  Intended maneuver: {self.user_path.get('intended_maneuver')}")
-        context_parts.append(f"  Other vehicle position: {(self.user_path.get('other_vehicle', {}) or {}).get('position')}")
-        context_parts.append(f"  Other vehicle action: {(self.user_path.get('other_vehicle', {}) or {}).get('action')}")
-        context_parts.append(f"  Collision point: {self.user_path.get('collision_point')}")
-        
-        return "\n".join(context_parts)
-        
-
-    def calculate_coverage_bounds(self):
-        """Calculate the geographical bounds of all lanes"""
-        if not self.lane_tree_data:
-            return {"min_x": 0, "max_x": 100, "min_y": 0, "max_y": 100}
-        
-        all_x_coords = []
-        all_y_coords = []
-        
-        for lane in self.lane_tree_data.get('lane_trees', []):
-            points = lane.get('points', [])
-            for point in points:
-                try:
-                    if isinstance(point, (list, tuple)) and len(point) >= 2:
-                        all_x_coords.append(float(point[0]))
-                        all_y_coords.append(float(point[1]))
-                    elif isinstance(point, dict) and 'x' in point and 'y' in point:
-                        all_x_coords.append(float(point['x']))
-                        all_y_coords.append(float(point['y']))
-                except (ValueError, TypeError, IndexError):
-                    continue
-        
-        if not all_x_coords or not all_y_coords:
-            return {"min_x": 0, "max_x": 100, "min_y": 0, "max_y": 100}
-        
-        return {
-            "min_x": min(all_x_coords),
-            "max_x": max(all_x_coords),
-            "min_y": min(all_y_coords),
-            "max_y": max(all_y_coords)
-        }
-
-    def estimate_intersection_center(self):
-        """Estimate the center point of the intersection"""
-        bounds = self.calculate_coverage_bounds()
-        
-        center_x = (bounds["min_x"] + bounds["max_x"]) / 2
-        center_y = (bounds["min_y"] + bounds["max_y"]) / 2
-        
-        return {"x": center_x, "y": center_y}
-
-    def calculate_approximate_length(self, points):
-        """Calculate approximate length of a point sequence"""
-        if len(points) < 2:
-            return 0
-        
-        total_length = 0
-        for i in range(len(points) - 1):
-            try:
-                if isinstance(points[i], (list, tuple)) and isinstance(points[i+1], (list, tuple)):
-                    dx = float(points[i+1][0]) - float(points[i][0])
-                    dy = float(points[i+1][1]) - float(points[i][1])
-                    total_length += (dx*dx + dy*dy) ** 0.5
-            except (ValueError, TypeError, IndexError):
-                continue
-        
-        return total_length
-
-    def calculate_general_direction(self, points):
-        """Calculate general direction of a point sequence"""
-        if len(points) < 2:
-            return "unknown"
-        
-        try:
-            start_point = points[0]
-            end_point = points[-1]
-            
-            if isinstance(start_point, (list, tuple)) and isinstance(end_point, (list, tuple)):
-                dx = float(end_point[0]) - float(start_point[0])
-                dy = float(end_point[1]) - float(start_point[1])
-                
-                # Simple directional classification
-                if abs(dx) > abs(dy):
-                    return "east" if dx > 0 else "west"
-                else:
-                    return "north" if dy > 0 else "south"
-        except (ValueError, TypeError, IndexError):
-            pass
-        
-        return "unknown"
-
-
-    def create_metadata_only_lane_tree(self):
-        """Create metadata-only version without waypoints for LLM processing"""
-        
-        if not self.lane_tree_data:
-            return {}
-        
-        metadata_only = {
-            "lane_trees_metadata": [],
-            "summary": {
-                "total_lanes": len(self.lane_tree_data.get('lane_trees', [])),
-                "coverage_bounds": self.calculate_coverage_bounds(),
-                "intersection_center": self.estimate_intersection_center()
-            }
-        }
-        
-        for lane in self.lane_tree_data.get('lane_trees', []):
-            # Extract only metadata, exclude waypoints
-            lane_meta = {
-                "lane_id": lane.get("lane_id"),
-                "road_id": lane.get("road_id"),
-                "direction": lane.get("direction"),
-                "metadata": {
-                    "parent_road_name": lane.get("metadata", {}).get("parent_road_name"),
-                    "dir8": lane.get("metadata", {}).get("dir8"),
-                    "traffic_direction": lane.get("metadata", {}).get("traffic_direction"),
-                    "allowed_turns": lane.get("metadata", {}).get("allowed_turns", []),
-                    "lane_type": lane.get("metadata", {}).get("lane_type"),
-                    "simple_direction": lane.get("metadata", {}).get("simple_direction"),
-                    "lateral_position_label": lane.get("metadata", {}).get("lateral_position_label"),
-                    # Include narrative data for LLM understanding
-                    "narrative_directional": lane.get("metadata", {}).get("narrative_directional", {}),
-                    "can_turn_left": lane.get("metadata", {}).get("can_turn_left", False),
-                    "can_turn_right": lane.get("metadata", {}).get("can_turn_right", False),
-                    "can_go_straight": lane.get("metadata", {}).get("can_go_straight", False)
-                },
-                # Include geometric summary without full waypoints
-                "geometry_summary": self.summarize_lane_geometry(lane),
-                "connection_points": self.extract_connection_points(lane)
-            }
-            
-            metadata_only["lane_trees_metadata"].append(lane_meta)
-        
-        return metadata_only
-
-    def summarize_lane_geometry(self, lane):
-        """Summarize lane geometry without full waypoints"""
-        points = lane.get('points', [])
-        if not points:
-            return {"status": "no_geometry"}
-        
-        return {
-            "start_point": points[0] if points else None,
-            "end_point": points[-1] if len(points) > 1 else points[0],
-            "total_waypoints": len(points),
-            "approximate_length": self.calculate_approximate_length(points),
-            "general_direction": self.calculate_general_direction(points)
-        }
-
-    def extract_connection_points(self, lane):
-        """Extract key connection points for routing"""
-        points = lane.get('points', [])
-        if len(points) <= 2:
-            return points
-        
-        # Return start, middle, and end points only
-        mid_idx = len(points) // 2
-        return [points[0], points[mid_idx], points[-1]]
-
 
     def _resolve_origin_lane_ids(self):
         """
@@ -580,9 +316,9 @@ class InteractiveTrafficAnalyzer:
         }
 
     def generate_other_vehicle_question(self):
-        """Generate other vehicle question with DISAMBIGUATION"""
+        """Generate other vehicle question using all JSON data"""
         prompt = f"""
-        Based on the intersection layout and user's path so far, ask about the other vehicle.
+        Based on the intersection layout and user's path so far, ask about the other vehicle:
         
         INTERSECTION DATA:
         {json.dumps(self.intersections_data, indent=2)[:2000]}
@@ -590,16 +326,10 @@ class InteractiveTrafficAnalyzer:
         USER'S PATH SO FAR:
         {json.dumps(self.responses, indent=2)}
         
-        Ask TWO things clearly:
-        1. Where was the other vehicle coming from? (which direction/road)
-        2. Was it on the SAME road as you, or a DIFFERENT road?
+        Ask where the other vehicle was when they first noticed it.
+        Reference the intersection layout from the JSON if helpful.
         
-        Example good question:
-        "Where was the other vehicle coming from? Was it:
-        A) On the same road as you, but in the opposite lane/direction?
-        B) Coming from a different road that meets at the intersection?"
-        
-        Keep it conversational but clear about the distinction.
+        Keep it simple: "Where was the other vehicle when you first noticed it?"
         """
         
         question = self.call_bedrock(prompt, max_tokens=300)
@@ -609,7 +339,6 @@ class InteractiveTrafficAnalyzer:
             "message": question,
             "conversation_state": "other_vehicle_position"
         }
-
 
     def generate_other_vehicle_action_question(self):
         """Generate other vehicle action question"""
@@ -867,131 +596,6 @@ class InteractiveTrafficAnalyzer:
         logger.info(f"✅ Stored road selection: {road_id} -> {self.user_path.get('origin_road_display')}")
 
 
-
-    def _parse_other_vehicle_position(self, user_input: str):
-        """
-        ENHANCED: Better scenario disambiguation
-        """
-        try:
-            # Gather context
-            user_road_id = self.user_path.get("origin_road_id")
-            user_road_display = self.user_path.get("origin_road_display", "unknown")
-            user_direction = self.user_path.get("origin_direction", "unknown")
-            
-            # Get available roads for context
-            available_roads = []
-            for road in self.roads_data.get("roads_metadata", []):
-                road_id = road.get("road_id")
-                conv_ids = road.get("conversational_identifiers", [])
-                narrative = road.get("narrative_directional", {})
-                
-                available_roads.append({
-                    "road_id": str(road_id),
-                    "names": conv_ids[:2] if conv_ids else [f"Road_{road_id}"],
-                    "comes_from": narrative.get("where_it_comes_from", ""),
-                    "direction": road.get("direction", "")
-                })
-            
-            prompt = f"""
-            You are analyzing a traffic accident at an INTERSECTION. Parse where the OTHER vehicle was coming from.
-            
-            USER'S DESCRIPTION: "{user_input}"
-            
-            CONTEXT:
-            - User's vehicle road_id: {user_road_id}
-            - User's vehicle road name: {user_road_display}
-            - User's vehicle direction: {user_direction}
-            
-            AVAILABLE ROADS AT THIS INTERSECTION:
-            {json.dumps(available_roads, indent=2)}
-            
-            CRITICAL DISAMBIGUATION:
-            
-            Scenario A: DIFFERENT ROADS (Intersection Collision) ✅ MOST COMMON
-            - Other vehicle is on a DIFFERENT road
-            - They meet at the INTERSECTION
-            - User says: "opposite direction", "facing me", "coming toward me", "from the other side"
-            - This is an INTERSECTION collision, NOT a head-on collision
-            - Example: User on Road 1 (SW), Other on Road 1 (NE) but they're DIFFERENT roads that happen to connect!
-            
-            Scenario B: SAME ROAD (Head-on Collision) ❌ RARE
-            - Other vehicle is on the EXACT SAME road segment
-            - They collide BEFORE reaching intersection
-            - User says: "on my road", "in my lane", "head-on", "coming at me on the same street"
-            - This is a HEAD-ON collision on the same road
-            
-            CRITICAL RULES:
-            1. If user says "opposite direction" at an INTERSECTION → Scenario A (different roads)
-            2. If user says "opposite direction on the SAME road" → Scenario B (same road)
-            3. If user says "facing me" or "toward me" at intersection → Scenario A
-            4. If collision is AT THE INTERSECTION → Scenario A (99% of cases)
-            5. If collision is BEFORE the intersection → Scenario B
-            
-            ANALYSIS FOR THIS CASE:
-            - User is on road {user_road_id} coming from {user_direction}
-            - Other vehicle description: "{user_input}"
-            - Is this an intersection collision (A) or head-on on same road (B)?
-            
-            OUTPUT FORMAT (JSON only):
-            {{
-                "scenario": "A",
-                "road_id": "different_road_id",
-                "road_name": "Road name",
-                "direction": "northeast",
-                "confidence": 0.95,
-                "reasoning": "User said 'opposite direction' at an intersection, which means the other vehicle was on a different road approaching from the opposite side of the intersection (Scenario A), not a head-on collision on the same road."
-            }}
-            
-            Default to Scenario A unless explicitly clear it's same-road head-on.
-            """
-            
-            response = self.call_bedrock(prompt, max_tokens=400)
-            
-            # Parse LLM response
-            result = self._extract_json_from_response(response)
-            
-            if result and result.get("confidence", 0) > 0.5:
-                ov = self.user_path.setdefault("other_vehicle", {})
-                ov["origin_road_id"] = result.get("road_id")
-                ov["origin_road_display"] = result.get("road_name", f"Road_{result.get('road_id')}")
-                ov["origin_direction"] = result.get("direction")
-                ov["scenario"] = result.get("scenario", "A")  # Default to A
-                
-                logger.info(f"✅ LLM parsed other vehicle position:")
-                logger.info(f"   Scenario: {result.get('scenario')} ({'Different roads' if result.get('scenario') == 'A' else 'Same road'})")
-                logger.info(f"   Road: {result.get('road_name')} (ID: {result.get('road_id')})")
-                logger.info(f"   Direction: {result.get('direction')}")
-                logger.info(f"   Confidence: {result.get('confidence')}")
-                logger.info(f"   Reasoning: {result.get('reasoning')}")
-            else:
-                logger.warning(f"⚠️ LLM uncertain about other vehicle position (confidence: {result.get('confidence', 0)})")
-                logger.warning(f"   Reasoning: {result.get('reasoning', 'No reasoning provided')}")
-                
-        except Exception as e:
-            logger.error(f"❗ Failed to parse other vehicle position: {e}")
-
-    def _extract_json_from_response(self, response_text: str) -> dict:
-        """
-        Extract JSON from LLM response, handling various formats
-        """
-        try:
-            # Try direct JSON parse
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to find JSON in markdown code blocks
-            import re
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(1))
-            
-            # Try to find any JSON object
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(0))
-            
-            logger.error(f"Could not extract JSON from: {response_text}")
-            return None
-
     def update_user_path_from_response(self, user_input, current_state):
         """FIXED: Handle confirmations and clarifications properly"""
         
@@ -999,25 +603,18 @@ class InteractiveTrafficAnalyzer:
             # Store the raw user input
             self.user_path["origin_direction"] = user_input
             
-            # ✅ NEW: Parse direction IMMEDIATELY using LLM
-            parsed_direction = self._parse_direction_from_natural_language(user_input)
-            if parsed_direction:
-                self.user_path["origin_direction"] = parsed_direction
-                logger.info(f"✅ Parsed direction: '{user_input}' → '{parsed_direction}'")
-            
             # Try to understand the road
             road_id = self._understand_road_from_natural_response(user_input)
             
             if road_id:
                 self._store_road_selection(road_id)
                 logger.info(f"✅ Road selection complete: {road_id}")
-                return
+                return  # Success, continue to next question
             else:
                 # Generate clarification
                 self._next_forced = self._generate_clarification_question(user_input)
                 return
-
-
+        
         elif current_state == "approach_direction_clarification":
             # ✅ NEW: Handle confirmation responses
             if self._is_confirmation(user_input):
@@ -1092,10 +689,7 @@ class InteractiveTrafficAnalyzer:
         elif current_state == "other_vehicle_position":
             ov = self.user_path.setdefault("other_vehicle", {})
             ov["position"] = user_input
-            
-            # ✅ NEW: Parse the natural language response
-            self._parse_other_vehicle_position(user_input)
-            
+
         elif current_state == "other_vehicle_action":
             ov = self.user_path.setdefault("other_vehicle", {})
             ov["action"] = user_input
@@ -1108,43 +702,6 @@ class InteractiveTrafficAnalyzer:
 
         else:
             logger.warning(f"Unrecognized conversation_state '{current_state}', continuing.")
-
-
-    def _parse_direction_from_natural_language(self, user_input: str) -> str:
-        """
-        Parse natural language direction descriptions
-        """
-        try:
-            prompt = f"""
-            Parse this direction description: "{user_input}"
-            
-            Convert to ONE of these standard directions:
-            north, south, east, west, northeast, northwest, southeast, southwest
-            
-            Examples:
-            - "from bottom right" → "southeast"
-            - "from upper left" → "northwest"
-            - "from the left side" → "west"
-            - "coming from north" → "north"
-            
-            Respond with ONLY the direction word. No other text.
-            """
-            
-            response = self.call_bedrock(prompt, max_tokens=10)
-            direction = response.strip().lower()
-            
-            valid_directions = ["north", "south", "east", "west", "northeast", "northwest", "southeast", "southwest"]
-            
-            if direction in valid_directions:
-                return direction
-            else:
-                logger.warning(f"⚠️ Invalid direction from LLM: '{direction}'")
-                return "unknown"
-                
-        except Exception as e:
-            logger.error(f"❗ Direction parsing failed: {e}")
-            return "unknown"
-
 
     def extract_road_name_from_direction(self, direction_response):
         """Extract specific road name from direction response using JSON data"""
@@ -1344,12 +901,6 @@ class InteractiveTrafficAnalyzer:
     def create_route_json(self):
         """Create comprehensive route JSON with FIXED STRUCTURE"""
         logger.info("🗺️ Creating standardized route JSON")
-
-        # ✅ NEW: Check if already created
-        if hasattr(self, '_route_json_created'):
-            logger.warning("⚠️ Route JSON already created, skipping duplicate")
-            return self._cached_route_json
-
         
         # ✅ FIXED STRUCTURE - NEVER CHANGES
         route_json = {
@@ -1519,13 +1070,9 @@ class InteractiveTrafficAnalyzer:
             }
         }
         
-        route_json = self.enhance_missing_values_with_llm(route_json)
-
-        # ✅ Cache the result
-        self._route_json_created = True
-        self._cached_route_json = route_json
-
         return route_json
+
+
 
 
 
@@ -1662,527 +1209,8 @@ class InteractiveTrafficAnalyzer:
         
         return convert_value(item)
 
-
-    def _infer_other_vehicle_road_from_context(self) -> str:
-        """
-        Use LLM to infer other vehicle's road from conversation context
-        """
-        try:
-            # Prepare context
-            user_road_id = self.user_path.get("origin_road_id")
-            user_direction = self.user_path.get("origin_direction")
-            other_position = (self.user_path.get("other_vehicle", {}) or {}).get("position", "")
-            other_action = (self.user_path.get("other_vehicle", {}) or {}).get("action", "")
-            
-            # Get available roads
-            available_roads = []
-            for road in self.roads_data.get("roads_metadata", []):
-                road_id = road.get("road_id")
-                conv_ids = road.get("conversational_identifiers", [])
-                available_roads.append({
-                    "road_id": str(road_id),
-                    "names": conv_ids[:2]
-                })
-            
-            prompt = f"""
-            Analyze this accident scenario and determine which road the OTHER vehicle was on:
-            
-            USER'S VEHICLE:
-            - Road ID: {user_road_id}
-            - Coming from: {user_direction}
-            
-            OTHER VEHICLE:
-            - Position described as: "{other_position}"
-            - Action: "{other_action}"
-            
-            AVAILABLE ROADS:
-            {json.dumps(available_roads, indent=2)}
-            
-            Key clues:
-            - "opposite direction of the same road" → SAME road_id as user
-            - "from the left/right" → perpendicular road
-            - "oncoming" → opposite direction, same road
-            
-            Respond with ONLY the road_id (as a number) that the other vehicle was on.
-            If "opposite direction same road", return the user's road_id: {user_road_id}
-            """
-            
-            response = self.call_bedrock(prompt, max_tokens=20)
-            inferred_road_id = response.strip()
-            
-            # Validate it's a real road_id
-            if inferred_road_id in [str(r["road_id"]) for r in available_roads]:
-                logger.info(f"✅ LLM inferred other vehicle road: {inferred_road_id}")
-                
-                # Store it for future use
-                self.user_path.setdefault("other_vehicle", {})
-                self.user_path["other_vehicle"]["origin_road_id"] = inferred_road_id
-                
-                return inferred_road_id
-            else:
-                logger.warning(f"⚠️ LLM returned invalid road_id: {inferred_road_id}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"❗ Failed to infer other vehicle road: {e}")
-            return None
-
-    def _find_perpendicular_road(self, user_road_id, other_direction: str) -> str:
-        """
-        Find a road that's perpendicular to user's road based on direction
-        """
-        user_direction = self.standardize_direction(self.user_path.get("origin_direction"))
-        
-        # Map directions to perpendicular directions
-        perpendicular_map = {
-            "north": ["east", "west"],
-            "south": ["east", "west"],
-            "east": ["north", "south"],
-            "west": ["north", "south"],
-            "northeast": ["northwest", "southeast"],
-            "northwest": ["northeast", "southwest"],
-            "southeast": ["southwest", "northeast"],
-            "southwest": ["southeast", "northwest"]
-        }
-        
-        target_directions = perpendicular_map.get(user_direction, [])
-        
-        logger.info(f"   🔍 Looking for perpendicular road: user={user_direction}, target={target_directions}")
-        
-        # Search for a road with matching direction
-        for road_id, lanes in self.lanes_by_road.items():
-            if str(road_id) == str(user_road_id):
-                continue  # Skip user's road
-            
-            for lane in lanes:
-                lane_dir = (lane.get("direction") or lane.get("metadata", {}).get("dir8") or "").lower()
-                
-                # Check if this lane's direction matches what we're looking for
-                for target_dir in target_directions:
-                    if target_dir in lane_dir or lane_dir in self._dir8_from_user_origin(other_direction):
-                        logger.info(f"   ✅ Found perpendicular road: {road_id} (direction: {lane_dir})")
-                        return road_id
-        
-        # Fallback: return any road that's not the user's
-        for road_id in self.lanes_by_road.keys():
-            if str(road_id) != str(user_road_id):
-                logger.warning(f"   ⚠️ Using fallback road: {road_id}")
-                return road_id
-        
-        logger.error(f"   ❌ Could not find perpendicular road!")
-        return user_road_id  # Last resort
-
-    def _get_lanes_for_road(self, road_id) -> list:
-        """
-        Type-safe lane lookup - tries all possible formats
-        """
-        if road_id is None:
-            logger.warning("   ⚠️ road_id is None")
-            return []
-        
-        # Try direct lookup
-        lanes = self.lanes_by_road.get(road_id)
-        if lanes:
-            logger.info(f"   ✅ Found {len(lanes)} lanes (direct: {road_id})")
-            return lanes
-        
-        # Try string conversion
-        lanes = self.lanes_by_road.get(str(road_id))
-        if lanes:
-            logger.info(f"   ✅ Found {len(lanes)} lanes (string: '{road_id}')")
-            return lanes
-        
-        # Try int conversion
-        try:
-            lanes = self.lanes_by_road.get(int(road_id))
-            if lanes:
-                logger.info(f"   ✅ Found {len(lanes)} lanes (int: {road_id})")
-                return lanes
-        except (ValueError, TypeError):
-            pass
-        
-        # Try with underscores (e.g., "0_1")
-        if isinstance(road_id, str) and '_' in road_id:
-            lanes = self.lanes_by_road.get(road_id)
-            if lanes:
-                logger.info(f"   ✅ Found {len(lanes)} lanes (underscore: {road_id})")
-                return lanes
-        
-        logger.warning(f"   ⚠️ No lanes found for road_id={road_id} (tried all formats)")
-        logger.info(f"   Available road_ids: {list(self.lanes_by_road.keys())}")
-        
-        return []
-
-    def _resolve_approach_lane_for_other(self) -> str:
-        """
-        COMPLETE FIX: Handles both scenarios with type-safe lookup and fallbacks
-        """
-        other_vehicle = self.user_path.get("other_vehicle", {}) or {}
-        road_id = other_vehicle.get("origin_road_id")
-        scenario = other_vehicle.get("scenario", "A")  # Default to different roads
-        
-        logger.info(f"🔍 Resolving other vehicle lane:")
-        logger.info(f"   Scenario: {scenario} ({'Different roads' if scenario == 'A' else 'Same road'})")
-        logger.info(f"   Road ID: {road_id} (type: {type(road_id).__name__})")
-        
-        user_road_id = self.user_path.get("origin_road_id")
-        
-        # ✅ Validate scenario against road_id
-        if str(road_id) == str(user_road_id):
-            if scenario == "A":
-                logger.warning(f"   ⚠️ Scenario A but same road_id - correcting to Scenario B")
-                scenario = "B"
-                other_vehicle["scenario"] = "B"
-        else:
-            if scenario == "B":
-                logger.warning(f"   ⚠️ Scenario B but different road_id - correcting to Scenario A")
-                scenario = "A"
-                other_vehicle["scenario"] = "A"
-        
-        # ========== SCENARIO B: Same Road, Opposite Lanes ==========
-        if scenario == "B":
-            logger.info("   🔄 Same road scenario - finding opposite lane")
-            
-            user_lane_id = self.user_path.get("origin_lane_id")
-            
-            # ✅ Type-safe lane lookup
-            available_lanes = self._get_lanes_for_road(road_id)
-            
-            logger.info(f"   User lane: {user_lane_id}")
-            logger.info(f"   Available lanes: {[l.get('lane_id') for l in available_lanes]}")
-            
-            if not available_lanes:
-                logger.error(f"   ❌ No lanes found for road {road_id} - using fallback")
-                return self._infer_conflicting_lane()
-            
-            # Find the lane that's NOT the user's lane
-            for lane in available_lanes:
-                lane_id = lane.get("lane_id")
-                if lane_id and lane_id != user_lane_id:
-                    logger.info(f"   ✅ Found opposite lane: {lane_id}")
-                    return lane_id
-            
-            logger.warning(f"   ⚠️ Could not find opposite lane - using fallback")
-            return self._infer_conflicting_lane()
-        
-        # ========== SCENARIO A: Different Roads ==========
-        else:
-            logger.info("   🔀 Different roads scenario")
-            
-            raw_direction = other_vehicle.get("origin_direction")
-            origin_dir = self.standardize_direction(raw_direction)
-            
-            logger.info(f"   Raw direction: '{raw_direction}'")
-            logger.info(f"   Standardized: '{origin_dir}'")
-            
-            # ✅ If road_id somehow matches user's, find different road
-            if str(road_id) == str(user_road_id):
-                logger.warning(f"   ⚠️ Road ID matches user - finding perpendicular road")
-                road_id = self._find_perpendicular_road(user_road_id, origin_dir)
-                logger.info(f"   ✅ Using road: {road_id}")
-                other_vehicle["origin_road_id"] = road_id
-            
-            # ✅ Type-safe lane lookup
-            available_lanes = self._get_lanes_for_road(road_id)
-            
-            if not available_lanes:
-                logger.warning(f"   ⚠️ No lanes for road {road_id} - using fallback")
-                return self._infer_conflicting_lane()
-            
-            # Filter by direction
-            dirset = self._dir8_from_user_origin(origin_dir)
-            logger.info(f"   Looking for directions: {dirset}")
-            
-            def lane_direction(lane):
-                return (lane.get("direction") or lane.get("metadata", {}).get("dir8") or "").lower()
-            
-            candidates = [l for l in available_lanes if lane_direction(l) in dirset]
-            
-            logger.info(f"   Found {len(candidates)} candidates")
-            
-            if not candidates:
-                logger.warning(f"   ⚠️ No direction match - using all lanes")
-                candidates = available_lanes
-            
-            # Apply Japan LHT rules
-            intended = self.standardize_maneuver(other_vehicle.get("action"))
-            chosen_lane = self._apply_japan_lht_rules(candidates, intended)
-            
-            if chosen_lane:
-                lane_id = chosen_lane.get("lane_id", "unknown")
-                logger.info(f"   ✅ Resolved: {lane_id}")
-                return lane_id
-            else:
-                logger.warning(f"   ⚠️ No lane chosen - using fallback")
-                return self._infer_conflicting_lane()
-
-    def _llm_infer_other_vehicle_road(self) -> str:
-        """
-        Use LLM to infer other vehicle's road from full conversation context
-        """
-        try:
-            # Gather all context
-            user_road_id = self.user_path.get("origin_road_id")
-            user_direction = self.user_path.get("origin_direction")
-            other_position = (self.user_path.get("other_vehicle", {}) or {}).get("position", "")
-            other_action = (self.user_path.get("other_vehicle", {}) or {}).get("action", "")
-            
-            # Get available roads
-            available_roads = []
-            for road in self.roads_data.get("roads_metadata", []):
-                road_id = road.get("road_id")
-                conv_ids = road.get("conversational_identifiers", [])
-                narrative = road.get("narrative_directional", {})
-                
-                available_roads.append({
-                    "road_id": str(road_id),
-                    "names": conv_ids[:2],
-                    "comes_from": narrative.get("where_it_comes_from", ""),
-                    "goes_to": narrative.get("where_it_goes_to", "")
-                })
-            
-            prompt = f"""
-            Determine which road the OTHER vehicle was traveling on in this accident:
-            
-            USER'S VEHICLE:
-            - Road ID: {user_road_id}
-            - Direction: {user_direction}
-            
-            OTHER VEHICLE:
-            - Position: "{other_position}"
-            - Action: "{other_action}"
-            
-            AVAILABLE ROADS:
-            {json.dumps(available_roads, indent=2)}
-            
-            ANALYSIS RULES:
-            1. If other vehicle was "opposite direction same road" → return user's road_id
-            2. If other vehicle was "from the left/right" → find perpendicular road
-            3. If other vehicle was "crossing" → find intersecting road
-            4. Consider the geometry and typical traffic patterns
-            
-            OUTPUT (JSON only):
-            {{
-                "road_id": "4",
-                "confidence": 0.9,
-                "reasoning": "Brief explanation"
-            }}
-            """
-            
-            response = self.call_bedrock(prompt, max_tokens=200)
-            result = self._extract_json_from_response(response)
-            
-            if result and result.get("confidence", 0) > 0.5:
-                road_id = result.get("road_id")
-                logger.info(f"✅ LLM inferred other vehicle road: {road_id}")
-                logger.info(f"   Reasoning: {result.get('reasoning')}")
-                return road_id
-            else:
-                logger.warning(f"⚠️ LLM uncertain about road (confidence: {result.get('confidence', 0)})")
-                return None
-                
-        except Exception as e:
-            logger.error(f"❗ LLM road inference failed: {e}")
-            return None
-
-    def _apply_japan_lht_rules(self, candidate_lanes: list, intended_maneuver: str) -> dict:
-        """
-        Apply Japan's Left-Hand Traffic rules to select appropriate lane
-        
-        Japan LHT Rules:
-        - Drive on LEFT side of road
-        - Right turns are PROTECTED (don't cross traffic)
-        - Left turns are UNPROTECTED (cross oncoming traffic)
-        - For straight: use left lane (default travel lane)
-        - For left turn: use leftmost lane available
-        - For right turn: use right lane
-        """
-        
-        if not candidate_lanes:
-            return None
-        
-        # Check if lanes have lateral position metadata
-        def get_lateral_position(lane):
-            meta = lane.get("metadata", {}) or {}
-            return meta.get("lateral_position_label") or meta.get("lane_position") or "unknown"
-        
-        def get_allowed_turns(lane):
-            meta = lane.get("metadata", {}) or {}
-            return meta.get("allowed_turns") or []
-        
-        # Rule 1: Filter by allowed turns for the maneuver
-        if intended_maneuver == "straight":
-            # Prefer "through" lanes
-            through_lanes = [l for l in candidate_lanes if "through" in get_allowed_turns(l)]
-            if through_lanes:
-                candidate_lanes = through_lanes
-        
-        elif intended_maneuver == "left_turn":
-            # Prefer "left" lanes (leftmost, since Japan LHT)
-            left_lanes = [l for l in candidate_lanes if "left" in get_allowed_turns(l)]
-            if left_lanes:
-                candidate_lanes = left_lanes
-        
-        elif intended_maneuver == "right_turn":
-            # Prefer "right" lanes (rightmost)
-            right_lanes = [l for l in candidate_lanes if "right" in get_allowed_turns(l)]
-            if right_lanes:
-                candidate_lanes = right_lanes
-        
-        # Rule 2: If still multiple candidates, prefer by lateral position
-        # In Japan LHT: "left" lane is default, "right" lane is passing/turning
-        
-        if len(candidate_lanes) > 1:
-            # For straight: prefer left lane
-            if intended_maneuver == "straight":
-                left_positioned = [l for l in candidate_lanes if "left" in get_lateral_position(l).lower()]
-                if left_positioned:
-                    return left_positioned[0]
-            
-            # For left turn: prefer leftmost
-            elif intended_maneuver == "left_turn":
-                left_positioned = [l for l in candidate_lanes if "left" in get_lateral_position(l).lower()]
-                if left_positioned:
-                    return left_positioned[0]
-            
-            # For right turn: prefer rightmost
-            elif intended_maneuver == "right_turn":
-                right_positioned = [l for l in candidate_lanes if "right" in get_lateral_position(l).lower()]
-                if right_positioned:
-                    return right_positioned[0]
-        
-        # Rule 3: Fallback - return first candidate
-        return candidate_lanes[0]
-
-
-    def _infer_conflicting_lane(self) -> str:
-        """
-        LLM-powered inference of conflicting lane when road data is incomplete
-        """
-        try:
-            user_road_id = self.user_path.get("origin_road_id")
-            user_direction = self.user_path.get("origin_direction")
-            other_position = (self.user_path.get("other_vehicle", {}) or {}).get("position", "")
-            other_action = (self.user_path.get("other_vehicle", {}) or {}).get("action", "")
-            
-            # Get all available lanes
-            all_lanes = []
-            for road_id, lanes in self.lanes_by_road.items():
-                for lane in lanes:
-                    lane_dir = (lane.get("direction") or lane.get("metadata", {}).get("dir8") or "").lower()
-                    all_lanes.append({
-                        "lane_id": lane.get("lane_id"),
-                        "road_id": road_id,
-                        "direction": lane_dir,
-                        "turns": lane.get("metadata", {}).get("allowed_turns", [])
-                    })
-            
-            prompt = f"""
-            Find the most likely lane for the OTHER vehicle that would create a collision:
-            
-            USER'S VEHICLE:
-            - Road: {user_road_id}
-            - Direction: {user_direction}
-            
-            OTHER VEHICLE:
-            - Position: "{other_position}"
-            - Action: "{other_action}"
-            
-            AVAILABLE LANES:
-            {json.dumps(all_lanes[:20], indent=2)}
-            
-            Find a lane that:
-            1. Would intersect with user's path
-            2. Matches the other vehicle's described position/action
-            3. Creates a realistic collision scenario
-            
-            OUTPUT (JSON only):
-            {{
-                "lane_id": "road_X_Y_lane",
-                "confidence": 0.8,
-                "reasoning": "This lane would create collision because..."
-            }}
-            """
-            
-            response = self.call_bedrock(prompt, max_tokens=200)
-            result = self._extract_json_from_response(response)
-            
-            if result and result.get("confidence", 0) > 0.6:
-                lane_id = result.get("lane_id")
-                logger.info(f"✅ LLM inferred conflicting lane: {lane_id}")
-                logger.info(f"   Reasoning: {result.get('reasoning')}")
-                return lane_id
-            else:
-                logger.warning("⚠️ Could not infer conflicting lane with confidence")
-                return "unknown"
-                
-        except Exception as e:
-            logger.error(f"❗ Conflicting lane inference failed: {e}")
-            return "unknown"
-
-
-    def _resolve_approach_lane_for_user(self) -> str:
-        """Resolve user's approach lane with ENHANCED DEBUGGING"""
-        road_id = self.user_path.get("origin_road_id")
-        origin_dir = self.standardize_direction(self.user_path.get("origin_direction"))
-        intended = self.standardize_maneuver(self.user_path.get("intended_maneuver"))
-        
-        logger.info(f"🔍 DEBUG: _resolve_approach_lane_for_user")
-        logger.info(f"🔍 DEBUG: road_id={road_id}, origin_dir='{origin_dir}', intended='{intended}'")
-        
-        if not road_id:
-            logger.warning("⚠️ No road_id for user, cannot resolve lane")
-            return "unknown"
-        
-        # 🔍 DEBUG: Check what lanes we have for this road
-        available_lanes = self.lanes_by_road.get(road_id, [])
-        logger.info(f"🔍 DEBUG: Road {road_id} has {len(available_lanes)} lanes")
-        
-        if not available_lanes:
-            logger.warning(f"⚠️ No lanes found for road {road_id}")
-            # 🔍 DEBUG: Show what roads DO have lanes
-            logger.info(f"🔍 DEBUG: Roads with lanes: {list(self.lanes_by_road.keys())}")
-            
-            # 🔧 FIX: Try to find lanes with matching road_id using string comparison
-            for road_str, lanes_list in self.lanes_by_road.items():
-                if str(road_str) == str(road_id):
-                    logger.info(f"✅ DEBUG: Found road {road_id} using string match!")
-                    available_lanes = lanes_list
-                    break
-            
-            if not available_lanes:
-                return "unknown"
-        
-        # Filter by traffic direction (toward intersection)
-        dirset = self._dir8_from_user_origin(origin_dir)
-        logger.info(f"🔍 DEBUG: Looking for lane directions in: {dirset}")
-        
-        def lane_direction(lane):
-            return (lane.get("direction") or lane.get("metadata", {}).get("dir8") or "").lower()
-        
-        candidates = [l for l in available_lanes if lane_direction(l) in dirset]
-        logger.info(f"🔍 DEBUG: Found {len(candidates)} candidate lanes matching direction")
-        
-        if not candidates:
-            logger.warning(f"⚠️ No lanes match direction {dirset} for road {road_id}")
-            # 🔍 DEBUG: Show what directions ARE available
-            available_directions = [lane_direction(l) for l in available_lanes]
-            logger.info(f"🔍 DEBUG: Available lane directions: {available_directions}")
-            candidates = available_lanes  # Fallback to all lanes
-        
-        # Apply Japan LHT rules (vehicles drive on left)
-        chosen_lane = self._apply_japan_lht_rules(candidates, intended)
-        
-        lane_id = chosen_lane.get("lane_id", "unknown") if chosen_lane else "unknown"
-        
-        logger.info(f"✅ User lane resolved: {lane_id} (road={road_id}, dir={origin_dir}, maneuver={intended})")
-        
-        return lane_id
-
     def save_animation_data(self, route_json):
-        """Save both full data and metadata-only version with FIXED STRUCTURE"""
-        
-        # Save full animation data (existing code)
+        """Save data needed for animation creation"""
         animation_data = {
             "user_path": self.user_path,
             "infrastructure": self.scene_understanding,
@@ -2192,6 +1220,7 @@ class InteractiveTrafficAnalyzer:
             "created_at": datetime.now().isoformat()
         }
         
+        # Save to S3 for future animation creation
         animation_key = f"animation-data/{self.connection_id}/complete_route_data.json"
         s3.put_object(
             Bucket=self.bucket_name,
@@ -2200,70 +1229,8 @@ class InteractiveTrafficAnalyzer:
             ContentType='application/json'
         )
         
-        # ✅ NEW: Create metadata-only version with STABLE TOP-LEVEL STRUCTURE
-        metadata_only_lane_tree = self.create_metadata_only_lane_tree()
-        
-        # 🔧 FIX: Pre-compute lane IDs using Japan LHT rules
-        user_lane_id = self._resolve_approach_lane_for_user()
-        other_lane_id = self._resolve_approach_lane_for_other()
-        
-        logger.info(f"✅ Resolved lanes: user={user_lane_id}, other={other_lane_id}")
-        
-        llm_data = {
-            # 🆕 ADD: Simple top-level keys for SVG generator
-            "user_path": {
-                "approach_lane": user_lane_id,  # ← This is what SVG generator needs
-                "lane_id": user_lane_id,
-                "origin_road_id": self.user_path.get("origin_road_id"),
-                "origin_direction": self.standardize_direction(self.user_path.get("origin_direction")),
-                "intended_maneuver": self.standardize_maneuver(self.user_path.get("intended_maneuver")),
-            },
-            
-            "other_vehicle_path": {
-                "approach_lane": other_lane_id,
-                "lane_id": other_lane_id,
-                "origin_road_id": (self.user_path.get("other_vehicle", {}) or {}).get("origin_road_id"),
-                "origin_direction": self.standardize_direction(
-                    (self.user_path.get("other_vehicle", {}) or {}).get("origin_direction") or
-                    (self.user_path.get("other_vehicle", {}) or {}).get("position")
-                ),
-                "intended_maneuver": self.standardize_maneuver(
-                    (self.user_path.get("other_vehicle", {}) or {}).get("action")
-                ),
-            },
-            
-            # Keep existing structure for compatibility
-            "route_analysis": route_json,
-            "lane_tree_metadata": metadata_only_lane_tree,
-            
-            # ✅ FIXED: Complete infrastructure_summary
-            "infrastructure_summary": {
-                "roads": self.roads_data,
-                "intersections": self.intersections_data,
-                "network": self.network_data
-            },
-            
-            # ✅ FIXED: Complete accident_scenario
-            "accident_scenario": {
-                "user_vehicle": route_json.get("vehicles", {}).get("user_vehicle", {}),
-                "other_vehicle": route_json.get("vehicles", {}).get("other_vehicle", {}),
-                "collision": route_json.get("collision", {})
-            }
-        }
-        
-        llm_key = f"animation-data/{self.connection_id}/llm_ready_data.json"
-        s3.put_object(
-            Bucket=self.bucket_name,
-            Key=llm_key,
-            Body=json.dumps(llm_data, indent=2),
-            ContentType='application/json'
-        )
-        
-        logger.info(f"💾 Saved LLM-ready data with stable structure: {llm_key}")
-        logger.info(f"📍 User lane: {user_lane_id}")
-        logger.info(f"📍 Other lane: {other_lane_id}")
-
-
+        logger.info(f"💾 Animation data saved: {animation_key}")
+    
     def call_bedrock(self, prompt, max_tokens=500):
         """Helper to call Bedrock"""
         try:
@@ -2628,48 +1595,19 @@ class InteractiveTrafficAnalyzer:
 
 
     def _build_lane_index(self):
-        """Build lane indexes with ENHANCED DEBUGGING"""
         by_lane_id, by_road, by_name_dir = {}, {}, {}
-        
-        logger.info("🔍 DEBUG: Building lane index...")
-        
-        lane_trees = (self.lane_tree_data or {}).get("lane_trees", [])
-        logger.info(f"🔍 DEBUG: Found {len(lane_trees)} lanes in lane_tree_data")
-        
-        for i, lane in enumerate(lane_trees):
+        for lane in (self.lane_tree_data or {}).get("lane_trees", []):
             lid = lane.get("lane_id")
             rid = lane.get("road_id")
             meta = lane.get("metadata", {}) or {}
             name = (meta.get("parent_road_name") or meta.get("road_name") or "").strip()
             direction = (lane.get("direction") or meta.get("dir8") or meta.get("traffic_direction") or "unknown").lower()
-            
-            # 🔍 DEBUG: Log first few lanes in detail
-            if i < 5:
-                logger.info(f"🔍 DEBUG: Lane {i}: lane_id='{lid}', road_id={rid}, direction='{direction}'")
-                logger.info(f"🔍 DEBUG: Lane {i} metadata keys: {list(meta.keys())}")
-            
             if lid:
                 by_lane_id[lid] = lane
             if rid is not None:
                 by_road.setdefault(rid, []).append(lane)
-                logger.info(f"🔍 DEBUG: Added lane {lid} to road {rid}")
             if name:
                 by_name_dir.setdefault((name.lower(), direction), []).append(lane)
-        
-        # 🔍 DEBUG: Show final road->lane mapping
-        logger.info(f"🔍 DEBUG: Final road->lane mapping:")
-        for road_id, lanes_list in by_road.items():
-            logger.info(f"🔍 DEBUG: Road {road_id}: {len(lanes_list)} lanes")
-            for lane in lanes_list[:2]:  # Show first 2 lanes per road
-                logger.info(f"🔍 DEBUG:   - {lane.get('lane_id')}")
-        
-        # 🔍 DEBUG: Check if road 4 has any lanes
-        if 4 in by_road:
-            logger.info(f"✅ DEBUG: Road 4 has {len(by_road[4])} lanes")
-        else:
-            logger.warning(f"❌ DEBUG: Road 4 NOT FOUND in lane index!")
-            logger.info(f"🔍 DEBUG: Available road IDs: {list(by_road.keys())}")
-        
         return by_lane_id, by_road, by_name_dir
 
 
@@ -2972,33 +1910,21 @@ class InteractiveTrafficAnalyzer:
         ]
 
 
+
     def trigger_svg_generation(self, route_json):
-        """Trigger enhanced SVG animation generation"""
+        """Trigger SVG animation generation using ECS Fargate task"""
         try:
-            cluster_name = os.environ.get('CLUSTER_NAME')
-            svg_task_def = os.environ.get('SVG_TASK_DEF')  # now expected to be "svg-animation-generator"
-            subnet_id = os.environ.get('SUBNET_ID')
-            security_group = os.environ.get('SECURITY_GROUP')
-
-            if not all([cluster_name, svg_task_def, subnet_id, security_group]):
-                logger.warning("⚠️ Missing ECS environment variables, skipping SVG generation")
-                return
-
-            # Family-based resolution logging
-            if ":" not in str(svg_task_def):
-                logger.info(f"🧭 Using family-only taskDefinition (LATEST will be resolved): {svg_task_def}")
-            else:
-                logger.warning(f"⚠️ SVG_TASK_DEF looks pinned to a revision/ARN: {svg_task_def}. "
-                            f"Use family name (e.g., 'svg-animation-generator') to always pick LATEST.")
-
+            # Use ECS client to run Fargate task instead of Lambda invoke
+            ecs_client = boto3.client('ecs')
+            
             response = ecs_client.run_task(
-                cluster=cluster_name,
-                taskDefinition=svg_task_def,  # now safe to pass family name
+                cluster=os.environ['CLUSTER_NAME'],
+                taskDefinition=os.environ['SVG_TASK_DEF'],
                 launchType='FARGATE',
                 networkConfiguration={
                     'awsvpcConfiguration': {
-                        'subnets': [subnet_id],
-                        'securityGroups': [security_group],
+                        'subnets': [os.environ['SUBNET_ID']],
+                        'securityGroups': [os.environ['SECURITY_GROUP']],
                         'assignPublicIp': 'ENABLED'
                     }
                 },
@@ -3006,23 +1932,33 @@ class InteractiveTrafficAnalyzer:
                     'containerOverrides': [
                         {
                             'name': 'svg-animation-generator',
+                            'command': [self.connection_id, self.bucket_name],
                             'environment': [
-                                {'name': 'CONNECTION_ID', 'value': self.connection_id},
-                                {'name': 'BUCKET_NAME', 'value': self.bucket_name},
-                                {'name': 'MODE', 'value': 'CLEAN_ANALYTICS'},
-                                {'name': 'LLM_DATA_KEY', 'value': f"animation-data/{self.connection_id}/llm_ready_data.json"}
+                                {
+                                    'name': 'CONNECTION_ID',
+                                    'value': self.connection_id
+                                },
+                                {
+                                    'name': 'BUCKET_NAME',
+                                    'value': self.bucket_name
+                                },
+                                {
+                                    "name": "ROUTE_S3_KEY",
+                                    "value": f"animation-data/{self.connection_id}/complete_route_data.json"
+                                }
                             ]
                         }
                     ]
                 }
             )
-
-            task = response['tasks'][0]
-            logger.info(f"🎬 run_task OK | taskArn={task['taskArn']} taskDefinitionArn={task.get('taskDefinitionArn')}")
-
-        except Exception as e:
-            logger.error(f"❗ Failed to trigger enhanced SVG generation: {e}")
             
+            task_arn = response['tasks'][0]['taskArn']
+            logger.info(f"🎬 SVG animation Fargate task started: {task_arn}")
+            
+        except Exception as e:
+            logger.error(f"❗ Failed to trigger SVG generation: {e}")
+
+
 
 def lambda_handler(event, context):
     """Main handler - supports both initial analysis and interactive conversation"""
