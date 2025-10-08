@@ -1191,13 +1191,26 @@ class InteractiveTrafficAnalyzer:
                 logger.warning(f"Failed to extract destination road: {e}")
                 self.user_path["destination_road"] = "unknown"
 
+
     def generate_completion_summary(self):
-        """Generate final summary and create route JSON"""
+        """Generate final summary and create route JSON - FIXED to use normalized datetime"""
         logger.info("🏁 Generating completion summary and route JSON")
         
-        # Generate analysis summary
+        # ✅ NEW: Get normalized datetime (priority)
+        accident_datetime = getattr(self, 'normalized_datetime', None)
+        
+        if not accident_datetime or accident_datetime == 'unknown':
+            # Fallback to responses
+            accident_datetime = self.responses.get('accident_time', 'unknown')
+        
+        logger.info(f"📅 Using datetime for summary: {accident_datetime}")
+        
+        # Generate analysis summary with EXPLICIT datetime instruction
         summary_prompt = f"""
         Generate a professional accident reconstruction summary based on these responses:
+        
+        CRITICAL: Use this EXACT date/time in your summary: {accident_datetime}
+        DO NOT use relative terms like "yesterday" or "today". Use the exact date/time provided above.
         
         LOCATION INFRASTRUCTURE:
         {self.scene_understanding}
@@ -1214,6 +1227,9 @@ class InteractiveTrafficAnalyzer:
         3. Timeline of events leading to collision
         4. Traffic control analysis
         
+        IMPORTANT: In the summary header, write:
+        **Date/Time:** {accident_datetime}
+        
         Write as a professional accident reconstruction report.
         """
         
@@ -1228,7 +1244,7 @@ class InteractiveTrafficAnalyzer:
         # Save animation data
         self.save_animation_data(route_json)
 
-        # 🎬 NEW: Trigger SVG animation generation
+        # 🎬 Trigger SVG animation generation
         self.trigger_svg_generation(route_json)
         
         return {
@@ -3046,13 +3062,18 @@ def lambda_handler(event, context):
 
 
 def handle_initial_analysis(connection_id, bucket_name, event):
-    """Handle initial infrastructure analysis - FIXED data handling"""
+    """Handle initial infrastructure analysis - FIXED to use normalized datetime"""
     try:
         logger.info(f"🚀 Starting initial analysis for {connection_id}")
         
         # Get collected data from the event
         collected_data = event.get('collected_data', {})
         logger.info(f"📥 Analytics received collected_data: {collected_data}")
+        
+        # ✅ NEW: Extract normalized datetime if available
+        normalized_datetime = collected_data.get('normalized_datetime', 'unknown')
+        if normalized_datetime and normalized_datetime != 'unknown':
+            logger.info(f"✅ Using normalized datetime: {normalized_datetime}")
         
         # Load infrastructure data
         infrastructure_data = load_infrastructure_data(connection_id, bucket_name)
@@ -3063,12 +3084,18 @@ def handle_initial_analysis(connection_id, bucket_name, event):
         
         # FIXED: Pass the collected data to the analyzer and pre-populate responses
         analyzer.existing_collected_data = collected_data
+        analyzer.normalized_datetime = normalized_datetime  # ✅ NEW: Store normalized datetime
         
         # Pre-populate any info we already have with better key checking
-        if collected_data.get('basic_q_0'):  # datetime question
+        if normalized_datetime and normalized_datetime != 'unknown':
+            # ✅ Use normalized datetime instead of raw input
+            analyzer.responses['accident_time'] = normalized_datetime
+            analyzer.user_path["accident_time"] = normalized_datetime
+            logger.info(f"✅ Pre-populated normalized datetime: {normalized_datetime}")
+        elif collected_data.get('basic_q_0'):  # Fallback to raw datetime
             analyzer.responses['accident_time'] = collected_data['basic_q_0']
             analyzer.user_path["accident_time"] = collected_data['basic_q_0']
-            logger.info(f"✅ Pre-populated datetime: {collected_data['basic_q_0']}")
+            logger.info(f"⚠️ Using raw datetime: {collected_data['basic_q_0']}")
         
         if collected_data.get('basic_q_1'):  # description question  
             analyzer.responses['description'] = collected_data['basic_q_1']
@@ -3100,17 +3127,23 @@ def handle_initial_analysis(connection_id, bucket_name, event):
         logger.error(f"❗ Initial analysis failed: {e}")
         return {"statusCode": 500, "error": str(e)}
 
-
 def handle_user_response(connection_id, bucket_name, event):
-    """Handle user response in interactive conversation"""
+    """Handle user response in interactive conversation - FIXED to preserve normalized_datetime"""
     try:
         user_input = event['user_input']
         current_state = event['conversation_state']
+        normalized_datetime = event.get('normalized_datetime')  # ✅ NEW
         
         logger.info(f"👤 Processing user response: '{user_input}' in state: {current_state}")
+        if normalized_datetime:
+            logger.info(f"📅 Normalized datetime: {normalized_datetime}")
         
         # Load analyzer state
         analyzer = load_analyzer_state(connection_id, bucket_name)
+        
+        # ✅ NEW: Update normalized_datetime if provided
+        if normalized_datetime and normalized_datetime != 'unknown':
+            analyzer.normalized_datetime = normalized_datetime
         
         # Process user response
         result = analyzer.process_user_response(user_input, current_state)
@@ -3159,14 +3192,16 @@ def load_infrastructure_data(connection_id, bucket_name):
     return infrastructure_data
 
 
+
 def save_analyzer_state(connection_id, bucket_name, analyzer):
-    """Save analyzer state for future interactions"""
+    """Save analyzer state for future interactions - FIXED to include normalized_datetime"""
     state_data = {
         "user_path": analyzer.user_path,
         "scene_understanding": analyzer.scene_understanding,
         "conversation_state": analyzer.investigation_steps[analyzer.current_step] if analyzer.current_step < len(analyzer.investigation_steps) else "complete",
         "current_step": analyzer.current_step,
         "responses": analyzer.responses,
+        "normalized_datetime": getattr(analyzer, 'normalized_datetime', None),  # ✅ NEW
         "timestamp": datetime.now().isoformat()
     }
     
@@ -3180,7 +3215,7 @@ def save_analyzer_state(connection_id, bucket_name, analyzer):
 
 
 def load_analyzer_state(connection_id, bucket_name):
-    """Load analyzer state from previous interactions"""
+    """Load analyzer state from previous interactions - FIXED to restore normalized_datetime"""
     state_key = f"analytics-state/{connection_id}/analyzer_state.json"
     
     try:
@@ -3196,6 +3231,7 @@ def load_analyzer_state(connection_id, bucket_name):
         analyzer.scene_understanding = state_data["scene_understanding"]
         analyzer.current_step = state_data["current_step"]
         analyzer.responses = state_data.get("responses", {})
+        analyzer.normalized_datetime = state_data.get("normalized_datetime")  # ✅ NEW
         
         return analyzer
         

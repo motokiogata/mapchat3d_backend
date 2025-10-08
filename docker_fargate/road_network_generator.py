@@ -3727,6 +3727,7 @@ class IntegratedRoadNetworkGenerator:
         
         return best_connection
 
+
     def enrich_lanes_with_traffic_geometry(self):
         """Add traffic-aware geometric metadata to lanes for LHT navigation"""
         print("🚗 ENRICHING LANES WITH TRAFFIC GEOMETRY FOR LHT...")
@@ -3789,16 +3790,17 @@ class IntegratedRoadNetworkGenerator:
             # Get the traffic direction (now clean geographic direction)
             traffic_direction = lane_tree.get('direction', 'unknown')
             
-            # Convert points to proper coordinate system (x=East, y=North)
-            map_points = []
+            # 🔥 CRITICAL FIX: Convert points to proper coordinate system for CALCULATIONS ONLY
+            # DO NOT MODIFY THE ORIGINAL POINTS - they are used for waypoints
+            map_points_for_calculation = []
             for point in points:
                 x, y = point[0], point[1]
-                map_y = CANVAS_SIZE[1] - y  # Flip y so North is up
-                map_points.append([x, map_y])
+                map_y = CANVAS_SIZE[1] - y  # Flip y so North is up - FOR CALCULATION ONLY
+                map_points_for_calculation.append([x, map_y])
             
-            # Compute forward vector (first to last point)
-            start_point = map_points[0]
-            end_point = map_points[-1]
+            # Compute forward vector using transformed coordinates (for calculations)
+            start_point = map_points_for_calculation[0]
+            end_point = map_points_for_calculation[-1]
             forward_vec = (end_point[0] - start_point[0], end_point[1] - start_point[1])
             forward_unit = normalize_vector(forward_vec)
             fx, fy = forward_unit
@@ -3834,7 +3836,9 @@ class IntegratedRoadNetworkGenerator:
                 "alignment_bin16": alignment_bin16,
                 "use_when_heading": use_when_heading,  # CRITICAL: Add this back
                 "allowed_turns": ["through", "left", "right"],
-                "map_coordinate_points": map_points
+                # 🔥 CRITICAL FIX: DO NOT STORE TRANSFORMED COORDINATES AS WAYPOINTS
+                # The original lane_tree['points'] will be used for waypoints
+                # "map_coordinate_points": map_points_for_calculation  # REMOVED - this was causing the issue
             }
             
             # 🔥 FIX: UPDATE metadata while preserving ALL existing names and narrative data
@@ -3863,9 +3867,12 @@ class IntegratedRoadNetworkGenerator:
         # Compute lateral rankings
         self.compute_lateral_rankings()
 
+
+
+
     def compute_lateral_rankings(self):
         """Compute lateral_rank within road groups for LHT lane selection"""
-        print("📊 COMPUTING LATERAL RANKINGS FOR LHT...")
+        print("📊 New Logic is reflected COMPUTING LATERAL RANKINGS FOR LHT...")
         
         # Group lanes by (road_id, dir8)
         lane_groups = {}

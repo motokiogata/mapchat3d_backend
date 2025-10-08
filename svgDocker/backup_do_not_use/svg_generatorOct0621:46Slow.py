@@ -76,9 +76,8 @@ class SVGAnimationGenerator:
             dwg = svgwrite.Drawing(size=(self.svg_width, self.svg_height))
             
             # Background
-            #dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='#1a1a1a'))
-            dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='none'))
-
+            dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='#1a1a1a'))
+            
             # Simple intersection
             dwg.add(dwg.line(start=(0, self.svg_height//2), end=(self.svg_width, self.svg_height//2), stroke='white', stroke_width=4))
             dwg.add(dwg.line(start=(self.svg_width//2, 0), end=(self.svg_width//2, self.svg_height), stroke='white', stroke_width=4))
@@ -782,9 +781,9 @@ class EnhancedSVGAnimationGenerator:
         return path_data
 
     def add_collision_effect(self, dwg, collision_data: dict):
-        """Add collision effect animation - FAST VERSION"""
+        """Add collision effect animation"""
         collision_point = collision_data.get('collision_point', [self.svg_width//2, self.svg_height//2])
-        collision_timing = collision_data.get('collision_timing', 4.0)
+        collision_timing = collision_data.get('collision_timing', 5.0)
         
         # Explosion effect
         explosion = dwg.circle(
@@ -794,20 +793,20 @@ class EnhancedSVGAnimationGenerator:
             opacity=0
         )
         
-        # 🚀 FAST: Explosion starts at 3s, lasts 1.5s
+        # Animate explosion
         explosion.add(dwg.animate(
             attributeName='r',
             values='5;50;30',
-            dur='1.5s',
-            begin='3s',  # Start at 3 seconds
+            dur='2s',
+            begin=f'{collision_timing}s',
             repeatCount='1'
         ))
         
         explosion.add(dwg.animate(
             attributeName='opacity',
             values='0;1;0.5;0',
-            dur='1.5s',
-            begin='3s',  # Start at 3 seconds
+            dur='2s',
+            begin=f'{collision_timing}s',
             repeatCount='1'
         ))
         
@@ -896,8 +895,8 @@ class EnhancedSVGAnimationGenerator:
         ))
 
     def calculate_collision_timing(self, user_path: dict, other_path: dict) -> dict:
-        """Calculate when and where vehicles collide - FAST VERSION"""
-        logger.info("💥 Calculating collision timing and point - FAST VERSION")
+        """Calculate when and where vehicles collide"""
+        logger.info("💥 Calculating collision timing and point")
         
         user_waypoints = user_path.get('waypoints', [])
         other_waypoints = other_path.get('waypoints', [])
@@ -908,17 +907,20 @@ class EnhancedSVGAnimationGenerator:
         # Find intersection point of paths
         collision_point = self.find_path_intersection(user_waypoints, other_waypoints)
         
-        # 🚀 FAST FIX: Force fast timing instead of calculating from waypoints
-        collision_timing = 4.0  # Fixed 4 seconds - fast!
+        # Calculate timing - when each vehicle reaches collision point
+        user_collision_time = self.calculate_time_to_point(user_waypoints, collision_point)
+        other_collision_time = self.calculate_time_to_point(other_waypoints, collision_point)
+        
+        # Synchronize timing for collision
+        collision_timing = max(user_collision_time, other_collision_time)
         
         return {
             'collision_point': collision_point,
-            'collision_timing': collision_timing,  # Fixed fast timing
-            'user_collision_progress': 0.6,
-            'other_collision_progress': 0.6,
+            'collision_timing': collision_timing,
+            'user_collision_progress': user_collision_time / len(user_waypoints) if user_waypoints else 0.5,
+            'other_collision_progress': other_collision_time / len(other_waypoints) if other_waypoints else 0.5,
             'collision_type': 'intersection_collision'
         }
-
 
     def find_path_intersection(self, path1: list, path2: list) -> list:
         """Find where two paths intersect (approximate)"""
@@ -970,15 +972,14 @@ class EnhancedSVGAnimationGenerator:
         return closest_index
 
     def create_default_collision(self) -> dict:
-        """Create default collision data when calculation fails - FAST VERSION"""
+        """Create default collision data when calculation fails"""
         return {
             'collision_point': [self.svg_width // 2, self.svg_height // 2],
-            'collision_timing': 4.0,  # Fast 4 seconds
+            'collision_timing': 5.0,
             'user_collision_progress': 0.6,
             'other_collision_progress': 0.6,
             'collision_type': 'intersection_collision'
         }
-
 
 # 🚀 MAIN PROCESS
 if __name__ == "__main__":

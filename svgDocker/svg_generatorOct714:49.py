@@ -76,9 +76,8 @@ class SVGAnimationGenerator:
             dwg = svgwrite.Drawing(size=(self.svg_width, self.svg_height))
             
             # Background
-            #dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='#1a1a1a'))
-            dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='none'))
-
+            dwg.add(dwg.rect(insert=(0, 0), size=(self.svg_width, self.svg_height), fill='#1a1a1a'))
+            
             # Simple intersection
             dwg.add(dwg.line(start=(0, self.svg_height//2), end=(self.svg_width, self.svg_height//2), stroke='white', stroke_width=4))
             dwg.add(dwg.line(start=(self.svg_width//2, 0), end=(self.svg_width//2, self.svg_height), stroke='white', stroke_width=4))

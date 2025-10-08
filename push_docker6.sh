@@ -20,7 +20,11 @@ REPO_NAME_2="svg-animation-generator"
 # Build & Push Images
 ##############
 
+# Login to ECR
+aws ecr get-login-password --region ap-northeast-1 | docker login --username AWS --password-stdin 118028261233.dkr.ecr.ap-northeast-1.amazonaws.com
+
 # Field Generator
+
 docker build --pull --no-cache \
   -t $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME_1:$IMAGE_TAG \
   --build-arg CACHEBUST=$UNIQUE_BUILD_ID \

@@ -366,8 +366,76 @@ Resources:
             Path: /generate-field
             Method: POST
 
+
+  # Function to check if accident report is ready
+  CheckReportReadyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-check-report-ready"
+      Handler: lambda_handler.lambda_handler
+      CodeUri: check_report_processing /
+      Runtime: python3.11
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref AccidentDataTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt AccidentDataTable.Arn
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /checkReportReady
+            Method: POST
+
+
+
+  # Function to check if SVG animation is ready
+  CheckSvgProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-check-svg-processing"
+      Handler: lambda_handler.lambda_handler
+      CodeUri: check_svg_processing/
+      Runtime: python3.11
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref FieldGenOutputBucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource:
+                - !Sub "arn:aws:s3:::${FieldGenOutputBucket}"
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /checkSvgProcessing
+            Method: POST
+
+
   # Function to check if processing is done (note: proper indentation)
-    # Function to check if processing is done (note: proper indentation)
+  # Function to check if processing is done (note: proper indentation)
   CheckProcessingDoneFunction:
     Type: AWS::Serverless::Function
     Properties:

@@ -195,22 +195,49 @@ class TaskOrchestrator:
             
         elif self.state.phase == ConversationPhase.CASE_FINALIZATION:
             return self._handle_case_finalization()
+        
+        # ✅ NEW: Handle COMPLETED phase
+        elif self.state.phase == ConversationPhase.COMPLETED:
+            return self._handle_completed_phase(user_input)
             
         else:
             return {"action": "error", "message": "Unknown phase"}
 
-    def _handle_legal_modifier_investigation(self, user_input: str) -> Dict[str, Any]:
+    # ✅ NEW: Add this method to TaskOrchestrator class
+    def _handle_completed_phase(self, user_input: str) -> Dict[str, Any]:
+        """Handle messages after conversation is completed"""
         lang = (self.state.user_language or "en").upper()
         
-        # Store user's answer if provided
-        if user_input and user_input.strip() and self.state.current_modifier_index > 0:
-            question_key = f"modifier_{self.state.current_modifier_index - 1}"
-            self.state.modifier_answers[question_key] = user_input
+        return {
+            "action": "claude_response",
+            "instruction": (
+                f"Reply only in {lang}. "
+                "Politely inform the user that their claim has been completed and submitted. "
+                "If they have questions or need to make changes, they should contact support."
+            ),
+            "progress": "Completed ✅"
+        }
+
+
+    ############ NEW PHASE HANDLER ############
+    def _handle_legal_modifier_investigation(self, user_input: str) -> Dict[str, Any]:
+        """FIXED: Properly handle modifier question flow"""
+        lang = (self.state.user_language or "en").upper()
+        
+        # ✅ FIX: Store user's answer if this is a response (not first entry)
+        if user_input and user_input.strip():
+            # Only store if we've already asked at least one question
+            if self.state.current_modifier_index > 0:
+                question_key = f"modifier_{self.state.current_modifier_index - 1}"
+                self.state.modifier_answers[question_key] = user_input
+                logger.info(f"✅ Stored answer for {question_key}: {user_input}")
         
         # Check if we have more questions to ask
         if self.state.current_modifier_index < len(self.state.modifier_questions):
             current_question = self.state.modifier_questions[self.state.current_modifier_index]
             self.state.current_modifier_index += 1
+            
+            logger.info(f"❓ Asking modifier question {self.state.current_modifier_index}/{len(self.state.modifier_questions)}: {current_question}")
             
             return {
                 "action": "claude_response",
@@ -223,7 +250,10 @@ class TaskOrchestrator:
                 "progress": f"Legal assessment (Step 6/6) - Question {self.state.current_modifier_index}/{len(self.state.modifier_questions)}"
             }
         else:
-            # All modifier questions answered, move to finalization
+            # ✅ All modifier questions answered, move to finalization
+            logger.info(f"✅ All {len(self.state.modifier_questions)} modifier questions answered")
+            logger.info(f"📝 Collected answers: {self.state.modifier_answers}")
+            
             self.state.phase = ConversationPhase.CASE_FINALIZATION
             return {
                 "action": "claude_response",
@@ -234,7 +264,6 @@ class TaskOrchestrator:
                 ),
                 "progress": "Calculating fault ratio (Step 6/6)"
             }
-
 
     def _handle_greeting(self) -> Dict[str, Any]:
         # Move to language selection; LLM will produce a multilingual greeting on its own
@@ -357,29 +386,30 @@ class TaskOrchestrator:
 
 
     def _handle_parallel_info_gathering(self, user_input: str) -> Dict[str, Any]:
+        """FIXED: Preserve datetime validation with proper degradation"""
         lang = (self.state.user_language or "en").upper()
         
         # Store user input if provided
         if user_input and user_input.strip():
             # Determine which question this answers
             if not self.state.questions_asked["datetime"]:
-                # Validate datetime specificity AND get normalized datetime
+                # ✅ PRESERVED: Validate datetime specificity AND get normalized datetime
                 validation = validate_datetime_specificity(user_input)
                 
                 if validation["is_specific"]:
                     # Store BOTH raw input and normalized datetime
                     self.state.collected_data["datetime"] = user_input  # Raw input
-                    self.state.collected_data["normalized_datetime"] = validation["normalized_datetime"]  # NEW
+                    self.state.collected_data["normalized_datetime"] = validation["normalized_datetime"]
                     self.state.questions_asked["datetime"] = True
                     self.state.datetime_validation_state = "completed"
                     logger.info(f"✅ Accepted datetime: '{user_input}' -> normalized: '{validation['normalized_datetime']}'")
                 else:
-                    # Not specific enough, ask for more details
+                    # ✅ PRESERVED: Not specific enough, ask for more details
                     self.state.datetime_attempts += 1
                     self.state.datetime_validation_state = "needs_clarification"
                     
                     if self.state.datetime_attempts >= 3:
-                        # After 3 attempts, accept and try to normalize what we have
+                        # ✅ PRESERVED: After 3 attempts, accept and try to normalize what we have
                         logger.info(f"⚠️ Accepting datetime after 3 attempts: {user_input}")
                         self.state.collected_data["datetime"] = user_input
                         # Try to get normalized version even if not perfect
@@ -388,7 +418,7 @@ class TaskOrchestrator:
                         self.state.questions_asked["datetime"] = True
                         self.state.datetime_validation_state = "completed"
                     else:
-                        # Ask for more specific information
+                        # ✅ PRESERVED: Ask for more specific information
                         follow_up = validation["follow_up_question"]
                         self.state.awaiting_user_input_for = "datetime_clarification"
                         
@@ -445,6 +475,7 @@ class TaskOrchestrator:
                 "progress": "Finalizing location analysis (Step 3/6)"
             }
 
+
     def _handle_location_processing(self) -> Dict[str, Any]:
         """Phase 3: Processing location data (now rarely used due to parallel processing)"""
         return {
@@ -453,8 +484,9 @@ class TaskOrchestrator:
             "progress": "Processing location data (Step 3/6)"
         }
     
+
     def _handle_basic_info_gathering(self, user_input: str) -> Dict[str, Any]:
-        """Phase 4: Collect basic accident information with datetime validation"""
+        """Phase 4: Collect basic accident information with datetime validation - PRESERVED"""
         lang = (self.state.user_language or "en").upper()
         
         # Check if we already have info from parallel gathering
@@ -466,15 +498,16 @@ class TaskOrchestrator:
         # Store user input if provided
         if user_input and user_input.strip():
             if not self.state.questions_asked["datetime"]:
-                # Validate datetime specificity
+                # ✅ PRESERVED: Validate datetime specificity
                 validation = validate_datetime_specificity(user_input)
                 
                 if validation["is_specific"] or self.state.datetime_attempts >= 2:
                     self.state.collected_data["datetime"] = user_input
+                    self.state.collected_data["normalized_datetime"] = validation["normalized_datetime"]
                     self.state.questions_asked["datetime"] = True
-                    logger.info(f"✅ Accepted datetime: {user_input}")
+                    logger.info(f"✅ Accepted datetime: {user_input} -> {validation['normalized_datetime']}")
                 else:
-                    # Ask for more specific information
+                    # ✅ PRESERVED: Ask for more specific information
                     self.state.datetime_attempts += 1
                     follow_up = validation["follow_up_question"]
                     
@@ -485,7 +518,7 @@ class TaskOrchestrator:
                             f"The user provided '{user_input}' but we need more specific timing. "
                             f"Ask: '{follow_up}'"
                         ),
-                        "progress": f"Gathering basic information (Step 3/6) - Clarifying timing"
+                        "progress": f"Gathering basic information (Step 3/6) - Clarifying timing (Attempt {self.state.datetime_attempts}/3)"
                     }
                     
             elif not self.state.questions_asked["description"]:
@@ -972,9 +1005,8 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
             "normalized_datetime": "unknown"  # NEW
         }
 
-
 def handle_send_message(event):
-    """FIXED: Ensure user's actual input reaches analytics"""
+    """FIXED: Handle messages gracefully when conversation is complete"""
     try:
         connection_id = event["requestContext"]["connectionId"]
         body = json.loads(event.get("body", "{}"))
@@ -991,18 +1023,31 @@ def handle_send_message(event):
             chat_histories[connection_id] = []
         
         logger.info(f"🧠 Current Phase: {orchestrator.state.phase}")
-        logger.info(f"👤 User said (RAW): '{user_msg}'")  # ✅ Log raw input
+        logger.info(f"👤 User said (RAW): '{user_msg}'")
         
-        # ✅ FIXED: For road selection, pass user's raw input directly
-        processed_input = user_msg  # Keep it simple
-
-        # Don't try to "understand" direction responses as option selections
-        if orchestrator.state.phase == ConversationPhase.DETAILED_INVESTIGATION:
-            interactive_state = get_interactive_state(connection_id)
-            if interactive_state and interactive_state.get("conversation_state") == "approach_direction":
-                # This is a direction response, not option selection
-                # Pass it through unchanged
-                processed_input = user_msg
+        # ✅ NEW: Handle COMPLETED phase gracefully
+        if orchestrator.state.phase == ConversationPhase.COMPLETED:
+            logger.info("✅ Conversation already completed, ignoring message")
+            
+            # Check if this is a system message (from animation generator)
+            if "animation" in user_msg.lower() and "complete" in user_msg.lower():
+                logger.info("📊 Animation completion notification received")
+                return {"statusCode": 200}
+            
+            # If user is trying to continue conversation after completion
+            apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
+            apig.post_to_connection(
+                ConnectionId=connection_id,
+                Data=json.dumps({
+                    "response": "Your claim has been completed and submitted. If you need to make changes or have questions, please contact our support team.",
+                    "connectionId": connection_id,
+                    "status": "completed"
+                }).encode("utf-8")
+            )
+            return {"statusCode": 200}
+        
+        # ✅ Process normal messages
+        processed_input = user_msg
         
         if user_msg and user_msg.strip():
             understanding = understand_user_response_by_phase(user_msg, orchestrator.state, connection_id)
@@ -1012,19 +1057,17 @@ def handle_send_message(event):
             
             # ✅ ONLY use understanding result if it's clearly better
             if understanding.get("understood") and understanding.get("selected_text"):
-                # This is for road selection - use the selected text
                 processed_input = understanding["selected_text"] 
                 logger.info(f"✅ Using understood selection: '{processed_input}'")
             else:
-                # Keep user's raw input
                 processed_input = user_msg
                 logger.info(f"✅ Using raw input: '{processed_input}'")
         
-        # ✅ CRITICAL: Pass the correct input
+        # ✅ Get next action
         action = orchestrator.get_next_action(processed_input)
         
         if action.get("action") == "interactive_investigation":
-            action["processed_input"] = processed_input  # ✅ Ensure correct input
+            action["processed_input"] = processed_input
             
         save_orchestrator_state(connection_id, orchestrator)
         return execute_action(connection_id, action, event)
@@ -1242,8 +1285,9 @@ def handle_trigger_analytics(connection_id: str, action: Dict[str, Any], apig, e
         logger.error(f"❗ Analytics trigger error: {e}")
         return {"statusCode": 500}
 
+
 def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
-    """Start detailed analytics with interactive investigation - FIXED data mapping"""
+    """Start detailed analytics with interactive investigation - FIXED to pass normalized datetime"""
     try:
         # Get orchestrator data
         orchestrator = orchestrators[connection_id]
@@ -1258,9 +1302,13 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
         
         # Priority 1: Direct keys from parallel/basic gathering
         datetime_value = None
+        normalized_datetime = None  # ✅ NEW
         description_value = None
         
-        # Check all possible datetime keys
+        # ✅ NEW: Get normalized datetime first (highest priority)
+        normalized_datetime = orchestrator_data.get("normalized_datetime")
+        
+        # Check all possible datetime keys for raw value
         for key in ["datetime", "parallel_q_0", "basic_q_0"]:
             if key in orchestrator_data and orchestrator_data[key]:
                 datetime_value = orchestrator_data[key]
@@ -1274,9 +1322,14 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
                 logger.info(f"✅ Found description in key: {key} = {description_value}")
                 break
         
-        # Map to analytics expected format
+        # ✅ NEW: Map to analytics expected format with BOTH raw and normalized datetime
+        if normalized_datetime and normalized_datetime != "unknown":
+            collected_data["normalized_datetime"] = normalized_datetime
+            logger.info(f"✅ Passing normalized datetime to analytics: {normalized_datetime}")
+        
         if datetime_value:
             collected_data["basic_q_0"] = datetime_value
+            
         if description_value:
             collected_data["basic_q_1"] = description_value
             
@@ -1290,7 +1343,7 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
                 'connection_id': connection_id,
                 'bucket_name': BUCKET,
                 'message_type': 'initial_analysis',
-                'collected_data': collected_data
+                'collected_data': collected_data  # ✅ Now includes normalized_datetime
             })
         )
         
@@ -1331,16 +1384,15 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
         return {"statusCode": 500}
 
 
-
 def handle_interactive_investigation(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
-    """Handle interactive investigation responses"""
+    """Handle interactive investigation responses - FIXED to pass normalized datetime"""
     try:
         raw_user_input = action.get("user_input", "")
         processed_input = action.get("processed_input", raw_user_input)
         
         logger.info(f"🔍 Interactive investigation - Raw: '{raw_user_input}' -> Processed: '{processed_input}'")
         
-        # ✅ FIXED: Get the CURRENT conversation state from interactive state
+        # ✅ Get the CURRENT conversation state from interactive state
         interactive_state = get_interactive_state(connection_id)
         current_conversation_state = "approach_direction"  # default
         
@@ -1348,17 +1400,31 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
             current_conversation_state = interactive_state.get("conversation_state", "approach_direction")
             logger.info(f"✅ Using stored conversation state: {current_conversation_state}")
         
+        # ✅ NEW: Get normalized datetime from orchestrator
+        orchestrator = orchestrators.get(connection_id)
+        normalized_datetime = None
+        if orchestrator and orchestrator.state.collected_data:
+            normalized_datetime = orchestrator.state.collected_data.get("normalized_datetime")
+        
+        # ✅ NEW: Build payload with normalized datetime
+        payload = {
+            'connection_id': connection_id,
+            'bucket_name': BUCKET,
+            'message_type': 'user_response',
+            'user_input': processed_input,
+            'conversation_state': current_conversation_state
+        }
+        
+        # ✅ NEW: Add normalized datetime if available
+        if normalized_datetime and normalized_datetime != "unknown":
+            payload['normalized_datetime'] = normalized_datetime
+            logger.info(f"✅ Passing normalized datetime to analytics: {normalized_datetime}")
+        
         # Call analytics for follow-up
         response = lambda_client.invoke(
             FunctionName=ANALYTICS_FUNCTION_NAME,
             InvocationType='RequestResponse',
-            Payload=json.dumps({
-                'connection_id': connection_id,
-                'bucket_name': BUCKET,
-                'message_type': 'user_response',
-                'user_input': processed_input,
-                'conversation_state': current_conversation_state  # ✅ Use the stored state
-            })
+            Payload=json.dumps(payload)
         )
         
         result = json.loads(response['Payload'].read())
@@ -1413,11 +1479,25 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
         logger.error(f"❗ Interactive investigation error: {e}")
         return {"statusCode": 500}
 
+
 def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
-    """Handle similarity search and case matching"""
+    """Handle similarity search and case matching - FIXED to store results and properly ask questions"""
     try:
-        # Get full conversation context
+        # Get full conversation context with normalized datetime
+        orchestrator = orchestrators.get(connection_id)
+        datetime_str = "unknown"
+        
+        if orchestrator and orchestrator.state.collected_data:
+            datetime_str = orchestrator.state.collected_data.get("normalized_datetime", "unknown")
+            if datetime_str == "unknown":
+                datetime_str = orchestrator.state.collected_data.get("datetime", "unknown")
+        
         full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
+        
+        # Add normalized datetime to context
+        if datetime_str != "unknown":
+            datetime_context = f"\n[NORMALIZED_DATETIME: {datetime_str}]\n"
+            full_context = datetime_context + full_context
         
         # Check if we have enough info for similarity search
         if should_run_similarity_search(full_context):
@@ -1434,70 +1514,143 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
             similar_cases = find_similar_cases(full_context)
             
             if similar_cases:
-                # Generate follow-up questions based on modifiers
-                modifiers = set()
+                # ✅ FIX 1: Store similar cases to orchestrator state
+                orchestrators[connection_id].state.analytics_result = {
+                    **(orchestrators[connection_id].state.analytics_result or {}),
+                    "similar_cases": similar_cases
+                }
+                
+                # ✅ FIX 2: Collect ALL unique modifiers from similar cases
+                all_modifiers = set()
                 for case in similar_cases:
-                    modifiers.update(case.get("modifications", []))
-                modifiers = list(modifiers)[:5]
+                    case_modifiers = case.get("modifications", [])
+                    if isinstance(case_modifiers, list):
+                        all_modifiers.update(case_modifiers)
+                
+                # Convert to list and limit to top 10 most relevant
+                modifiers = list(all_modifiers)[:10]
+                
+                logger.info(f"🔍 Found {len(modifiers)} unique modifiers: {modifiers}")
                 
                 if modifiers:
+                    # Generate questions for these modifiers
                     mod_questions = generate_modifier_questions(modifiers)
                     
-                    # Store modifier questions in orchestrator state
-                    orchestrators[connection_id].state.modifier_questions = mod_questions
-                    orchestrators[connection_id].state.current_modifier_index = 0
-                    
-                    # Move to legal modifier investigation phase
-                    orchestrators[connection_id].state.phase = ConversationPhase.LEGAL_MODIFIER_INVESTIGATION
-                    
-                    # ✅ ADD THIS:
-                    save_orchestrator_state(connection_id, orchestrators[connection_id])
+                    if mod_questions:
+                        # Store modifier questions in orchestrator state
+                        orchestrators[connection_id].state.modifier_questions = mod_questions
+                        orchestrators[connection_id].state.current_modifier_index = 0  # ✅ Start at 0
+                        
+                        # Move to legal modifier investigation phase
+                        orchestrators[connection_id].state.phase = ConversationPhase.LEGAL_MODIFIER_INVESTIGATION
+                        
+                        # Save state
+                        save_orchestrator_state(connection_id, orchestrators[connection_id])
 
-                    intro_msg = (
-                        "I found some similar cases in our database. To provide the most accurate fault ratio assessment, "
-                        "I need to ask a few specific questions about the circumstances. These help determine legal liability factors."
-                    )
-                    
-                    apig.post_to_connection(
-                        ConnectionId=connection_id,
-                        Data=json.dumps({
-                            "response": intro_msg,
-                            "connectionId": connection_id,
-                            "progress": "Preparing legal assessment (Step 6/6)"
-                        }).encode("utf-8")
-                    )
-                    
-                    return {"statusCode": 200}
+                        # ✅ FIX 3: Send intro message WITHOUT asking first question yet
+                        lang = (orchestrators[connection_id].state.user_language or "en").upper()
+                        
+                        intro_message = (
+                            "I found some similar cases in our database. To provide the most accurate fault ratio assessment, "
+                            "I need to ask a few specific questions about the circumstances. These help determine legal liability factors.\n\n"
+                            "Let me start with the first question..."
+                        )
+                        
+                        apig.post_to_connection(
+                            ConnectionId=connection_id,
+                            Data=json.dumps({
+                                "response": intro_message,
+                                "connectionId": connection_id,
+                                "progress": f"Legal assessment (Step 6/6) - Preparing questions"
+                            }).encode("utf-8")
+                        )
+                        
+                        # ✅ FIX 4: Let the orchestrator ask the first question on next cycle
+                        # This will be triggered by the next get_next_action call
+                        return {"statusCode": 200}
+                    else:
+                        logger.warning("⚠️ No modifier questions generated")
+                else:
+                    logger.info("ℹ️ No modifiers found in similar cases")
         
-        # Move to finalization if no modifiers or not enough context
+        # ✅ FIX 5: If no modifiers or not enough context, store what we have and move to finalization
+        logger.info("ℹ️ Moving to finalization (no modifiers or insufficient context)")
         orchestrators[connection_id].state.phase = ConversationPhase.CASE_FINALIZATION
         save_orchestrator_state(connection_id, orchestrators[connection_id])
         return handle_finalize_case(connection_id, {"action": "finalize_case"}, apig)
         
     except Exception as e:
         logger.error(f"❗ Similarity search error: {e}")
+        import traceback
+        logger.error(f"❗ Full traceback: {traceback.format_exc()}")
         return {"statusCode": 500}
 
 
-
 def handle_finalize_case(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
-    """Finalize the case"""
+    """Finalize the case - FIXED to use stored similar cases"""
     try:
-        # Extract final information
-        full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
-        datetime_str = extract_datetime(full_context)
-        location_data = extract_location(full_context)
+        # ✅ Get data from orchestrator (already processed and validated)
+        orchestrator = orchestrators.get(connection_id)
+        datetime_str = "unknown"
+        location_data = None
+        similar_cases = None  # ✅ NEW
         
-        # Store to DynamoDB
-        if datetime_str != "unknown" and location_data:
+        if orchestrator and orchestrator.state.collected_data:
+            # Get normalized datetime (priority)
+            datetime_str = orchestrator.state.collected_data.get("normalized_datetime", "unknown")
+            if datetime_str == "unknown":
+                # Fallback to raw datetime
+                datetime_str = orchestrator.state.collected_data.get("datetime", "unknown")
+            
+            # Get location data (check multiple possible keys)
+            location_data = (
+                orchestrator.state.collected_data.get("location") or
+                orchestrator.state.collected_data.get("coordinates") or
+                orchestrator.state.analytics_result.get("location") if orchestrator.state.analytics_result else None
+            )
+            
+            # ✅ NEW: Get similar cases from orchestrator state
+            if orchestrator.state.analytics_result:
+                similar_cases = orchestrator.state.analytics_result.get("similar_cases")
+        
+        # ✅ Only use extraction as absolute fallback
+        if datetime_str == "unknown" or not location_data:
+            logger.warning(f"⚠️ Missing data, falling back to extraction for {connection_id}")
+            full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
+            
+            if datetime_str == "unknown":
+                datetime_str = extract_datetime(full_context)
+            if not location_data:
+                location_data = extract_location(full_context)
+        
+        # ✅ NEW: If we still don't have similar cases, try to find them now
+        if not similar_cases:
+            logger.info("🔍 No stored similar cases, running search now...")
+            full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
+            
+            if datetime_str != "unknown":
+                datetime_context = f"\n[NORMALIZED_DATETIME: {datetime_str}]\n"
+                full_context = datetime_context + full_context
+            
             similar_cases = find_similar_cases(full_context)
+        
+        logger.info(f"📊 Final data: datetime='{datetime_str}', location={location_data}, similar_cases={len(similar_cases) if similar_cases else 0}")
+        
+        # ✅ NEW: Include modifier answers in the context for final summary
+        modifier_context = ""
+        if orchestrator and orchestrator.state.modifier_answers:
+            modifier_context = "\n[MODIFIER ANSWERS]\n"
+            for key, answer in orchestrator.state.modifier_answers.items():
+                modifier_context += f"{key}: {answer}\n"
+        
+        # Store to DynamoDB with all collected information
+        if datetime_str != "unknown" and location_data:
             store_to_dynamodb(connection_id, datetime_str, location_data, similar_cases)
         
         final_message = (
             "Thank you for providing all the necessary information about your accident. "
             "I have recorded all the details and your claim is now being processed. "
-            "You should receive further updates within 24-48 hours. "
-            "Is there anything else you'd like to clarify about the accident?"
+            "You should receive further updates within 24-48 hours. Thank you."
         )
         
         apig.post_to_connection(
@@ -1516,7 +1669,10 @@ def handle_finalize_case(connection_id: str, action: Dict[str, Any], apig) -> Di
         
     except Exception as e:
         logger.error(f"❗ Case finalization error: {e}")
+        import traceback
+        logger.error(f"❗ Full traceback: {traceback.format_exc()}")
         return {"statusCode": 500}
+
 
 # --- Interactive Analytics Support (Legacy) ---
 def handle_interactive_analytics_response(connection_id, user_input, current_state, event):
