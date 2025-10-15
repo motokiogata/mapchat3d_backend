@@ -2126,171 +2126,40 @@ def clear_interactive_state(connection_id):
     except Exception as e:
         logger.error(f"❗ Failed to clear interactive state: {e}")
 
-
-def generate_modifier_questions(modifiers: list[str], connection_id: str) -> list[str]:
-    """Generate questions from modifiers using existing context - WITH DETAILED LOGGING"""
-    
-    logger.info(f"🔍 Generating modifier questions for {connection_id}")
-    logger.info(f"📝 Input modifiers ({len(modifiers)}): {modifiers}")
-    
-    # Get existing orchestrator data
-    orchestrator = orchestrators.get(connection_id)
-    full_context = ""
-    context_sources = []  # Track what we found
-    
-    if orchestrator:
-        logger.info(f"✅ Found orchestrator for {connection_id}")
-        
-        # Use existing collected data
-        collected_data = orchestrator.state.collected_data
-        if collected_data:
-            logger.info(f"📊 Collected data keys: {list(collected_data.keys())}")
-            
-            if collected_data.get("description"):
-                desc = collected_data["description"]
-                full_context += f"ACCIDENT DESCRIPTION: {desc}\n"
-                context_sources.append("description")
-                logger.info(f"✅ Added description: '{desc[:100]}{'...' if len(desc) > 100 else ''}'")
-            
-            if collected_data.get("datetime"):
-                datetime_val = collected_data["datetime"]
-                full_context += f"ACCIDENT TIME: {datetime_val}\n"
-                context_sources.append("datetime")
-                logger.info(f"✅ Added datetime: '{datetime_val}'")
-        
-        # Use existing analytics result
-        analytics_result = orchestrator.state.analytics_result
-        if analytics_result:
-            logger.info(f"🔬 Analytics result keys: {list(analytics_result.keys())}")
-            
-            route_data = analytics_result.get("route_data", {})
-            if route_data:
-                vehicles = route_data.get("vehicles", {})
-                
-                if vehicles.get("user_vehicle"):
-                    user_vehicle = vehicles["user_vehicle"]
-                    user_action = user_vehicle.get("path", {}).get("intended_destination", {}).get("maneuver", "unknown")
-                    full_context += f"USER VEHICLE: {user_action}\n"
-                    context_sources.append("user_vehicle")
-                    logger.info(f"✅ Added user vehicle action: '{user_action}'")
-                
-                if vehicles.get("other_vehicle"):
-                    other_vehicle = vehicles["other_vehicle"]
-                    other_action = other_vehicle.get("state_at_collision", {}).get("action", "unknown")
-                    full_context += f"OTHER VEHICLE: {other_action}\n"
-                    context_sources.append("other_vehicle")
-                    logger.info(f"✅ Added other vehicle action: '{other_action}'")
-                
-                collision = route_data.get("collision", {})
-                if collision:
-                    collision_type = collision.get("type", "unknown")
-                    full_context += f"COLLISION TYPE: {collision_type}\n"
-                    context_sources.append("collision")
-                    logger.info(f"✅ Added collision type: '{collision_type}'")
-            
-            # Check for final analysis
-            if analytics_result.get("final_analysis"):
-                final_analysis = analytics_result["final_analysis"]
-                full_context += f"DETAILED ANALYSIS: {final_analysis}\n"
-                context_sources.append("final_analysis")
-                logger.info(f"✅ Added final analysis: '{final_analysis[:100]}{'...' if len(final_analysis) > 100 else ''}'")
-        else:
-            logger.warning(f"⚠️ No analytics result found for {connection_id}")
-    else:
-        logger.warning(f"⚠️ No orchestrator found for {connection_id}")
-    
-    # Use existing chat history (already pruned)
-    if connection_id in chat_histories:
-        chat_history = chat_histories[connection_id]
-        logger.info(f"💬 Chat history: {len(chat_history)} messages")
-        
-        # Get last 10 relevant messages (skip system instructions)
-        relevant_messages = []
-        for msg in chat_history[-15:]:  # Look at last 15 messages
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            
-            # Skip system instructions and very short messages
-            if (role == "user" and len(content.strip()) > 10 and 
-                not content.startswith("Current date/time:") and
-                not content.startswith("Reply only in")):
-                relevant_messages.append(f"USER: {content}")
-            elif (role == "assistant" and len(content.strip()) > 20 and
-                  not "Reply only in" in content):
-                relevant_messages.append(f"ASSISTANT: {content}")
-        
-        if relevant_messages:
-            recent_chat = "\n".join(relevant_messages[-10:])  # Last 10 relevant
-            full_context += f"RECENT CONVERSATION:\n{recent_chat}\n"
-            context_sources.append("chat_history")
-            logger.info(f"✅ Added {len(relevant_messages)} relevant chat messages")
-        else:
-            logger.warning(f"⚠️ No relevant chat messages found")
-    else:
-        logger.warning(f"⚠️ No chat history found for {connection_id}")
-    
-    # Log what we're sending to LLM
-    logger.info(f"📋 Context sources used: {context_sources}")
-    logger.info(f"📏 Full context length: {len(full_context)} characters")
-    logger.info(f"🤖 CONTEXT BEING SENT TO LLM:")
-    logger.info(f"{'='*50}")
-    logger.info(full_context)
-    logger.info(f"{'='*50}")
-    
-    # Build the prompt
+# --- Helper Functions ---
+def generate_modifier_questions(modifiers: list[str]) -> list[str]:
+    """Generate questions from modifiers - FIXED to remove redundant time context"""
+    # ✅ ADD THIS LINE:
     jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
     time_context = f"Current date/time: {jst_time.strftime('%Y/%m/%d %H:%M')} JST."
 
     prompt = (
         f"{time_context}\n\n"
         "You are Mariko, an empathetic insurance claim operator for Tokio Marine Nichido. "
-        f"ACCIDENT CONTEXT:\n{full_context}\n\n"
         "Given the following internal legal or traffic modifiers that affect accident fault ratio, "
-        "please turn each into a clear and friendly question you can ask the customer involved in the accident. "
-        "IMPORTANT: Base your questions on the specific accident scenario described above. "
-        "Don't ask irrelevant questions (e.g., don't ask about turn signals if someone was going straight).\n\n"
+        "please turn each into a clear and friendly question you can ask a customer involved in the accident. "
+        "The goal is to confirm whether each modifier applies or not.\n\n"
+        "Example modifier: 'A's 30km+ speed violation +20 to A'\n"
+        "Example question: 'Were you driving more than 30km/h over the speed limit at the time of the accident?'\n\n"
         f"Modifiers:\n" + "\n".join(f"- {m}" for m in modifiers[:5]) +
         "\n\nOutput ONLY the list of questions, each on a new line. No explanations."
     )
-    
-    # Log the final prompt
-    logger.info(f"🤖 FINAL PROMPT TO LLM:")
-    logger.info(f"{'='*50}")
-    logger.info(prompt)
-    logger.info(f"{'='*50}")
 
-    try:
-        response = bedrock.invoke_model(
-            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 500,
-                "temperature": 0.1,
-                "messages": [{"role": "user", "content": prompt}]
-            })
-        )
+    response = bedrock.invoke_model(
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 500,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
 
-        raw_text = json.loads(response["body"].read())["content"][0]["text"]
-        logger.info(f"🤖 LLM RAW RESPONSE:")
-        logger.info(f"{'='*50}")
-        logger.info(raw_text)
-        logger.info(f"{'='*50}")
-        
-        questions = [line.strip("- ").strip() for line in raw_text.strip().split("\n") if line.strip()]
-        logger.info(f"✅ Generated {len(questions)} questions:")
-        for i, q in enumerate(questions, 1):
-            logger.info(f"  {i}. {q}")
-        
-        return questions
-        
-    except Exception as e:
-        logger.error(f"❗ Error calling Bedrock for modifier questions: {e}")
-        logger.error(f"❗ Context sources attempted: {context_sources}")
-        logger.error(f"❗ Full context length: {len(full_context)}")
-        return []
-
+    raw_text = json.loads(response["body"].read())["content"][0]["text"]
+    questions = [line.strip("- ").strip() for line in raw_text.strip().split("\n") if line.strip()]
+    return questions
 
 def extract_datetime(full_context):
     """Extract datetime from context - FIXED to remove redundant time context"""

@@ -16,7 +16,6 @@ from typing import Dict, List, Optional, Any
 
 LANG_CODES = {"EN","JA","ES","KO","ZH"}
 
-
 def detect_language_via_llm(user_text: str) -> str:
     """
     Call LLM once to classify language.
@@ -967,19 +966,18 @@ def understand_general_response(user_input: str) -> Dict[str, Any]:
     }
 
 
-
 def understand_option_selection(user_input: str, options: list, context: str) -> Dict[str, Any]:
-    """Handle option selection using LLM - return the number - FIXED to remove redundant time context"""
+    """Handle option selection using LLM - return the number"""
     
     try:
-        # ✅ ADD THIS LINE:
+        # ✅ PRIMARY METHOD: Use Claude to understand selection
         jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-        time_context = f"Current date/time: {jst_time.strftime('%Y/%m/%d %H:%M')} JST."
+        time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
         
         options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)])
         
         prompt = (
-            f"{time_context}\n\n"
+            time_context +
             f"The user was asked to select from these {context} options:\n"
             f"{options_text}\n\n"
             f"User responded: '{user_input}'\n\n"
@@ -1008,6 +1006,7 @@ def understand_option_selection(user_input: str, options: list, context: str) ->
         result_text = json.loads(response["body"].read())["content"][0]["text"].strip()
         logger.info(f"🤖 Claude understood: '{user_input}' → '{result_text}'")
         
+        # Parse Claude's response
         if result_text.lower() == "unclear":
             return {
                 "understood": False,
@@ -1045,7 +1044,7 @@ def understand_option_selection(user_input: str, options: list, context: str) ->
     except Exception as e:
         logger.error(f"❗ LLM option selection failed: {e}")
         
-        # Fallback: Simple numeric parsing only
+        # ✅ FALLBACK: Simple numeric parsing only
         try:
             import re
             number_match = re.search(r'\b(\d+)\b', user_input.strip())
@@ -1064,13 +1063,13 @@ def understand_option_selection(user_input: str, options: list, context: str) ->
         except Exception:
             pass
         
+        # Last resort
         return {
             "understood": False,
             "confidence": 0.0,
             "interpretation": f"Failed to understand: {user_input}"
         }
-
-
+    
 def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
     """
     Validate if the user provided specific enough datetime information AND return normalized datetime.
@@ -1080,16 +1079,16 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
         "has_time": bool,
         "missing_info": str,
         "follow_up_question": str,
-        "normalized_datetime": str  # yyyy/mm/dd hh:mm format
+        "normalized_datetime": str  # NEW: yyyy/mm/dd hh:mm format
     }
     """
     try:
-        # ✅ ADD THIS LINE:
+        # Add JST time context
         jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-        time_context = f"Current date/time: {jst_time.strftime('%Y/%m/%d %H:%M')} JST."
-
+        time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
+        
         prompt = (
-            f"{time_context}\n\n"
+            time_context +
             f"Analyze this user input about accident timing: \"{user_input}\"\n\n"
             "Your tasks:\n"
             "1. Determine if it includes specific DATE and TIME information\n"
@@ -1122,9 +1121,11 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
         
         result_text = json.loads(response["body"].read())["content"][0]["text"].strip()
         
+        # Parse JSON response
         try:
             validation_result = json.loads(result_text)
             
+            # Generate follow-up question if needed
             follow_up = ""
             if not validation_result.get("is_sufficient", False):
                 missing = validation_result.get("missing_info", "")
@@ -1141,7 +1142,7 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
                 "has_time": validation_result.get("has_specific_time", False),
                 "missing_info": validation_result.get("missing_info", ""),
                 "follow_up_question": follow_up,
-                "normalized_datetime": validation_result.get("normalized_datetime", "unknown")
+                "normalized_datetime": validation_result.get("normalized_datetime", "unknown")  # NEW
             }
             
         except json.JSONDecodeError:
@@ -1152,7 +1153,7 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
                 "has_time": False,
                 "missing_info": "date and time",
                 "follow_up_question": "Could you please provide the specific date and time of the accident?",
-                "normalized_datetime": "unknown"
+                "normalized_datetime": "unknown"  # NEW
             }
             
     except Exception as e:
@@ -1163,14 +1164,11 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
             "has_time": False,
             "missing_info": "date and time",
             "follow_up_question": "Could you please provide the date and time of the accident?",
-            "normalized_datetime": "unknown"
+            "normalized_datetime": "unknown"  # NEW
         }
 
-#--- Main Message Handler ---
-# In-memory chat histories for context management
-# Key: connection_id, Value: list of messages
 def handle_send_message(event):
-    """FIXED: Handle messages with proper chat history management"""
+    """FIXED: Handle messages gracefully when conversation is complete"""
     try:
         connection_id = event["requestContext"]["connectionId"]
         body = json.loads(event.get("body", "{}"))
@@ -1189,14 +1187,16 @@ def handle_send_message(event):
         logger.info(f"🧠 Current Phase: {orchestrator.state.phase}")
         logger.info(f"👤 User said (RAW): '{user_msg}'")
         
-        # ✅ Handle COMPLETED phase gracefully
+        # ✅ NEW: Handle COMPLETED phase gracefully
         if orchestrator.state.phase == ConversationPhase.COMPLETED:
             logger.info("✅ Conversation already completed, ignoring message")
             
+            # Check if this is a system message (from animation generator)
             if "animation" in user_msg.lower() and "complete" in user_msg.lower():
                 logger.info("📊 Animation completion notification received")
                 return {"statusCode": 200}
             
+            # If user is trying to continue conversation after completion
             apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
             apig.post_to_connection(
                 ConnectionId=connection_id,
@@ -1215,9 +1215,9 @@ def handle_send_message(event):
             understanding = understand_user_response_by_phase(user_msg, orchestrator.state, connection_id)
             logger.info(f"🧠 Understanding result: {understanding}")
             
-            # Add user message to history (pruning will happen in handle_claude_response)
-            chat_histories[connection_id].append({"role": "user", "content": user_msg})            
+            chat_histories[connection_id].append({"role": "user", "content": user_msg})
             
+            # ✅ ONLY use understanding result if it's clearly better
             if understanding.get("understood") and understanding.get("selected_text"):
                 processed_input = understanding["selected_text"] 
                 logger.info(f"✅ Using understood selection: '{processed_input}'")
@@ -1225,7 +1225,7 @@ def handle_send_message(event):
                 processed_input = user_msg
                 logger.info(f"✅ Using raw input: '{processed_input}'")
         
-        # Get next action
+        # ✅ Get next action
         action = orchestrator.get_next_action(processed_input)
         
         if action.get("action") == "interactive_investigation":
@@ -1237,6 +1237,7 @@ def handle_send_message(event):
     except Exception as e:
         logger.error(f"❗ Send message error: {e}")
         return {"statusCode": 500}
+
 
 # --- Action Executors ---
 def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[str, int]:
@@ -1344,24 +1345,18 @@ def handle_check_map_processing(connection_id: str, action: Dict[str, Any], apig
         logger.error(f"❗ Map processing check error: {e}")
         return {"statusCode": 500}
 
-# --- Claude Interaction ---
-#--- Prune chat history to manage token limits ---
-# Simple pruning strategy: keep last 15 messages
-# You can enhance this with more sophisticated logic if needed
 def handle_claude_response(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
-    """Handle Claude responses with orchestrator instructions - FIXED"""
+    """Handle Claude responses with orchestrator instructions - FIXED to include JST time context"""
     try:
         instruction = action.get("instruction", "Continue the conversation naturally.")
         progress = action.get("progress", "")
         
-        # Prune BEFORE adding new instruction
-        prune_chat_history(connection_id)
-        
-        # Add instruction as user message (restore working behavior)
+        # FIXED: Add JST time context
         jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
         time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
-        full_instruction = time_context + instruction
         
+        # Add instruction with time context to chat history
+        full_instruction = time_context + instruction
         chat_histories[connection_id].append({"role": "user", "content": full_instruction})
         
         # Get Claude response
@@ -1371,7 +1366,7 @@ def handle_claude_response(connection_id: str, action: Dict[str, Any], apig) -> 
             accept="application/json",
             body=json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1500,  # Increased for complex questions
+                "max_tokens": 1000,
                 "temperature": 0.1,
                 "messages": chat_histories[connection_id]
             })
@@ -1648,10 +1643,10 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
         return {"statusCode": 500}
 
 
-
 def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
-    """Handle similarity search and case matching - FIXED with chat history management"""
+    """Handle similarity search and case matching - FIXED to store results and properly ask questions"""
     try:
+        # Get full conversation context with normalized datetime
         orchestrator = orchestrators.get(connection_id)
         datetime_str = "unknown"
         
@@ -1660,17 +1655,14 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
             if datetime_str == "unknown":
                 datetime_str = orchestrator.state.collected_data.get("datetime", "unknown")
         
-        # ✅ Build context from chat history (which is now pruned and clean)
         full_context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
         
+        # Add normalized datetime to context
         if datetime_str != "unknown":
             datetime_context = f"\n[NORMALIZED_DATETIME: {datetime_str}]\n"
             full_context = datetime_context + full_context
         
-        # ✅ Log context size
-        context_tokens = estimate_tokens(full_context)
-        logger.info(f"📊 Similarity search context: ~{context_tokens} tokens")
-        
+        # Check if we have enough info for similarity search
         if should_run_similarity_search(full_context):
             apig.post_to_connection(
                 ConnectionId=connection_id,
@@ -1681,33 +1673,44 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
                 }).encode("utf-8")
             )
             
+            # Run similarity search
             similar_cases = find_similar_cases(full_context)
             
             if similar_cases:
+                # ✅ FIX 1: Store similar cases to orchestrator state
                 orchestrators[connection_id].state.analytics_result = {
                     **(orchestrators[connection_id].state.analytics_result or {}),
                     "similar_cases": similar_cases
                 }
                 
+                # ✅ FIX 2: Collect ALL unique modifiers from similar cases
                 all_modifiers = set()
                 for case in similar_cases:
                     case_modifiers = case.get("modifications", [])
                     if isinstance(case_modifiers, list):
                         all_modifiers.update(case_modifiers)
                 
+                # Convert to list and limit to top 10 most relevant
                 modifiers = list(all_modifiers)[:10]
+                
                 logger.info(f"🔍 Found {len(modifiers)} unique modifiers: {modifiers}")
                 
                 if modifiers:
+                    # Generate questions for these modifiers
                     mod_questions = generate_modifier_questions(modifiers)
                     
                     if mod_questions:
+                        # Store modifier questions in orchestrator state
                         orchestrators[connection_id].state.modifier_questions = mod_questions
-                        orchestrators[connection_id].state.current_modifier_index = 0
+                        orchestrators[connection_id].state.current_modifier_index = 0  # ✅ Start at 0
+                        
+                        # Move to legal modifier investigation phase
                         orchestrators[connection_id].state.phase = ConversationPhase.LEGAL_MODIFIER_INVESTIGATION
                         
+                        # Save state
                         save_orchestrator_state(connection_id, orchestrators[connection_id])
 
+                        # ✅ FIX 3: Send intro message WITHOUT asking first question yet
                         lang = (orchestrators[connection_id].state.user_language or "en").upper()
                         
                         intro_message = (
@@ -1725,12 +1728,15 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
                             }).encode("utf-8")
                         )
                         
+                        # ✅ FIX 4: Let the orchestrator ask the first question on next cycle
+                        # This will be triggered by the next get_next_action call
                         return {"statusCode": 200}
                     else:
                         logger.warning("⚠️ No modifier questions generated")
                 else:
                     logger.info("ℹ️ No modifiers found in similar cases")
         
+        # ✅ FIX 5: If no modifiers or not enough context, store what we have and move to finalization
         logger.info("ℹ️ Moving to finalization (no modifiers or insufficient context)")
         orchestrators[connection_id].state.phase = ConversationPhase.CASE_FINALIZATION
         save_orchestrator_state(connection_id, orchestrators[connection_id])
@@ -1744,7 +1750,7 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
 
 
 def build_comprehensive_accident_context(connection_id: str, orchestrator: TaskOrchestrator) -> str:
-    """Build comprehensive accident context from all available sources - FIXED with pruned history"""
+    """Build comprehensive accident context from all available sources"""
     context_parts = []
     
     # 1. Add basic collected data
@@ -1767,6 +1773,7 @@ def build_comprehensive_accident_context(connection_id: str, orchestrator: TaskO
         if analytics.get("route_data"):
             route_data = analytics["route_data"]
             
+            # Extract vehicle information
             vehicles = route_data.get("vehicles", {})
             if vehicles.get("user_vehicle"):
                 user_vehicle = vehicles["user_vehicle"]
@@ -1776,10 +1783,12 @@ def build_comprehensive_accident_context(connection_id: str, orchestrator: TaskO
                 other_vehicle = vehicles["other_vehicle"]
                 context_parts.append(f"OTHER VEHICLE: Coming from {other_vehicle.get('path', {}).get('origin', {}).get('direction', 'unknown')} direction, action: {other_vehicle.get('state_at_collision', {}).get('action', 'unknown')}")
             
+            # Extract collision information
             collision = route_data.get("collision", {})
             if collision:
                 context_parts.append(f"COLLISION: Type: {collision.get('type', 'unknown')}, Point: {collision.get('point', {}).get('description', 'unknown')}")
             
+            # Extract traffic conditions
             traffic = route_data.get("traffic_conditions", {})
             if traffic.get("signals"):
                 signals = traffic["signals"]
@@ -1791,38 +1800,35 @@ def build_comprehensive_accident_context(connection_id: str, orchestrator: TaskO
         for key, answer in orchestrator.state.modifier_answers.items():
             context_parts.append(f"  {key}: {answer}")
     
-    # 4. Add relevant chat history (now already pruned and clean)
+    # 4. Add relevant chat history (filter out system messages)
     if connection_id in chat_histories:
         relevant_messages = []
         for msg in chat_histories[connection_id]:
             content = msg.get("content", "")
-            role = msg.get("role", "")
-            
-            # Skip system summaries (they're already condensed)
-            if role == "system" and "[Previous conversation summary]" in content:
-                relevant_messages.append(f"SUMMARY: {content}")
-            # Keep user and assistant messages
-            elif role == "user" and len(content.strip()) > 10:
+            # Skip system instructions and very short messages
+            if (msg.get("role") == "user" and len(content.strip()) > 10 and 
+                not content.startswith("Reply only in") and 
+                not content.startswith("FYI, today is")):
                 relevant_messages.append(f"USER: {content}")
-            elif role == "assistant" and len(content.strip()) > 20:
+            elif (msg.get("role") == "assistant" and len(content.strip()) > 20 and
+                  not "Reply only in" in content and
+                  not "FYI, today is" in content):
                 relevant_messages.append(f"ASSISTANT: {content}")
         
         if relevant_messages:
             context_parts.append("CONVERSATION HIGHLIGHTS:")
-            context_parts.extend(relevant_messages[-15:])  # Last 15 relevant messages
+            context_parts.extend(relevant_messages[-10:])  # Last 10 relevant messages
     
-    # 5. Fallback: if no structured data, use what we have
+    # 5. Fallback: if no structured data, try to extract from chat
     if len(context_parts) < 3 and connection_id in chat_histories:
-        logger.warning("⚠️ Limited structured data, using available chat history")
+        logger.warning("⚠️ Limited structured data, using full chat history as fallback")
         full_chat = "\n".join([f"{m['role']}: {m['content']}" for m in chat_histories[connection_id]])
         context_parts.append(f"FULL CONVERSATION: {full_chat}")
     
     final_context = "\n\n".join(context_parts)
-    context_tokens = estimate_tokens(final_context)
-    logger.info(f"📝 Built context with {len(context_parts)} sections, ~{context_tokens} tokens")
+    logger.info(f"📝 Built context with {len(context_parts)} sections, {len(final_context)} total chars")
     
     return final_context
-
 
 def handle_finalize_case(connection_id: str, action: Dict[str, Any], apig) -> Dict[str, int]:
     """Finalize the case - FIXED to build comprehensive context"""
@@ -2126,187 +2132,46 @@ def clear_interactive_state(connection_id):
     except Exception as e:
         logger.error(f"❗ Failed to clear interactive state: {e}")
 
-
-def generate_modifier_questions(modifiers: list[str], connection_id: str) -> list[str]:
-    """Generate questions from modifiers using existing context - WITH DETAILED LOGGING"""
-    
-    logger.info(f"🔍 Generating modifier questions for {connection_id}")
-    logger.info(f"📝 Input modifiers ({len(modifiers)}): {modifiers}")
-    
-    # Get existing orchestrator data
-    orchestrator = orchestrators.get(connection_id)
-    full_context = ""
-    context_sources = []  # Track what we found
-    
-    if orchestrator:
-        logger.info(f"✅ Found orchestrator for {connection_id}")
-        
-        # Use existing collected data
-        collected_data = orchestrator.state.collected_data
-        if collected_data:
-            logger.info(f"📊 Collected data keys: {list(collected_data.keys())}")
-            
-            if collected_data.get("description"):
-                desc = collected_data["description"]
-                full_context += f"ACCIDENT DESCRIPTION: {desc}\n"
-                context_sources.append("description")
-                logger.info(f"✅ Added description: '{desc[:100]}{'...' if len(desc) > 100 else ''}'")
-            
-            if collected_data.get("datetime"):
-                datetime_val = collected_data["datetime"]
-                full_context += f"ACCIDENT TIME: {datetime_val}\n"
-                context_sources.append("datetime")
-                logger.info(f"✅ Added datetime: '{datetime_val}'")
-        
-        # Use existing analytics result
-        analytics_result = orchestrator.state.analytics_result
-        if analytics_result:
-            logger.info(f"🔬 Analytics result keys: {list(analytics_result.keys())}")
-            
-            route_data = analytics_result.get("route_data", {})
-            if route_data:
-                vehicles = route_data.get("vehicles", {})
-                
-                if vehicles.get("user_vehicle"):
-                    user_vehicle = vehicles["user_vehicle"]
-                    user_action = user_vehicle.get("path", {}).get("intended_destination", {}).get("maneuver", "unknown")
-                    full_context += f"USER VEHICLE: {user_action}\n"
-                    context_sources.append("user_vehicle")
-                    logger.info(f"✅ Added user vehicle action: '{user_action}'")
-                
-                if vehicles.get("other_vehicle"):
-                    other_vehicle = vehicles["other_vehicle"]
-                    other_action = other_vehicle.get("state_at_collision", {}).get("action", "unknown")
-                    full_context += f"OTHER VEHICLE: {other_action}\n"
-                    context_sources.append("other_vehicle")
-                    logger.info(f"✅ Added other vehicle action: '{other_action}'")
-                
-                collision = route_data.get("collision", {})
-                if collision:
-                    collision_type = collision.get("type", "unknown")
-                    full_context += f"COLLISION TYPE: {collision_type}\n"
-                    context_sources.append("collision")
-                    logger.info(f"✅ Added collision type: '{collision_type}'")
-            
-            # Check for final analysis
-            if analytics_result.get("final_analysis"):
-                final_analysis = analytics_result["final_analysis"]
-                full_context += f"DETAILED ANALYSIS: {final_analysis}\n"
-                context_sources.append("final_analysis")
-                logger.info(f"✅ Added final analysis: '{final_analysis[:100]}{'...' if len(final_analysis) > 100 else ''}'")
-        else:
-            logger.warning(f"⚠️ No analytics result found for {connection_id}")
-    else:
-        logger.warning(f"⚠️ No orchestrator found for {connection_id}")
-    
-    # Use existing chat history (already pruned)
-    if connection_id in chat_histories:
-        chat_history = chat_histories[connection_id]
-        logger.info(f"💬 Chat history: {len(chat_history)} messages")
-        
-        # Get last 10 relevant messages (skip system instructions)
-        relevant_messages = []
-        for msg in chat_history[-15:]:  # Look at last 15 messages
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            
-            # Skip system instructions and very short messages
-            if (role == "user" and len(content.strip()) > 10 and 
-                not content.startswith("Current date/time:") and
-                not content.startswith("Reply only in")):
-                relevant_messages.append(f"USER: {content}")
-            elif (role == "assistant" and len(content.strip()) > 20 and
-                  not "Reply only in" in content):
-                relevant_messages.append(f"ASSISTANT: {content}")
-        
-        if relevant_messages:
-            recent_chat = "\n".join(relevant_messages[-10:])  # Last 10 relevant
-            full_context += f"RECENT CONVERSATION:\n{recent_chat}\n"
-            context_sources.append("chat_history")
-            logger.info(f"✅ Added {len(relevant_messages)} relevant chat messages")
-        else:
-            logger.warning(f"⚠️ No relevant chat messages found")
-    else:
-        logger.warning(f"⚠️ No chat history found for {connection_id}")
-    
-    # Log what we're sending to LLM
-    logger.info(f"📋 Context sources used: {context_sources}")
-    logger.info(f"📏 Full context length: {len(full_context)} characters")
-    logger.info(f"🤖 CONTEXT BEING SENT TO LLM:")
-    logger.info(f"{'='*50}")
-    logger.info(full_context)
-    logger.info(f"{'='*50}")
-    
-    # Build the prompt
+# --- Helper Functions ---
+def generate_modifier_questions(modifiers: list[str]) -> list[str]:
+    # FIXED: Add JST time context here too
     jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-    time_context = f"Current date/time: {jst_time.strftime('%Y/%m/%d %H:%M')} JST."
-
+    time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
+    
     prompt = (
-        f"{time_context}\n\n"
+        time_context +
         "You are Mariko, an empathetic insurance claim operator for Tokio Marine Nichido. "
-        f"ACCIDENT CONTEXT:\n{full_context}\n\n"
         "Given the following internal legal or traffic modifiers that affect accident fault ratio, "
-        "please turn each into a clear and friendly question you can ask the customer involved in the accident. "
-        "IMPORTANT: Base your questions on the specific accident scenario described above. "
-        "Don't ask irrelevant questions (e.g., don't ask about turn signals if someone was going straight).\n\n"
+        "please turn each into a clear and friendly question you can ask a customer involved in the accident. "
+        "The goal is to confirm whether each modifier applies or not.\n\n"
+        "Example modifier: 'A's 30km+ speed violation +20 to A'\n"
+        "Example question: 'Were you driving more than 30km/h over the speed limit at the time of the accident?'\n\n"
         f"Modifiers:\n" + "\n".join(f"- {m}" for m in modifiers[:5]) +
         "\n\nOutput ONLY the list of questions, each on a new line. No explanations."
     )
-    
-    # Log the final prompt
-    logger.info(f"🤖 FINAL PROMPT TO LLM:")
-    logger.info(f"{'='*50}")
-    logger.info(prompt)
-    logger.info(f"{'='*50}")
 
-    try:
-        response = bedrock.invoke_model(
-            modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 500,
-                "temperature": 0.1,
-                "messages": [{"role": "user", "content": prompt}]
-            })
-        )
+    response = bedrock.invoke_model(
+        modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 500,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
 
-        raw_text = json.loads(response["body"].read())["content"][0]["text"]
-        logger.info(f"🤖 LLM RAW RESPONSE:")
-        logger.info(f"{'='*50}")
-        logger.info(raw_text)
-        logger.info(f"{'='*50}")
-        
-        questions = [line.strip("- ").strip() for line in raw_text.strip().split("\n") if line.strip()]
-        logger.info(f"✅ Generated {len(questions)} questions:")
-        for i, q in enumerate(questions, 1):
-            logger.info(f"  {i}. {q}")
-        
-        return questions
-        
-    except Exception as e:
-        logger.error(f"❗ Error calling Bedrock for modifier questions: {e}")
-        logger.error(f"❗ Context sources attempted: {context_sources}")
-        logger.error(f"❗ Full context length: {len(full_context)}")
-        return []
-
+    raw_text = json.loads(response["body"].read())["content"][0]["text"]
+    questions = [line.strip("- ").strip() for line in raw_text.strip().split("\n") if line.strip()]
+    return questions
 
 def extract_datetime(full_context):
-    """Extract datetime from context - FIXED to remove redundant time context"""
-    # ✅ ADD THIS LINE:
+    # FIXED: Add JST time context
     jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-    time_context = f"Current date/time: {jst_time.strftime('%Y/%m/%d %H:%M')} JST."     
-
-    prompt = (
-        f"{time_context}\n\n"
-        f"Generate the exact datetime (format: yyyy/mm/dd hh:mm) from this accident description: \"{full_context}\". "
-        f"If the user provides a relative date expression such as yesterday, today, or three days ago, "
-        f"instead of a specific date, estimate the exact date by referring to today's date. "
-        f"Just output yyyy/mm/dd hh:mm directly and don't include any other messages. "
-        f"If you can't do it, return 'unknown'."
-    )
+    time_context = f"FYI, today is \"{jst_time.strftime('%Y/%m/%d %H:%M')} JST\". "
     
+    prompt = time_context + f"Generate the exact datetime (format: yyyy/mm/dd hh:mm) from this accident description: \"{full_context}\". If the user provides a relative date expression such as yesterday, today, or three days ago, instead of a specific date, estimate the exact date by referring to today's date. Just output yyyy/mm/dd hh:mm directly and Don't include any other messages. If you can't do it, return 'unknown'."
     response = bedrock.invoke_model(
         modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
@@ -2364,10 +2229,7 @@ def extract_location(full_context):
 
     return None
 
-
 def should_run_similarity_search(full_context):
-    """Determine if enough info for similarity search - no time context needed"""
-    
     prompt = (
         f"Analyze this conversation and determine if the user has provided enough details "
         f"about their traffic accident to run a similarity search against a database of accident cases.\n\n"
@@ -2398,15 +2260,12 @@ def should_run_similarity_search(full_context):
 
 # --- CSV Similarity Logic ---
 def categorize_accident_type(full_context):
-    """Categorize accident type - no time context needed here"""
-    
     prompt = (
         f"Categorize this accident description into one of the following categories:\n"
         f"{list(CATEGORY_CSV_MAPPING.keys())}\n"
         f"Description:\n\"{full_context}\"\n"
         f"Reply only the category string exactly as above."
     )
-    
     response = bedrock.invoke_model(
         modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
@@ -2421,6 +2280,7 @@ def categorize_accident_type(full_context):
     category = json.loads(response["body"].read())["content"][0]["text"].strip()
     logger.info(f"Accident category: {category}")
     return category
+
 
 def load_csv_from_s3(csv_filename):
     """Load CSV from S3 with better error handling"""
@@ -2446,11 +2306,11 @@ def format_cases_for_analysis(cases):
         for c in cases
     ])
 
-
 def find_matching_pattern(category, full_context):
-    """Find matching patterns with better error handling - FIXED chat history management"""
+    """Find matching patterns with better error handling"""
     all_cases = []
     
+    # Get CSV files for this category
     csv_files = CATEGORY_CSV_MAPPING.get(category, [])
     logger.info(f"🔍 Category '{category}' maps to files: {csv_files}")
     
@@ -2458,6 +2318,7 @@ def find_matching_pattern(category, full_context):
         logger.warning(f"⚠️ No CSV files found for category: {category}")
         return None
     
+    # Load all cases from relevant CSV files
     for file in csv_files:
         try:
             df = load_csv_from_s3(file)
@@ -2478,6 +2339,7 @@ def find_matching_pattern(category, full_context):
                     "source_file": file
                 }
                 
+                # Only add cases with valid data
                 if case_data["case_number"] and case_data["vehicle_information"]:
                     all_cases.append(case_data)
                     
@@ -2491,7 +2353,8 @@ def find_matching_pattern(category, full_context):
     
     logger.info(f"📊 Total cases loaded: {len(all_cases)}")
     
-    cases_text = format_cases_for_analysis(all_cases[:50])
+    # Prepare prompt with formatted cases + user context
+    cases_text = format_cases_for_analysis(all_cases[:50])  # Limit to first 50 cases to avoid token limits
     
     prompt = (
         f"Given the following accident cases:\n{cases_text}\n\n"
@@ -2523,13 +2386,16 @@ def find_matching_pattern(category, full_context):
         result_text = json.loads(response["body"].read())["content"][0]["text"]
         logger.info(f"🤖 Similarity analysis response: {result_text[:500]}...")
 
+        # Try to parse JSON from response
         try:
+            # Remove any markdown formatting
             clean_text = result_text.strip()
             if clean_text.startswith("```json"):
                 clean_text = clean_text.replace("```json", "").replace("```", "").strip()
             elif clean_text.startswith("```"):
                 clean_text = clean_text.replace("```", "").strip()
             
+            # Parse JSON
             matches = json.loads(clean_text)
             logger.info(f"✅ Successfully parsed {len(matches)} similar cases")
             return matches
@@ -2545,15 +2411,12 @@ def find_matching_pattern(category, full_context):
 
 
 def calculate_final_fault_ratio(base_ratio, modifications, accident_context):
-    """Calculate final fault ratio - no time context needed"""
-    
     prompt = (
         f"Given a base fault ratio: {base_ratio}, and the following modification factors: {modifications},\n"
         f"and the accident description:\n{accident_context}\n"
         f"Calculate the final fault ratio as a numeric value between 0 and 1.\n"
         f"Output only the numeric value as a string."
     )
-    
     response = bedrock.invoke_model(
         modelId="apac.anthropic.claude-sonnet-4-20250514-v1:0",
         contentType="application/json",
