@@ -337,15 +337,10 @@ class InteractiveTrafficAnalyzer:
 
 
 
-    def __init__(self, connection_id, bucket_name, infrastructure_data, user_language="en"):
+    def __init__(self, connection_id, bucket_name, infrastructure_data):
         self.connection_id = connection_id
         self.bucket_name = bucket_name
         self.infrastructure = infrastructure_data
-        self.user_language = user_language.upper()  # ✅ Store language preference
-
-        # ✅ NEW: Store responses in BOTH languages
-        self.responses = {}  # User's language (for context)
-        self.responses_english = {}  # English (for storage)
         
         # ✅ KEEP JSON DATA ACCESSIBLE THROUGHOUT
         self.roads_data = infrastructure_data.get(f'{connection_id}_roads_metadata_only.json', {})
@@ -484,9 +479,6 @@ class InteractiveTrafficAnalyzer:
             options_text = identifier_texts[0] if identifier_texts else "one of the roads"
         
         prompt = f"""
-
-        Reply only in {self.user_language}. 
-
         Based on this intersection, generate a natural question asking which road the user came from.
         
         SCENE: {self.scene_understanding}
@@ -498,8 +490,6 @@ class InteractiveTrafficAnalyzer:
         "I can see this accident happened at this intersection. Which road were you traveling on - were you coming from {options_text}?"
         
         Use the exact conversational identifiers provided above - don't change the wording.
-
-        IMPORTANT: Respond in {self.user_language} language.  # ✅ ADD THIS
         """
         
         question = self.call_bedrock(prompt, max_tokens=400)
@@ -514,8 +504,6 @@ class InteractiveTrafficAnalyzer:
     def generate_action_question(self):
         """Generate action question using roads/intersection JSON data"""
         prompt = f"""
-        Reply only in {self.user_language}.
-
         Based on this intersection data and the user's previous response, ask about their intended action:
         
         INTERSECTIONS DATA:
@@ -544,9 +532,6 @@ class InteractiveTrafficAnalyzer:
     def generate_lane_question(self):
         """Generate lane question using roads JSON data"""
         prompt = f"""
-
-        Reply only in {self.user_language}.
-
         Based on this road infrastructure data and previous responses, ask about which lane they were in:
         
         ROADS DATA:
@@ -573,9 +558,6 @@ class InteractiveTrafficAnalyzer:
     def generate_traffic_signal_question(self):
         """Generate traffic signal question using intersections JSON data"""
         prompt = f"""
-        
-        Reply only in {self.user_language}.
-
         Based on this intersection data, ask about traffic signals or controls:
         
         INTERSECTIONS DATA:
@@ -600,9 +582,6 @@ class InteractiveTrafficAnalyzer:
     def generate_other_vehicle_question(self):
         """Generate other vehicle question with DISAMBIGUATION"""
         prompt = f"""
-
-        Reply only in {self.user_language}.
-        
         Based on the intersection layout and user's path so far, ask about the other vehicle.
         
         INTERSECTION DATA:
@@ -633,22 +612,8 @@ class InteractiveTrafficAnalyzer:
 
 
     def generate_other_vehicle_action_question(self):
-        """Generate other vehicle action question - translated to user's language"""
-        
-        prompt = f"""
-        You are an empathetic insurance claim operator.
-        
-        USER'S LANGUAGE: {self.user_language}
-        RESPOND ONLY IN {self.user_language}.
-        
-        Ask the user this question in a natural, conversational way:
-        "What was the other vehicle doing when the accident happened - was it going straight, turning, or stopped?"
-        
-        Keep it simple and empathetic.
-        CRITICAL: Your entire response must be in {self.user_language}.
-        """
-        
-        question = self.call_bedrock(prompt, max_tokens=200)
+        """Generate other vehicle action question"""
+        question = "What was the other vehicle doing when the accident happened - was it going straight, turning, or stopped?"
         
         return {
             "statusCode": 200,
@@ -656,13 +621,9 @@ class InteractiveTrafficAnalyzer:
             "conversation_state": "other_vehicle_action"
         }
 
-
     def generate_collision_question(self):
         """Generate collision point question using intersection data"""
         prompt = f"""
-
-        Reply only in {self.user_language}.
-
         Based on the intersection layout and both vehicles' paths, ask about collision point:
         
         INTERSECTION DATA:
@@ -733,20 +694,9 @@ class InteractiveTrafficAnalyzer:
         
         # Store raw response
         self.responses[current_state] = user_input
-
-        # ✅ NEW: Translate to English for storage
-        if self.user_language != "EN":
-            english_response = self._translate_to_english(user_input, current_state)
-            self.responses_english[current_state] = english_response
-            logger.info(f"🌐 Translated '{user_input}' → '{english_response}'")
-        else:
-            self.responses_english[current_state] = user_input
         
-        # Update path from ENGLISH response (for consistent storage)
-        self.update_user_path_from_response(
-            self.responses_english[current_state],  # ✅ Use English version
-            current_state
-        )
+        # Update path from response
+        self.update_user_path_from_response(user_input, current_state)
         
         # Handle forced questions
         if getattr(self, "_next_forced", None):
@@ -770,33 +720,6 @@ class InteractiveTrafficAnalyzer:
                 nxt["conversation_state"] = "investigation_complete"
         
         return nxt
-
-
-    def _translate_to_english(self, user_input: str, context: str) -> str:
-        """Translate user input to English for storage"""
-        try:
-            prompt = f"""
-            Translate this user response to English. Preserve the semantic meaning accurately.
-            
-            Context: The user is answering a question about: {context}
-            User's response ({self.user_language}): "{user_input}"
-            
-            Provide ONLY the English translation. No explanations.
-            
-            Examples:
-            - "左から来ました" → "came from the left"
-            - "直進するつもりでした" → "intended to go straight"
-            - "赤信号でした" → "red light"
-            
-            Translation:
-            """
-            
-            english_text = self.call_bedrock(prompt, max_tokens=200)
-            return english_text.strip()
-            
-        except Exception as e:
-            logger.error(f"❗ Translation failed: {e}")
-            return user_input  # Fallback to original
 
 
     def _generate_clarification_question(self, unclear_response: str):
@@ -1069,21 +992,194 @@ class InteractiveTrafficAnalyzer:
             logger.error(f"Could not extract JSON from: {response_text}")
             return None
 
+    def _get_conversational_name(self, road_id) -> str:
+        """Get the first conversational identifier for a road"""
+        for road in self.roads_data.get("roads_metadata", []):
+            if str(road.get("road_id")) == str(road_id):
+                conv_ids = road.get("conversational_identifiers", [])
+                return conv_ids[0] if conv_ids else None
+        return None
+
+    def _find_most_likely_road(self, user_input: str) -> str:
+        """
+        Find the most likely road based on partial matching with user input.
+        Uses fuzzy matching against all road metadata.
+        """
+        user_lower = user_input.lower()
+        
+        # Score each road
+        road_scores = []
+        
+        for road in self.roads_data.get("roads_metadata", []):
+            road_id = str(road.get("road_id"))
+            score = 0
+            
+            # Check conversational identifiers
+            for identifier in road.get("conversational_identifiers", []):
+                if identifier.lower() in user_lower:
+                    score += len(identifier) * 2  # Higher weight for exact phrases
+                else:
+                    # Check word overlap
+                    identifier_words = set(identifier.lower().split())
+                    user_words = set(user_lower.split())
+                    overlap = len(identifier_words & user_words)
+                    score += overlap
+            
+            # Check user_likely_descriptions
+            for description in road.get("user_likely_descriptions", []):
+                if description.lower() in user_lower:
+                    score += len(description) * 3  # Highest weight
+                else:
+                    description_words = set(description.lower().split())
+                    user_words = set(user_lower.split())
+                    overlap = len(description_words & user_words)
+                    score += overlap * 1.5
+            
+            # Check narrative directional
+            narrative = road.get("narrative_directional", {})
+            comes_from = narrative.get("where_it_comes_from", "")
+            if comes_from and comes_from.lower() in user_lower:
+                score += len(comes_from) * 1.5
+            
+            if score > 0:
+                road_scores.append((road_id, score))
+        
+        # Return road with highest score
+        if road_scores:
+            road_scores.sort(key=lambda x: x[1], reverse=True)
+            best_road_id = road_scores[0][0]
+            best_score = road_scores[0][1]
+            logger.info(f"🎯 Best match: road_id={best_road_id}, score={best_score}")
+            return best_road_id
+        
+        return None
+
+
+    def _match_user_response_to_road_from_json(self, user_input: str) -> str:
+        """
+        Match user response directly to road using the metadata JSON.
+        No need for separate mapping - the JSON IS the mapping!
+        """
+        user_lower = user_input.lower()
+        
+        best_match_road_id = None
+        best_match_score = 0
+        
+        # Search through the metadata JSON
+        for road in self.roads_data.get("roads_metadata", []):
+            road_id = str(road.get("road_id"))
+            score = 0
+            
+            # Check conversational identifiers (what we showed the user)
+            conv_identifiers = road.get("conversational_identifiers", [])
+            for identifier in conv_identifiers:
+                identifier_lower = identifier.lower()
+                
+                # Exact substring match (highest score)
+                if identifier_lower in user_lower:
+                    score += len(identifier) * 10
+                    logger.info(f"✅ Matched conversational ID: '{identifier}' → road_id={road_id}")
+                else:
+                    # Word overlap scoring
+                    identifier_words = set(identifier_lower.split())
+                    user_words = set(user_lower.split())
+                    overlap = len(identifier_words & user_words)
+                    if overlap > 0:
+                        score += overlap * 5
+                        logger.info(f"📝 Partial match (conv): {overlap} words → road_id={road_id}")
+            
+            # Check user_likely_descriptions (common phrases users say)
+            user_descriptions = road.get("user_likely_descriptions", [])
+            for description in user_descriptions:
+                description_lower = description.lower()
+                
+                # Exact substring match
+                if description_lower in user_lower:
+                    score += len(description) * 15  # Even higher weight
+                    logger.info(f"✅ Matched user description: '{description}' → road_id={road_id}")
+                else:
+                    # Word overlap
+                    description_words = set(description_lower.split())
+                    user_words = set(user_lower.split())
+                    overlap = len(description_words & user_words)
+                    if overlap > 0:
+                        score += overlap * 7
+                        logger.info(f"📝 Partial match (desc): {overlap} words → road_id={road_id}")
+            
+            # Check narrative directional info
+            narrative = road.get("narrative_directional", {})
+            comes_from = narrative.get("where_it_comes_from", "")
+            if comes_from:
+                comes_from_lower = comes_from.lower()
+                
+                if comes_from_lower in user_lower:
+                    score += len(comes_from) * 8
+                    logger.info(f"✅ Matched narrative: '{comes_from}' → road_id={road_id}")
+                else:
+                    # Word overlap
+                    comes_words = set(comes_from_lower.split())
+                    user_words = set(user_lower.split())
+                    overlap = len(comes_words & user_words)
+                    if overlap > 0:
+                        score += overlap * 4
+                        logger.info(f"📝 Partial match (narrative): {overlap} words → road_id={road_id}")
+            
+            # Update best match if this road scored higher
+            if score > best_match_score:
+                best_match_road_id = road_id
+                best_match_score = score
+        
+        if best_match_road_id:
+            logger.info(f"✅ Final match: '{user_input}' → road_id={best_match_road_id} (score: {best_match_score})")
+            
+            # ✅ VALIDATE: Check if this road actually has lanes matching the direction
+            parsed_direction = self._parse_direction_from_natural_language(user_input)
+            if parsed_direction and parsed_direction != "unknown":
+                available_lanes = self._get_lanes_for_road(best_match_road_id)
+                dirset = self._dir8_from_user_origin(parsed_direction)
+                
+                matching_lanes = [l for l in available_lanes 
+                                if (l.get("direction") or "").lower() in dirset]
+                
+                if not matching_lanes:
+                    logger.warning(f"⚠️ Road {best_match_road_id} has no {parsed_direction} lanes!")
+                    logger.info(f"   Available lanes: {[l.get('direction') for l in available_lanes]}")
+                    
+                    # Try to find a better road with matching lanes
+                    for road in self.roads_data.get("roads_metadata", []):
+                        alt_road_id = str(road.get("road_id"))
+                        if alt_road_id == best_match_road_id:
+                            continue
+                        
+                        alt_lanes = self._get_lanes_for_road(alt_road_id)
+                        alt_matching = [l for l in alt_lanes 
+                                    if (l.get("direction") or "").lower() in dirset]
+                        
+                        if alt_matching:
+                            logger.info(f"✅ Found better road with {parsed_direction} lanes: {alt_road_id}")
+                            return alt_road_id
+            
+            return best_match_road_id
+        
+        logger.warning(f"⚠️ No match found for: '{user_input}'")
+        return None
+
+
     def update_user_path_from_response(self, user_input, current_state):
-        """FIXED: Handle confirmations and clarifications properly"""
+        """Use JSON metadata directly - no separate mapping needed"""
         
         if current_state == "approach_direction":
             # Store the raw user input
             self.user_path["origin_direction"] = user_input
             
-            # ✅ NEW: Parse direction IMMEDIATELY using LLM
+            # Parse direction
             parsed_direction = self._parse_direction_from_natural_language(user_input)
             if parsed_direction:
                 self.user_path["origin_direction"] = parsed_direction
                 logger.info(f"✅ Parsed direction: '{user_input}' → '{parsed_direction}'")
             
-            # Try to understand the road
-            road_id = self._understand_road_from_natural_response(user_input)
+            # ✅ FIXED: Match directly from JSON metadata
+            road_id = self._match_user_response_to_road_from_json(user_input)
             
             if road_id:
                 self._store_road_selection(road_id)
@@ -1093,98 +1189,6 @@ class InteractiveTrafficAnalyzer:
                 # Generate clarification
                 self._next_forced = self._generate_clarification_question(user_input)
                 return
-
-
-        elif current_state == "approach_direction_clarification":
-            # ✅ NEW: Handle confirmation responses
-            if self._is_confirmation(user_input):
-                # User is confirming a previously suggested road
-                suggested_road_id = self._get_last_suggested_road_id()
-                if suggested_road_id:
-                    self._store_road_selection(suggested_road_id)
-                    logger.info(f"✅ Road confirmed: {suggested_road_id}")
-                    return  # Success, continue to next question
-            
-            # Try to understand the clarification response
-            road_id = self._understand_road_from_natural_response(user_input)
-            
-            if road_id:
-                self._store_road_selection(road_id)
-                logger.info(f"✅ Road clarified: {road_id}")
-                return
-            else:
-                # Still unclear, try one more time
-                self._next_forced = self._generate_final_clarification(user_input)
-                return
-                
-        # Handle other conversation states...
-        elif current_state == "intended_action":
-            self.user_path["intended_maneuver"] = user_input
-            self.extract_destination_from_action(user_input)
-
-        # --- Road selection micro-state ---
-        elif current_state == "choose_origin_road":
-            idx = _as_int(user_input)
-            choice = None
-            
-            if idx and hasattr(self, "_pending_origin_road_choices"):
-                choice = next((c for c in self._pending_origin_road_choices if c["idx"] == idx), None)
-
-            if choice:
-                self.user_path["origin_road_id"] = choice["road_id"]
-                self.user_path["origin_road_display"] = choice["alias"]
-                logger.info(f"✅ User selected road: '{choice['alias']}' (ID: {choice['road_id']})")
-
-                # Go directly to confirmation (no lane selection)
-                q = self._confirmation_question()
-                if q:
-                    self._next_forced = q
-                    return
-            else:
-                # Re-ask road selection
-                q = self._propose_origin_roads_question()
-                if q:
-                    q["message"] = f"I didn't understand '{user_input}'. Please choose a number from the options:\n\n" + q["message"].split('\n\n', 1)[1]
-                    self._next_forced = q
-                    return
-
-        elif current_state == "confirm_summary":
-            yn = (user_input or "").strip().lower()
-            if yn in ("yes", "y", "ok", "correct", "right"):
-                return  # Confirmed - continue to next scripted question
-            else:
-                # Restart road selection
-                q = self._propose_origin_roads_question()
-                if q:
-                    self._next_forced = q
-                    return
-
-        # --- Regular scripted states (no changes) ---
-        elif current_state == "lane_position":
-            self.user_path["approach_lane"] = self.standardize_lane(user_input)
-
-        elif current_state == "traffic_signal":
-            self.user_path["traffic_conditions"]["signal_state"] = user_input
-
-        elif current_state == "other_vehicle_position":
-            ov = self.user_path.setdefault("other_vehicle", {})
-            ov["position"] = user_input
-            
-            # ✅ NEW: Parse the natural language response
-            self._parse_other_vehicle_position(user_input)
-            
-        elif current_state == "other_vehicle_action":
-            ov = self.user_path.setdefault("other_vehicle", {})
-            ov["action"] = user_input
-
-        elif current_state == "collision_point":
-            self.user_path["collision_point"] = user_input
-
-        elif current_state == "accident_time":
-            self.user_path["accident_time"] = user_input
-
-        else:
-            logger.warning(f"Unrecognized conversation_state '{current_state}', continuing.")
 
 
     def _parse_direction_from_natural_language(self, user_input: str) -> str:
@@ -1270,33 +1274,30 @@ class InteractiveTrafficAnalyzer:
 
 
     def generate_completion_summary(self):
-        """Generate final summary in user's language, store data in English"""
-        logger.info("🏁 Generating completion summary")
+        """Generate final summary and create route JSON - FIXED to use normalized datetime"""
+        logger.info("🏁 Generating completion summary and route JSON")
         
-        # ✅ Get datetime (already normalized to English format)
+        # ✅ NEW: Get normalized datetime (priority)
         accident_datetime = getattr(self, 'normalized_datetime', None)
+        
         if not accident_datetime or accident_datetime == 'unknown':
-            accident_datetime = self.responses_english.get('accident_time', 'unknown')
+            # Fallback to responses
+            accident_datetime = self.responses.get('accident_time', 'unknown')
         
-        # ✅ Create route JSON using ENGLISH data
-        route_json = self.create_route_json()
+        logger.info(f"📅 Using datetime for summary: {accident_datetime}")
         
-        # ✅ Generate summary in user's language (for display only)
+        # Generate analysis summary with EXPLICIT datetime instruction
         summary_prompt = f"""
-        You are a professional accident investigator.
-        
-        USER'S LANGUAGE: {self.user_language}
-        RESPOND ONLY IN {self.user_language}.
-        
         Generate a professional accident reconstruction summary based on these responses:
         
-        Date/Time: {accident_datetime}
+        CRITICAL: Use this EXACT date/time in your summary: {accident_datetime}
+        DO NOT use relative terms like "yesterday" or "today". Use the exact date/time provided above.
         
         LOCATION INFRASTRUCTURE:
         {self.scene_understanding}
         
-        INVESTIGATION RESULTS (English - translate context as needed):
-        {json.dumps(self.responses_english, indent=2)}
+        INVESTIGATION RESULTS:
+        {json.dumps(self.responses, indent=2)}
         
         USER PATH RECONSTRUCTION:
         {json.dumps(self.user_path, indent=2)}
@@ -1307,40 +1308,35 @@ class InteractiveTrafficAnalyzer:
         3. Timeline of events leading to collision
         4. Traffic control analysis
         
+        IMPORTANT: In the summary header, write:
+        **Date/Time:** {accident_datetime}
+        
         Write as a professional accident reconstruction report.
-        CRITICAL: Write the entire report in {self.user_language}.
         """
         
-        # ✅ Summary in user's language (for display)
         final_summary = self.call_bedrock(summary_prompt, max_tokens=1000)
         
-        # ✅ ALSO create English summary (for storage)
-        english_summary_prompt = f"""
-        Generate a professional accident reconstruction summary in ENGLISH.
+        # ✅ CREATE ROUTE JSON
+        route_json = self.create_route_json()
         
-        {json.dumps(self.responses_english, indent=2)}
-        {json.dumps(self.user_path, indent=2)}
+        # ✅ SAVE TO DYNAMODB
+        self.save_to_dynamodb(route_json, final_summary)
         
-        Brief professional summary in English only.
-        """
-        
-        english_summary = self.call_bedrock(english_summary_prompt, max_tokens=1000)
-        
-        # ✅ Save BOTH versions
-        self.save_to_dynamodb(route_json, english_summary)  # English for DB
+        # Save animation data
         self.save_animation_data(route_json)
+
+        # 🎬 Trigger SVG animation generation
         self.trigger_svg_generation(route_json)
         
-        # ✅ Return user's language version for display
         return {
             "statusCode": 200,
-            "message": f"{final_summary}\n\n✅ **Investigation Complete!**",
+            "message": f"Thank you for providing all the details. Here's my analysis:\n\n{final_summary}\n\n✅ **Investigation Complete!** I've created a detailed route reconstruction and saved all the information for your claim processing.",
             "conversation_state": "investigation_complete",
             "animation_ready": True,
             "route_data": route_json,
-            "final_analysis": final_summary,  # Display version
-            "final_analysis_english": english_summary  # Storage version
+            "final_analysis": final_summary
         }
+
 
     def standardize_direction(self, direction_input):
         """Convert any direction input to standard format"""
@@ -1458,7 +1454,6 @@ class InteractiveTrafficAnalyzer:
                 "accident_id": self.connection_id,
                 "created_timestamp": datetime.now().isoformat(),
                 "schema_version": "1.0",
-                "user_language": self.user_language,  # Store for display purposes
                 "data_completeness": self.calculate_data_completeness()
             },
             
@@ -1600,8 +1595,6 @@ class InteractiveTrafficAnalyzer:
             },
             
             "analysis": {
-                "investigation_responses": self.responses_english,  # ✅ English version
-                "user_language_responses": self.responses,  # Keep for reference
                 "investigation_responses": self.responses,
                 "data_quality": {
                     "completeness_score": self.calculate_completeness_score(),
@@ -1712,7 +1705,7 @@ class InteractiveTrafficAnalyzer:
             "intersection_boundaries": {}
         }
 
-    def save_to_dynamodb(self, route_json, final_summary_english):
+    def save_to_dynamodb(self, route_json, final_summary):
         """Save route data and analysis to DynamoDB"""
         try:
             logger.info(f"💾 Saving route data to DynamoDB for {self.connection_id}")
@@ -1730,10 +1723,9 @@ class InteractiveTrafficAnalyzer:
                 "connection_id": self.connection_id,
                 "route_analysis": {
                     "route_s3_key": f"animation-data/{self.connection_id}/complete_route_data.json",
-                    "final_summary": final_summary_english,
+                    "final_summary": final_summary,
                     "investigation_complete": True,
                     "completed_at": datetime.now().isoformat(),
-                    "user_language": self.user_language
                 }                
             }
             
@@ -2768,12 +2760,9 @@ class InteractiveTrafficAnalyzer:
             for lane in lanes_list[:2]:  # Show first 2 lanes per road
                 logger.info(f"🔍 DEBUG:   - {lane.get('lane_id')}")
         
-        # 🔍 DEBUG: Check if road 4 has any lanes
-        if 4 in by_road:
-            logger.info(f"✅ DEBUG: Road 4 has {len(by_road[4])} lanes")
-        else:
-            logger.warning(f"❌ DEBUG: Road 4 NOT FOUND in lane index!")
-            logger.info(f"🔍 DEBUG: Available road IDs: {list(by_road.keys())}")
+        # Debug: Show all available roads
+        logger.info(f"🔍 DEBUG: Available road IDs: {list(by_road.keys())}")
+        logger.info(f"🔍 DEBUG: Total roads in index: {len(by_road)}")
         
         return by_lane_id, by_road, by_name_dir
 
@@ -2864,8 +2853,6 @@ class InteractiveTrafficAnalyzer:
     def _propose_origin_roads_question(self):
         origin_dir = self.user_path.get("origin_direction")
         dirset = self._dir8_from_user_origin(self.standardize_direction(origin_dir))
-
-        candidates = []  # ✅ Add this
         
         logger.info(f"🧭 User said: '{origin_dir}'")
         logger.info(f"🧭 Standardized: '{self.standardize_direction(origin_dir)}'")
@@ -2873,7 +2860,6 @@ class InteractiveTrafficAnalyzer:
         
         # Debug: Show all available lanes
         for rid, lanes in self.lanes_by_road.items():
-            matching_lanes = [] 
             for lane in lanes:
                 lane_dir = (lane.get("direction") or lane.get("metadata", {}).get("dir8") or "").lower()
                 logger.info(f"🛣️ Road {rid} has lane with direction: '{lane_dir}'")
@@ -3160,10 +3146,6 @@ def handle_initial_analysis(connection_id, bucket_name, event):
         
         # Get collected data from the event
         collected_data = event.get('collected_data', {})
-        #  
-        user_language = event.get('user_language', 'en')
-        logger.info(f"🌐 User language: {user_language}")
-
         logger.info(f"📥 Analytics received collected_data: {collected_data}")
         
         # ✅ NEW: Extract normalized datetime if available
@@ -3176,7 +3158,7 @@ def handle_initial_analysis(connection_id, bucket_name, event):
         logger.info(f"📁 Loaded {len(infrastructure_data)} infrastructure files")
         
         # Create analyzer
-        analyzer = InteractiveTrafficAnalyzer(connection_id, bucket_name, infrastructure_data, user_language=user_language)
+        analyzer = InteractiveTrafficAnalyzer(connection_id, bucket_name, infrastructure_data)
         
         # FIXED: Pass the collected data to the analyzer and pre-populate responses
         analyzer.existing_collected_data = collected_data
@@ -3294,11 +3276,10 @@ def save_analyzer_state(connection_id, bucket_name, analyzer):
     state_data = {
         "user_path": analyzer.user_path,
         "scene_understanding": analyzer.scene_understanding,
+        "conversation_state": analyzer.investigation_steps[analyzer.current_step] if analyzer.current_step < len(analyzer.investigation_steps) else "complete",
         "current_step": analyzer.current_step,
-        "responses": analyzer.responses,  # User's language (for context)
-        "responses_english": analyzer.responses_english,  # ✅ English (for storage)
-        "user_language": analyzer.user_language,
-        "normalized_datetime": getattr(analyzer, 'normalized_datetime', None),
+        "responses": analyzer.responses,
+        "normalized_datetime": getattr(analyzer, 'normalized_datetime', None),  # ✅ NEW
         "timestamp": datetime.now().isoformat()
     }
     
@@ -3323,12 +3304,11 @@ def load_analyzer_state(connection_id, bucket_name):
         infrastructure_data = load_infrastructure_data(connection_id, bucket_name)
         
         # Recreate analyzer with saved state
-        analyzer = InteractiveTrafficAnalyzer(connection_id, bucket_name, infrastructure_data, user_language=state_data.get("user_language", "en") )
+        analyzer = InteractiveTrafficAnalyzer(connection_id, bucket_name, infrastructure_data)
         analyzer.user_path = state_data["user_path"]
         analyzer.scene_understanding = state_data["scene_understanding"]
         analyzer.current_step = state_data["current_step"]
         analyzer.responses = state_data.get("responses", {})
-        analyzer.responses_english = state_data.get("responses_english", {})  # ✅ Restore
         analyzer.normalized_datetime = state_data.get("normalized_datetime")  # ✅ NEW
         
         return analyzer

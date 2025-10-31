@@ -72,8 +72,8 @@ manifest_hash = ""
 packagetype = "Zip"
 functions = ["CheckSvgProcessingFunction"]
 
-[function_build_definitions.feb033c5-20e6-41ae-b5fa-c889c830f8a7]
-codeuri = "/home/tokiomarine/trials/sam-app/sam-app/check_report_processing "
+[function_build_definitions.5b416aee-c8e0-4882-b845-960a19b932fd]
+codeuri = "/home/tokiomarine/trials/sam-app/sam-app/check_report_processing"
 runtime = "python3.11"
 architecture = "x86_64"
 handler = "lambda_handler.lambda_handler"

@@ -1853,6 +1853,8 @@ class IntegratedRoadNetworkGenerator:
 
         Look at the MAP IMAGES and create descriptions that help match user language to specific roads/intersections.
 
+        Roads are BIDIRECTIONAL, so consider both directions expressed precisely in conversational_identifiers and user_likely_descriptions. Like "I'm from northwest to the intersection" and "I'm heading to northwest from the intersection" is mentioning the same road.
+
         Return EXACTLY this JSON structure:
 
         {{
@@ -1861,15 +1863,16 @@ class IntegratedRoadNetworkGenerator:
             "road_index": 0,
             "road_id": "road_0_0",
             "conversational_identifiers": [
-                "the main road going upward",
-                "the wide street toward the north", 
-                "the primary route heading up"
+                "the main road going northwest/upperleft from the collision point(intersection)",
+                "the main road going from northwest/upperleft to the collision point(intersection)",
+                "the wide street toward the northwest/upperleft from the collision point(intersection)",
+                "the wide street from the northwest/upperleft to the collision point(intersection)"
             ],
             "user_likely_descriptions": [
-                "I came from the main road",
-                "I was on the wide street going up",
-                "the road that goes toward the top",
-                "the north-bound road"
+                "I came down the main road from northwest/upperleft to the collision point(intersection)",
+                "I was heading up the main road toward northwest/upperleft from the collision point(intersection)",
+                "that wide street going northwest/upperleft from the collision point(intersection)",
+                "that wide street coming from northwest/upperleft to the collision point(intersection)"
             ],
             "visual_characteristics": {{
                 "width_description": "wide main road",

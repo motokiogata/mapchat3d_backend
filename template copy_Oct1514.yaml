@@ -25,7 +25,6 @@ Parameters:
     Description: ECR image tag for deployments
 
 Resources:
-  # Warmup for SVG Animation Generator
   ProcessRoadmapFunction:
     Type: AWS::Serverless::Function
     Description: Lambda function to process the roadmap
@@ -239,7 +238,7 @@ Resources:
                   - "arn:aws:bedrock:ap-*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0"
 
 
-  # S3 Bucket for storing CSV files
+  # S3 Bucket for storing CSV filesAnalyticsFunction:
   CsvFilesBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -374,7 +373,7 @@ Resources:
     Properties:
       FunctionName: !Sub "${AWS::StackName}-check-report-ready"
       Handler: lambda_handler.lambda_handler
-      CodeUri: check_report_processing/
+      CodeUri: check_report_processing /
       Runtime: python3.11
       Timeout: 10
       MemorySize: 128

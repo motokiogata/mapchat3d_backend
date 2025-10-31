@@ -16,6 +16,8 @@ from typing import Dict, List, Optional, Any
 
 LANG_CODES = {"EN","JA","ES","KO","ZH"}
 
+NATURAL_TRANSLATION_INSTRUCTION = "Please translate naturally and idiomatically - avoid word-for-word translation and be conversational and culturally appropriate."
+
 
 def detect_language_via_llm(user_text: str) -> str:
     """
@@ -374,7 +376,7 @@ class TaskOrchestrator:
         return {
             "action": "claude_response",
             "instruction": (
-                f"Reply only in {lang}. "
+                f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                 "Politely inform the user that their claim has been completed and submitted. "
                 "If they have questions or need to make changes, they should contact support."
             ),
@@ -405,7 +407,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     f"Ask this specific question to determine legal liability factors: "
                     f"'{current_question}' "
                     "Be empathetic and explain that this helps determine accurate fault ratios."
@@ -421,7 +423,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Thank the user for providing detailed information and explain that "
                     "you're now calculating the final fault ratio and preparing their claim summary."
                 ),
@@ -513,7 +515,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Say this to the user, concisely, in 1–2 short sentences:\n"
                     "Thanks—I've received your pinned location. I'm analyzing the map in the background now. "
                     "Let me start with the first question: What date and time did the accident occur?"
@@ -529,7 +531,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Say this to the user, concisely, in 1–2 short sentences:\n"
                     "“No problem—let’s continue while the map is processing. First, what date and time did the accident occur?”"
                 ),
@@ -540,7 +542,7 @@ class TaskOrchestrator:
         return {
             "action": "claude_response",
             "instruction": (
-                f"Reply only in {lang}. "
+                f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                 "Tell the user, in one short sentence: "
                 "“Please use the map UI to drop a pin on the exact accident location, then press the button below the map.”"
             ),
@@ -588,7 +590,7 @@ class TaskOrchestrator:
                         return {
                             "action": "claude_response",
                             "instruction": (
-                                f"Reply only in {lang}. "
+                                f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                                 f"The user said '{user_input}' but we need more specific timing information. "
                                 f"Ask this follow-up question in a friendly way: '{follow_up}' "
                                 "Explain that specific timing helps with accurate claim processing."
@@ -606,7 +608,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Ask the user this question in a friendly, empathetic way: "
                     "'What date and time did the accident occur? Please be as specific as possible - "
                     "for example, \"January 15th around 3 PM\" or \"yesterday at 2:30 PM\".'"
@@ -618,7 +620,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Ask the user this question in a friendly, empathetic way: "
                     "'Could you describe what happened during the accident?'"
                 ),
@@ -631,7 +633,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Tell the user, concisely: "
                     "'Perfect! I have all the basic information. Now I'll analyze the location details and ask some specific questions based on the road layout.'"
                 ),
@@ -677,7 +679,7 @@ class TaskOrchestrator:
                     return {
                         "action": "claude_response",
                         "instruction": (
-                            f"Reply only in {lang}. "
+                            f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                             f"The user provided '{user_input}' but we need more specific timing. "
                             f"Ask: '{follow_up}'"
                         ),
@@ -693,7 +695,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Ask: 'What date and time did the accident occur? Please be as specific as possible - "
                     "even approximate times like \"around 3 PM yesterday\" are helpful.'"
                 ),
@@ -703,7 +705,7 @@ class TaskOrchestrator:
             return {
                 "action": "claude_response",
                 "instruction": (
-                    f"Reply only in {lang}. "
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
                     "Ask: 'Could you describe what happened during the accident?'"
                 ),
                 "progress": "Gathering basic information (Step 3/6) - Question 2/2"
@@ -1461,6 +1463,9 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
         orchestrator = orchestrators[connection_id]
         orchestrator_data = orchestrator.state.collected_data
         
+        # ✅ ADD: Get user's language
+        user_language = orchestrator.state.user_language or "en"
+
         # FIXED: Comprehensive data mapping with debugging
         collected_data = {}
         
@@ -1511,7 +1516,8 @@ def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], 
                 'connection_id': connection_id,
                 'bucket_name': BUCKET,
                 'message_type': 'initial_analysis',
-                'collected_data': collected_data  # ✅ Now includes normalized_datetime
+                'collected_data': collected_data,  # ✅ Now includes normalized_datetime
+                'user_language': user_language  # ✅ NEW
             })
         )
         
@@ -1570,6 +1576,9 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
         
         # ✅ NEW: Get normalized datetime from orchestrator
         orchestrator = orchestrators.get(connection_id)
+        
+        user_language = orchestrator.state.user_language if orchestrator else "en"
+        
         normalized_datetime = None
         if orchestrator and orchestrator.state.collected_data:
             normalized_datetime = orchestrator.state.collected_data.get("normalized_datetime")
@@ -1580,7 +1589,8 @@ def handle_interactive_investigation(connection_id: str, action: Dict[str, Any],
             'bucket_name': BUCKET,
             'message_type': 'user_response',
             'user_input': processed_input,
-            'conversation_state': current_conversation_state
+            'conversation_state': current_conversation_state,
+            'user_language': user_language  # ✅ NEW
         }
         
         # ✅ NEW: Add normalized datetime if available
@@ -1699,9 +1709,11 @@ def handle_similarity_search(connection_id: str, action: Dict[str, Any], apig) -
                 logger.info(f"🔍 Found {len(modifiers)} unique modifiers: {modifiers}")
                 
                 if modifiers:
-                    mod_questions = generate_modifier_questions(modifiers)
+                    logger.info(f"🔍 Found {len(modifiers)} unique modifiers for {connection_id}")
+                    mod_questions = generate_modifier_questions(modifiers, connection_id)
                     
                     if mod_questions:
+                        logger.info(f"✅ Generated {len(mod_questions)} modifier questions:")
                         orchestrators[connection_id].state.modifier_questions = mod_questions
                         orchestrators[connection_id].state.current_modifier_index = 0
                         orchestrators[connection_id].state.phase = ConversationPhase.LEGAL_MODIFIER_INVESTIGATION
