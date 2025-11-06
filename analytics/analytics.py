@@ -13,6 +13,7 @@ logger.setLevel(logging.INFO)
 s3 = boto3.client('s3')
 bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
 dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))
+NATURAL_TRANSLATION_INSTRUCTION = "Please translate naturally and idiomatically - avoid word-for-word translation and be conversational and culturally appropriate."
 ecs_client = boto3.client('ecs', region_name=os.environ.get("AWS_REGION", "ap-northeast-1"))  # ADD THIS LINE
 table = dynamodb.Table("AccidentDataTable")
 
@@ -457,24 +458,24 @@ class InteractiveTrafficAnalyzer:
 
 
     def generate_direction_question(self):
-        """Generate direction question using ALL conversational identifiers"""
+        """Generate direction question using ONE identifier per road"""
         
-        # ✅ FIXED: Collect ALL conversational identifiers from ALL roads
-        all_conversational_options = []
+        # ✅ FIXED: Use only PRIMARY conversational identifier per road
+        unique_road_options = []
         
         for road in self.roads_data.get("roads_metadata", []):
             road_id = road.get("road_id")
             conv_identifiers = road.get("conversational_identifiers", [])
             
-            # Add all conversational identifiers for this road
-            for identifier in conv_identifiers:
-                all_conversational_options.append({
+            # Use only the FIRST (primary) identifier for each road
+            if conv_identifiers:
+                unique_road_options.append({
                     "road_id": road_id,
-                    "identifier": identifier
+                    "identifier": conv_identifiers[0]  # ✅ Only use first/primary identifier
                 })
         
-        # Create natural options text using the ACTUAL conversational identifiers
-        identifier_texts = [opt["identifier"] for opt in all_conversational_options]
+        # Create natural options text using UNIQUE identifiers only
+        identifier_texts = [opt["identifier"] for opt in unique_road_options]
         
         if len(identifier_texts) > 2:
             options_text = ", ".join(identifier_texts[:-1]) + f", or {identifier_texts[-1]}"
@@ -514,7 +515,7 @@ class InteractiveTrafficAnalyzer:
     def generate_action_question(self):
         """Generate action question using roads/intersection JSON data"""
         prompt = f"""
-        Reply only in {self.user_language}.
+        Reply only in {self.user_language}.{NATURAL_TRANSLATION_INSTRUCTION}
 
         Based on this intersection data and the user's previous response, ask about their intended action:
         
@@ -545,7 +546,7 @@ class InteractiveTrafficAnalyzer:
         """Generate lane question using roads JSON data"""
         prompt = f"""
 
-        Reply only in {self.user_language}.
+        Reply only in {self.user_language}. {NATURAL_TRANSLATION_INSTRUCTION}
 
         Based on this road infrastructure data and previous responses, ask about which lane they were in:
         
@@ -574,7 +575,7 @@ class InteractiveTrafficAnalyzer:
         """Generate traffic signal question using intersections JSON data"""
         prompt = f"""
         
-        Reply only in {self.user_language}.
+        Reply only in {self.user_language}. {NATURAL_TRANSLATION_INSTRUCTION}
 
         Based on this intersection data, ask about traffic signals or controls:
         
@@ -601,7 +602,7 @@ class InteractiveTrafficAnalyzer:
         """Generate other vehicle question with DISAMBIGUATION"""
         prompt = f"""
 
-        Reply only in {self.user_language}.
+        Reply only in {self.user_language}. {NATURAL_TRANSLATION_INSTRUCTION}
         
         Based on the intersection layout and user's path so far, ask about the other vehicle.
         
@@ -661,7 +662,7 @@ class InteractiveTrafficAnalyzer:
         """Generate collision point question using intersection data"""
         prompt = f"""
 
-        Reply only in {self.user_language}.
+        Reply only in {self.user_language}. {NATURAL_TRANSLATION_INSTRUCTION}
 
         Based on the intersection layout and both vehicles' paths, ask about collision point:
         
@@ -1286,7 +1287,7 @@ class InteractiveTrafficAnalyzer:
         You are a professional accident investigator.
         
         USER'S LANGUAGE: {self.user_language}
-        RESPOND ONLY IN {self.user_language}.
+        RESPOND ONLY IN {self.user_language}. {NATURAL_TRANSLATION_INSTRUCTION}
         
         Generate a professional accident reconstruction summary based on these responses:
         
@@ -1308,7 +1309,7 @@ class InteractiveTrafficAnalyzer:
         4. Traffic control analysis
         
         Write as a professional accident reconstruction report.
-        CRITICAL: Write the entire report in {self.user_language}.
+        CRITICAL: Write the entire report in {self.user_language} using natural, professional language.
         """
         
         # ✅ Summary in user's language (for display)
@@ -3081,27 +3082,73 @@ class InteractiveTrafficAnalyzer:
 
 
     def trigger_svg_generation(self, route_json):
-        """Trigger enhanced SVG animation generation"""
+        """Trigger enhanced SVG animation generation using hot standby service"""
         try:
             cluster_name = os.environ.get('CLUSTER_NAME')
-            svg_task_def = os.environ.get('SVG_TASK_DEF')  # now expected to be "svg-animation-generator"
+            service_name = os.environ.get('SVG_SERVICE_NAME')  # NEW: Service name
+            task_def_name = os.environ.get('SVG_TASK_DEF', 'svg-animation-generator')
             subnet_id = os.environ.get('SUBNET_ID')
             security_group = os.environ.get('SECURITY_GROUP')
 
-            if not all([cluster_name, svg_task_def, subnet_id, security_group]):
-                logger.warning("⚠️ Missing ECS environment variables, skipping SVG generation")
+            if not cluster_name:
+                logger.warning("⚠️ Missing CLUSTER_NAME, skipping SVG generation")
                 return
 
-            # Family-based resolution logging
-            if ":" not in str(svg_task_def):
-                logger.info(f"🧭 Using family-only taskDefinition (LATEST will be resolved): {svg_task_def}")
-            else:
-                logger.warning(f"⚠️ SVG_TASK_DEF looks pinned to a revision/ARN: {svg_task_def}. "
-                            f"Use family name (e.g., 'svg-animation-generator') to always pick LATEST.")
+            # Try to use hot standby service first
+            if service_name and self._try_service_generation(cluster_name, service_name, route_json):
+                logger.info(f"✅ Used hot standby service: {service_name}")
+                return
+                
+            # Fallback to original run_task method
+            logger.info("⏱️ Falling back to run_task method")
+            self._run_task_generation(cluster_name, task_def_name, subnet_id, security_group, route_json)
 
+        except Exception as e:
+            logger.error(f"❗ Failed to trigger enhanced SVG generation: {e}")
+
+    def _try_service_generation(self, cluster_name, service_name, route_json):
+        """Try to use running service containers"""
+        try:
+            # Check if service has running containers
+            if not check_service_availability(cluster_name, service_name):
+                logger.warning(f"⚠️ Service {service_name} not available")
+                return False
+            
+            # Queue work for the service
+            work_data = {
+                "route_json": route_json,
+                "mode": "CLEAN_ANALYTICS",
+                "llm_data_key": f"animation-data/{self.connection_id}/llm_ready_data.json"
+            }
+            
+            success = queue_work_for_service(
+                self.connection_id, 
+                self.bucket_name, 
+                "svg_generation", 
+                work_data
+            )
+            
+            if success:
+                # Optionally scale up service to handle the work faster
+                scale_service_if_needed(cluster_name, service_name, min_desired=1)
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"❗ Service generation attempt failed: {e}")
+            return False
+
+    def _run_task_generation(self, cluster_name, task_def_name, subnet_id, security_group, route_json):
+        """Original run_task method as fallback"""
+        try:
+            if not all([subnet_id, security_group]):
+                logger.warning("⚠️ Missing network configuration for run_task")
+                return
+                
             response = ecs_client.run_task(
                 cluster=cluster_name,
-                taskDefinition=svg_task_def,  # now safe to pass family name
+                taskDefinition=task_def_name,
                 launchType='FARGATE',
                 networkConfiguration={
                     'awsvpcConfiguration': {
@@ -3118,19 +3165,20 @@ class InteractiveTrafficAnalyzer:
                                 {'name': 'CONNECTION_ID', 'value': self.connection_id},
                                 {'name': 'BUCKET_NAME', 'value': self.bucket_name},
                                 {'name': 'MODE', 'value': 'CLEAN_ANALYTICS'},
-                                {'name': 'LLM_DATA_KEY', 'value': f"animation-data/{self.connection_id}/llm_ready_data.json"}
+                                {'name': 'LLM_DATA_KEY', 'value': f"animation-data/{self.connection_id}/llm_ready_data.json"},
+                                {'name': 'RUN_MODE', 'value': 'TASK'}  # NEW: Force task mode
                             ]
                         }
                     ]
                 }
             )
-
-            task = response['tasks'][0]
-            logger.info(f"🎬 run_task OK | taskArn={task['taskArn']} taskDefinitionArn={task.get('taskDefinitionArn')}")
-
-        except Exception as e:
-            logger.error(f"❗ Failed to trigger enhanced SVG generation: {e}")
             
+            task = response['tasks'][0]
+            logger.info(f"🎬 Started fallback task: {task['taskArn']}")
+            
+        except Exception as e:
+            logger.error(f"❗ Fallback run_task failed: {e}")
+
 
 def lambda_handler(event, context):
     """Main handler - supports both initial analysis and interactive conversation"""
@@ -3336,3 +3384,90 @@ def load_analyzer_state(connection_id, bucket_name):
     except Exception as e:
         logger.error(f"❗ Failed to load analyzer state: {e}")
         raise
+
+# ---------- ECS Service Management Utilities ----------
+def check_service_availability(cluster_name, service_name):
+    """Check if ECS service has running containers"""
+    try:
+        response = ecs_client.describe_services(
+            cluster=cluster_name,
+            services=[service_name]
+        )
+        
+        if not response['services']:
+            logger.warning(f"⚠️ Service {service_name} not found")
+            return False
+            
+        service = response['services'][0]
+        running_count = service['runningCount']
+        
+        logger.info(f"🔍 Service {service_name}: {running_count} running containers")
+        return running_count &gt; 0
+        
+    except Exception as e:
+        logger.error(f"❗ Error checking service availability: {e}")
+        return False
+
+# ---------- Work Queue Utilities ----------
+def queue_work_for_service(connection_id, bucket_name, work_type, work_data):
+    """Queue work item for service containers to pick up"""
+    try:
+        work_item = {
+            "connection_id": connection_id,
+            "work_type": work_type,
+            "work_data": work_data,
+            "created_at": datetime.now().isoformat(),
+            "status": "pending"
+        }
+        
+        # Put work item in S3 queue location
+        work_key = f"work-queue/{work_type}/{connection_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=work_key,
+            Body=json.dumps(work_item, indent=2),
+            ContentType='application/json'
+        )
+        
+        logger.info(f"📝 Queued work item: {work_key}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❗ Failed to queue work: {e}")
+        return False
+
+# ---------- ECS Service Scaling Utilities ----------
+def scale_service_if_needed(cluster_name, service_name, min_desired=1):
+    """Scale up service if it has no running containers"""
+    try:
+        response = ecs_client.describe_services(
+            cluster=cluster_name,
+            services=[service_name]
+        )
+        
+        if not response['services']:
+            logger.warning(f"⚠️ Service {service_name} not found for scaling")
+            return False
+            
+        service = response['services'][0]
+        current_desired = service['desiredCount']
+        current_running = service['runningCount']
+        
+        if current_running < min_desired:
+            # Scale up the service
+            new_desired = max(current_desired + 1, min_desired)
+            
+            ecs_client.update_service(
+                cluster=cluster_name,
+                service=service_name,
+                desiredCount=new_desired
+            )
+            
+            logger.info(f"🔥 Scaled service {service_name}: {current_desired} → {new_desired}")
+            return True
+        
+        return True  # Already has enough containers
+        
+    except Exception as e:
+        logger.error(f"❗ Failed to scale service: {e}")
+        return False

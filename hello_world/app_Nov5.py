@@ -304,8 +304,7 @@ class TaskState:
     datetime_attempts: int = 0  # NEW: Track datetime specificity attempts
     datetime_validation_state: str = "initial"  # NEW: Track validation state
     last_processed_input: str = None  # ✅ Add this field
-    waiting_for_user: bool = False
-    queued_system_events: list[str] = field(default_factory=list)
+
     
     def __post_init__(self):
         if self.collected_data is None:
@@ -550,34 +549,41 @@ class TaskOrchestrator:
             "progress": "Waiting for location (Step 1/6)"
         }
 
-    #Fix 3: Ensure parallel info gathering advances correctly
+
     def _handle_parallel_info_gathering(self, user_input: str) -> Dict[str, Any]:
-        """FIXED: Preserve datetime validation with proper phase advancement"""
+        """FIXED: Preserve datetime validation with proper degradation"""
         lang = (self.state.user_language or "en").upper()
         
         # Store user input if provided
         if user_input and user_input.strip():
+            # Determine which question this answers
             if not self.state.questions_asked["datetime"]:
+                # ✅ PRESERVED: Validate datetime specificity AND get normalized datetime
                 validation = validate_datetime_specificity(user_input)
                 
                 if validation["is_specific"]:
-                    self.state.collected_data["datetime"] = user_input
+                    # Store BOTH raw input and normalized datetime
+                    self.state.collected_data["datetime"] = user_input  # Raw input
                     self.state.collected_data["normalized_datetime"] = validation["normalized_datetime"]
                     self.state.questions_asked["datetime"] = True
                     self.state.datetime_validation_state = "completed"
                     logger.info(f"✅ Accepted datetime: '{user_input}' -> normalized: '{validation['normalized_datetime']}'")
                 else:
+                    # ✅ PRESERVED: Not specific enough, ask for more details
                     self.state.datetime_attempts += 1
                     self.state.datetime_validation_state = "needs_clarification"
                     
                     if self.state.datetime_attempts >= 3:
+                        # ✅ PRESERVED: After 3 attempts, accept and try to normalize what we have
                         logger.info(f"⚠️ Accepting datetime after 3 attempts: {user_input}")
                         self.state.collected_data["datetime"] = user_input
+                        # Try to get normalized version even if not perfect
                         normalized = validation.get("normalized_datetime", "unknown")
                         self.state.collected_data["normalized_datetime"] = normalized
                         self.state.questions_asked["datetime"] = True
                         self.state.datetime_validation_state = "completed"
                     else:
+                        # ✅ PRESERVED: Ask for more specific information
                         follow_up = validation["follow_up_question"]
                         self.state.awaiting_user_input_for = "datetime_clarification"
                         
@@ -621,17 +627,19 @@ class TaskOrchestrator:
                 "progress": "Gathering information (Step 2/6) - Question 2/2"
             }
         else:
-            # ✅ RESTORED: All questions answered, automatically trigger analytics
-            logger.info(f"✅ Parallel info gathering complete for {self.connection_id}")
+            # All questions answered, move to next phase
             self.state.phase = ConversationPhase.ANALYTICS_PROCESSING
             self.state.awaiting_user_input_for = None
-            
-            # ✅ RESTORED: Return action to trigger analytics processing
             return {
-                "action": "trigger_analytics",  # Changed from claude_response to trigger_analytics
-                "message": "Perfect! I have all the basic information. Now I'll analyze the location details and ask some specific questions based on the road layout.",
+                "action": "claude_response",
+                "instruction": (
+                    f"Reply only in {lang}. {NATURAL_TRANSLATION_INSTRUCTION} "
+                    "Tell the user, concisely: "
+                    "'Perfect! I have all the basic information. Now I'll analyze the location details and ask some specific questions based on the road layout.'"
+                ),
                 "progress": "Finalizing location analysis (Step 3/6)"
             }
+
 
     def _handle_location_processing(self) -> Dict[str, Any]:
         """Phase 3: Processing location data (now rarely used due to parallel processing)"""
@@ -1176,29 +1184,7 @@ def handle_send_message(event):
         else:
             orchestrator = load_orchestrator_state(connection_id)
             orchestrators[connection_id] = orchestrator
-
-        # 🧩 Handle map-processing completion trigger from Fargate
-        if "Processing complete" in user_msg:
-            logger.info("🗺️ Received 'Processing complete' message from frontend or Fargate ✅")
-
-            # Ensure orchestrator exists
-            if connection_id not in orchestrators:
-                orchestrator = TaskOrchestrator(connection_id)
-                orchestrators[connection_id] = orchestrator
-
-            # Move to ANALYTICS_PROCESSING phase
-            orchestrator.state.phase = ConversationPhase.ANALYTICS_PROCESSING
-            logger.info(f"🧠 Phase updated → ANALYTICS_PROCESSING for {connection_id}")
-
-            # Generate next action
-            next_action = orchestrator.get_next_action("Processing complete")
-
-            # Save orchestrator state
-            save_orchestrator_state(connection_id, orchestrator)
-
-            # Execute and send back to WebSocket
-            return execute_action(connection_id, next_action, event)
-
+            
         if connection_id not in chat_histories:
             chat_histories[connection_id] = []
         
@@ -1254,10 +1240,9 @@ def handle_send_message(event):
         logger.error(f"❗ Send message error: {e}")
         return {"statusCode": 500}
 
-
-# Fix 4: Add missing handler in execute_action
+# --- Action Executors ---
 def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[str, int]:
-    """Execute actions determined by orchestrator - RESTORED missing handlers"""
+    """Execute actions determined by orchestrator"""
     try:
         apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
         action_type = action.get("action")
@@ -1274,7 +1259,6 @@ def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[st
         elif action_type == "acknowledge_location":
             return handle_acknowledge_location(connection_id, action, apig)
             
-        # ✅ RESTORED: Proper handling of trigger_analytics
         elif action_type == "trigger_analytics":
             return handle_trigger_analytics(connection_id, action, apig, event)
             
@@ -1288,7 +1272,7 @@ def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[st
             return handle_similarity_search(connection_id, action, apig)
             
         elif action_type == "finalize_case":
-            return handle_finalize_case(connection_id, action, apig)
+            return handle_finalize_case(connection_id,action, apig)
             
         else:
             logger.error(f"Unknown action type: {action_type}")
@@ -1297,6 +1281,7 @@ def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[st
     except Exception as e:
         logger.error(f"❗ Error executing action: {e}")
         return {"statusCode": 500}
+
 
 def handle_start_parallel_processing(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
     """NEW: Handle parallel processing start - trigger map analysis and ask first question"""
@@ -1333,12 +1318,11 @@ def handle_start_parallel_processing(connection_id: str, action: Dict[str, Any],
         logger.error(f"❗ Parallel processing start error: {e}")
         return {"statusCode": 500}
 
-
-# Fix 2: Add automatic transition in handle_check_map_processing
 def handle_check_map_processing(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
-    """Check if map processing is complete and proceed - RESTORED auto-transition"""
+    """NEW: Check if map processing is complete and proceed accordingly"""
     try:
-        orchestrator = orchestrators.get(connection_id)
+        # Check if map processing is done (you can implement actual checking logic here)
+        # For now, we'll assume it's ready and move to detailed analytics
         
         message = action.get("message", "Location analysis is complete! Now I'll ask some specific questions based on the road layout.")
         progress = action.get("progress", "")
@@ -1352,22 +1336,15 @@ def handle_check_map_processing(connection_id: str, action: Dict[str, Any], apig
             }).encode("utf-8")
         )
         
-        # ✅ RESTORED: Automatically trigger analytics processing
-        orchestrator.state.phase = ConversationPhase.ANALYTICS_PROCESSING
-        save_orchestrator_state(connection_id, orchestrator)
-        
-        # ✅ RESTORED: Automatically call trigger_analytics to continue flow
-        return handle_trigger_analytics(
-            connection_id,
-            {"action": "trigger_analytics", "progress": "Processing location data (Step 3/6)"},
-            apig,
-            event
-        )
+        # Move to analytics processing
+        orchestrators[connection_id].state.phase = ConversationPhase.ANALYTICS_PROCESSING
+        # ✅ ADD THIS:
+        save_orchestrator_state(connection_id, orchestrators[connection_id])
+        return {"statusCode": 200}
         
     except Exception as e:
         logger.error(f"❗ Map processing check error: {e}")
         return {"statusCode": 500}
-
 
 # --- Claude Interaction ---
 #--- Prune chat history to manage token limits ---
@@ -1453,7 +1430,6 @@ def handle_acknowledge_location(connection_id: str, action: Dict[str, Any], apig
         logger.error(f"❗ Location acknowledgment error: {e}")
         return {"statusCode": 500}
 
-
 # Fix 1: Restore handle_trigger_analytics with proper phase transition
 def handle_trigger_analytics(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:
     """Trigger initial analytics processing - RESTORED phase transition"""
@@ -1500,7 +1476,6 @@ def handle_trigger_analytics(connection_id: str, action: Dict[str, Any], apig, e
     except Exception as e:
         logger.error(f"❗ Analytics trigger error: {e}")
         return {"statusCode": 500}
-
 
 
 def handle_start_detailed_analytics(connection_id: str, action: Dict[str, Any], apig, event) -> Dict[str, int]:

@@ -24,8 +24,32 @@ Parameters:
     Default: "latest"
     Description: ECR image tag for deployments
 
+  ##Add for Hot Standby
+  EnableHotStandby:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable hot standby containers
+    
+  FieldGeneratorHotStandbyCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 10
+    Description: Number of field generator containers to keep warm
+    
+  SvgAnimationHotStandbyCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 5
+    Description: Number of SVG animation containers to keep warm
+  ##Add for Hot Standby
+
+Conditions:
+  CreateHotStandby: !Equals [!Ref EnableHotStandby, "true"]
+
 Resources:
-  # Warmup for SVG Animation Generator
   ProcessRoadmapFunction:
     Type: AWS::Serverless::Function
     Description: Lambda function to process the roadmap
@@ -40,12 +64,29 @@ Resources:
         - AmazonECS_FullAccess
         - AmazonS3ReadOnlyAccess
         - AWSLambdaBasicExecutionRole
+        - Statement:  # NEW: Additional permissions for services
+          - Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:UpdateService
+            Resource: 
+              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${FargateCluster}/*"
+          - Effect: Allow
+            Action:
+              - s3:PutObject  # For work queue
+            Resource:
+              - !Sub "arn:aws:s3:::${FieldGenOutputBucket}/*"
       Environment:
         Variables:
           CLUSTER_NAME: !Ref FargateCluster
           TASK_DEF: !Ref FargateTaskDefinition
           SUBNET_ID: !Ref SubnetId
           SECURITY_GROUP: !Ref FargateSecurityGroup
+          FIELD_SERVICE_NAME: !If   # NEW
+            - CreateHotStandby
+            - !Ref FieldGeneratorService
+            - ""
+          FIELD_OUTPUT_BUCKET: !Ref FieldGenOutputBucket  # NEW
     DependsOn:
       - FargateTaskDefinition
 
@@ -74,6 +115,8 @@ Resources:
               Value: !Ref FieldGenOutputBucket
             - Name: CONNECTION_ID
               Value: "will-be-overridden-at-runtime"
+            - Name: RUN_MODE  # NEW
+              Value: !If [CreateHotStandby, "SERVICE", "TASK"]
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -173,6 +216,8 @@ Resources:
               Value: !Ref FieldGenOutputBucket
             - Name: CONNECTION_ID
               Value: "will-be-overridden-at-runtime"
+            - Name: RUN_MODE  # NEW
+              Value: !If [CreateHotStandby, "SERVICE", "TASK"]
             - Name: DEPLOY_TIME                  # ★ forces CFN to see a change every deploy
               Value: !Ref DeployTime  
           LogConfiguration:
@@ -181,6 +226,122 @@ Resources:
               awslogs-group: !Ref SvgLogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: svg-fargate
+
+  # Add the following resources for Hot Standby setup
+  # ECS Services for hot standby
+  FieldGeneratorService:
+    Type: AWS::ECS::Service
+    Condition: CreateHotStandby
+    Properties:
+      Cluster: !Ref FargateCluster
+      TaskDefinition: !Ref FargateTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref FieldGeneratorHotStandbyCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetId
+          SecurityGroups:
+            - !Ref FargateSecurityGroup
+          AssignPublicIp: ENABLED
+      ServiceName: !Sub "${AWS::StackName}-field-generator-service"
+      EnableExecuteCommand: true
+
+  SvgAnimationService:
+    Type: AWS::ECS::Service
+    Condition: CreateHotStandby
+    Properties:
+      Cluster: !Ref FargateCluster
+      TaskDefinition: !Ref SvgAnimationTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref SvgAnimationHotStandbyCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetId
+          SecurityGroups:
+            - !Ref FargateSecurityGroup
+          AssignPublicIp: ENABLED
+      ServiceName: !Sub "${AWS::StackName}-svg-animation-service"
+      EnableExecuteCommand: true
+
+  # Auto Scaling Target for Field Generator
+  FieldGeneratorScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: CreateHotStandby
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub "service/${FargateCluster}/${FieldGeneratorService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref FieldGeneratorHotStandbyCount
+      MaxCapacity: 10
+      RoleARN: !GetAtt ApplicationAutoScalingECSRole.Arn
+    DependsOn: FieldGeneratorService
+
+  # Auto Scaling Target for SVG Animation
+  SvgAnimationScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: CreateHotStandby
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub "service/${FargateCluster}/${SvgAnimationService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref SvgAnimationHotStandbyCount
+      MaxCapacity: 5
+      RoleARN: !GetAtt ApplicationAutoScalingECSRole.Arn
+    DependsOn: SvgAnimationService
+
+  # CPU-based scaling for Field Generator
+  FieldGeneratorScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: CreateHotStandby
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-field-generator-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ServiceNamespace: ecs
+      ResourceId: !Sub "service/${FargateCluster}/${FieldGeneratorService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+    DependsOn: FieldGeneratorScalableTarget
+
+  # CPU-based scaling for SVG Animation
+  SvgAnimationScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: CreateHotStandby
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-svg-animation-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ServiceNamespace: ecs
+      ResourceId: !Sub "service/${FargateCluster}/${SvgAnimationService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+    DependsOn: SvgAnimationScalableTarget
+
+  # IAM Role for Application Auto Scaling
+  ApplicationAutoScalingECSRole:
+    Type: AWS::IAM::Role
+    Condition: CreateHotStandby
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+  
 
   # New log group for SVG container
   SvgLogGroup:
@@ -641,6 +802,14 @@ Resources:
           SVG_TASK_DEF: "svg-animation-generator"
           SUBNET_ID: !Ref SubnetId                             # Add this
           SECURITY_GROUP: !Ref FargateSecurityGroup            # Add this
+          SVG_SERVICE_NAME: !If 
+            - CreateHotStandby
+            - !Ref SvgAnimationService
+            - ""
+          FIELD_SERVICE_NAME: !If 
+            - CreateHotStandby  
+            - !Ref FieldGeneratorService
+            - ""
       Policies:
         - AWSLambdaBasicExecutionRole
         - Statement:
@@ -671,10 +840,13 @@ Resources:
               # - !Sub "arn:aws:bedrock:\${AWS::Region}:\${AWS::AccountId}:inference-profile/*"
           - Effect: Allow
             Action:
+              - ecs:DescribeServices  # NEW
+              - ecs:UpdateService     # NEW
               - ecs:RunTask
               - ecs:DescribeTasks
               - ecs:DescribeTaskDefinition        # (optional for debug)
             Resource: 
+              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${FargateCluster}/*"  # NEW
               - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/svg-animation-generator:*"
               - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${FargateCluster}/*"
           - Effect: Allow
@@ -813,3 +985,24 @@ Outputs:
     Value: !Ref FieldGenOutputBucket
     Export:
       Name: !Sub "${AWS::StackName}-FieldGenOutputBucket"
+
+  # Outputs for Hot Standby ECS Services
+  FieldGeneratorServiceName:
+    Condition: CreateHotStandby
+    Description: ECS Service name for Field Generator
+    Value: !Ref FieldGeneratorService
+    Export:
+      Name: !Sub "${AWS::StackName}-FieldGeneratorService"
+  
+  # New output for SVG Animation ECS Service
+  SvgAnimationServiceName:
+    Condition: CreateHotStandby
+    Description: ECS Service name for SVG Animation
+    Value: !Ref SvgAnimationService
+    Export:
+      Name: !Sub "${AWS::StackName}-SvgAnimationService"
+
+  # New output to indicate if Hot Standby is enabled
+  HotStandbyEnabled:
+    Description: Whether hot standby is enabled
+    Value: !Ref EnableHotStandby

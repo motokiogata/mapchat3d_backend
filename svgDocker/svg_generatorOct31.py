@@ -1,4 +1,4 @@
-#svg_generator.py of svgDocker is like this now.
+#svg_generator.py
 import json
 import boto3
 import os
@@ -14,25 +14,6 @@ import sys
 import math
 from typing import Optional, Union
 import random
-
-
-# ADD these imports to your existing imports section
-import time
-import signal
-
-# ADD these global variables after your existing logger setup
-shutdown_requested = False
-
-def signal_handler(sig, frame):
-    """Handle shutdown signals gracefully"""
-    global shutdown_requested
-    logger.info('📡 Shutdown signal received, finishing current work...')
-    shutdown_requested = True
-
-# Register signal handlers
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
-
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
@@ -998,130 +979,13 @@ class EnhancedSVGAnimationGenerator:
             'collision_type': 'intersection_collision'
         }
 
-# ✅ NEW: Service/Task mode functions (ADD these before the main block)
 
-def check_for_work(bucket_name):
-    """Check S3 for pending SVG generation work"""
-    try:
-        response = s3.list_objects_v2(
-            Bucket=bucket_name,
-            Prefix='work-queue/svg_generation/',
-            MaxKeys=3  # Process up to 3 SVG jobs at once
-        )
-        
-        work_items = []
-        for obj in response.get('Contents', []):
-            if obj['Key'].endswith('.json'):
-                try:
-                    # Get the work item
-                    work_response = s3.get_object(Bucket=bucket_name, Key=obj['Key'])
-                    work_data = json.loads(work_response['Body'].read())
-                    work_data['s3_key'] = obj['Key']
-                    work_items.append(work_data)
-                except Exception as e:
-                    logger.error(f"❗ Error reading work item {obj['Key']}: {e}")
-        
-        if work_items:
-            logger.info(f"📋 Found {len(work_items)} SVG work items")
-        
-        return work_items
-        
-    except Exception as e:
-        logger.error(f"❗ Error checking for work: {e}")
-        return []
-
-def process_work_item(work_item, bucket_name):
-    """Process a single SVG work item"""
-    try:
-        connection_id = work_item.get('connection_id')
-        work_data = work_item.get('work_data', {})
-        
-        logger.info(f"🎯 Processing SVG work: {connection_id}")
-        
-        # Extract work parameters
-        mode = work_data.get('mode', 'CLEAN_ANALYTICS')
-        llm_data_key = work_data.get('llm_data_key')
-        route_json = work_data.get('route_json')
-        
-        # Set environment variables for the generation process
-        os.environ['CONNECTION_ID'] = connection_id
-        os.environ['MODE'] = mode
-        if llm_data_key:
-            os.environ['LLM_DATA_KEY'] = llm_data_key
-        
-        # Call your existing SVG generation logic
-        process_svg_generation_task(connection_id, bucket_name, mode, route_json)
-        
-        # Mark as complete by deleting the work item
-        s3.delete_object(Bucket=bucket_name, Key=work_item['s3_key'])
-        logger.info(f"✅ Completed SVG work: {connection_id}")
-        
-    except Exception as e:
-        logger.error(f"❗ Error processing SVG work item: {e}")
-        # Move to error location
-        try:
-            error_key = work_item['s3_key'].replace('work-queue/', 'work-errors/')
-            s3.copy_object(
-                Bucket=bucket_name,
-                CopySource={'Bucket': bucket_name, 'Key': work_item['s3_key']},
-                Key=error_key
-            )
-            s3.delete_object(Bucket=bucket_name, Key=work_item['s3_key'])
-            logger.info(f"📁 Moved failed SVG work to: {error_key}")
-        except Exception as cleanup_error:
-            logger.error(f"❗ Error moving failed work item: {cleanup_error}")
-
-def process_svg_generation_task(connection_id, bucket_name, mode, route_json=None):
-    """Your existing SVG generation logic - extracted from main block"""
-    generator = EnhancedSVGAnimationGenerator(bucket_name, connection_id)
-    svg_key = generator.generate_intelligent_animation()
-    
-    result = {
-        "statusCode": 200,
-        "svg_key": svg_key,
-        "mode": mode,
-        "connection_id": connection_id
-    }
-    
-    print(json.dumps(result, indent=2))
-    return result
-
-def run_as_service():
-    """Run as a long-lived service polling for work"""
-    bucket_name = os.environ.get("BUCKET_NAME")
-    if not bucket_name:
-        logger.error("❗ BUCKET_NAME environment variable required for service mode")
-        return
-        
-    logger.info("🔥 Starting as hot standby service...")
-    
-    while not shutdown_requested:
-        try:
-            work_items = check_for_work(bucket_name)
-            
-            if work_items:
-                for work_item in work_items:
-                    if shutdown_requested:
-                        logger.info("🛑 Shutdown requested, stopping work processing")
-                        break
-                    process_work_item(work_item, bucket_name)
-            else:
-                logger.info("💤 No work found, sleeping...")
-                time.sleep(30)  # Check every 30 seconds
-                
-        except Exception as e:
-            logger.error(f"❗ Error in service loop: {e}")
-            time.sleep(60)  # Wait longer on error
-    
-    logger.info("✅ Service shutdown complete")
-
-def run_as_task():
-    """Original one-shot task behavior - EXACT COPY of your existing main block"""
+# 🚀 MAIN PROCESS
+if __name__ == "__main__":
     logger.info("🧾 Runtime marker | td_rev+image should match deploy | MODE=%s", os.getenv("MODE", ""))
     # 🚨 FORCE LOG TO PROVE NEW CODE IS RUNNING
     logger.info("🔥 NEW CODE VERSION 2.0 - CLEAN ANALYTICS STARTING!")
     logger.info("🔥 This message proves the updated code is deployed!")
-    
     try:
         bucket_name = _get_env("BUCKET_NAME")
         connection_id = _get_env("CONNECTION_ID")
@@ -1132,24 +996,19 @@ def run_as_task():
         logger.info(f"🔗 Connection: {connection_id}")
         logger.info(f"🎯 Mode: {mode}")
         
-        # Call your existing logic
-        process_svg_generation_task(connection_id, bucket_name, mode)
+        generator = EnhancedSVGAnimationGenerator(bucket_name, connection_id)
+        svg_key = generator.generate_intelligent_animation()
+        
+        result = {
+            "statusCode": 200,
+            "svg_key": svg_key,
+            "mode": mode,
+            "connection_id": connection_id
+        }
+        
+        print(json.dumps(result, indent=2))
         
     except Exception as e:
         logger.error(f"❗ Main process failed: {e}")
         print(json.dumps({"statusCode": 500, "error": str(e)}, indent=2))
         sys.exit(1)
-
-def main():
-    """NEW: Main entry point with service/task mode support"""
-    run_mode = os.environ.get('RUN_MODE', 'TASK')
-    logger.info(f"🚀 Starting SVG generator in {run_mode} mode")
-    
-    if run_mode == 'SERVICE':
-        run_as_service()
-    else:
-        run_as_task()
-
-# ✅ REPLACE ONLY THIS BLOCK - keep everything else exactly the same
-if __name__ == "__main__":
-    main()
