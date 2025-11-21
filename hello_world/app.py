@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from decimal import Decimal
 import time
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 LANG_CODES = {"EN","JA","ES","KO","ZH"}
@@ -444,9 +444,9 @@ class TaskOrchestrator:
             ),
             # ✅ Your working instruction (as you wrote it)
             "instruction": (
-                "あなたは東京海上日動で働いているマリコです。あなたはマルチリンガルで、"
-                "日本語、英語、韓国語、中国語が話せます。まずはすべての言葉であいさつをしながら、"
-                "どの言語を選ぶかお客様に聞いてください。"
+                "あなたは東京海上日動で働いているマリコです。あなたはマルチリンガルで、日本語、英語、韓国語、中国語が話せます。"
+                "すべての言葉であいさつをしながら、各言語の挨拶では、自己紹介と言語選択の質問を含めてどの言語を選ぶかお客様に聞いてください。"
+                "各言語は分けて、まとまりよく話してください。"
             ),
             "progress": "Language selection"
         }
@@ -1164,55 +1164,48 @@ def validate_datetime_specificity(user_input: str) -> Dict[str, Any]:
 # In-memory chat histories for context management
 # Key: connection_id, Value: list of messages
 def handle_send_message(event):
-    """FIXED: Handle messages with proper chat history management"""
+    """Handle incoming messages with safe concurrency (queue system events if user input pending)"""
     try:
         connection_id = event["requestContext"]["connectionId"]
         body = json.loads(event.get("body", "{}"))
         user_msg = body.get("message", "")
-        
-        # Load orchestrator
+
+        # -------------------------------
+        # 1️⃣ Load orchestrator
+        # -------------------------------
         if connection_id in orchestrators:
             orchestrator = orchestrators[connection_id]
         else:
             orchestrator = load_orchestrator_state(connection_id)
             orchestrators[connection_id] = orchestrator
 
-        # 🧩 Handle map-processing completion trigger from Fargate
-        if "Processing complete" in user_msg:
+        # -------------------------------
+        # 2️⃣ Handle system event: "Processing complete"
+        # -------------------------------
+        if "Processing complete" in (user_msg or ""):
             logger.info("🗺️ Received 'Processing complete' message from frontend or Fargate ✅")
 
-            # Ensure orchestrator exists
-            if connection_id not in orchestrators:
-                orchestrator = TaskOrchestrator(connection_id)
-                orchestrators[connection_id] = orchestrator
+            # If we're waiting for user, queue this event instead of running immediately
+            if getattr(orchestrator.state, "waiting_for_user", False):
+                logger.info("🕓 Queuing 'Processing complete' because we're waiting for user input")
+                if "Processing complete" not in orchestrator.state.queued_system_events:
+                    orchestrator.state.queued_system_events.append("Processing complete")
+                save_orchestrator_state(connection_id, orchestrator)
+                return {"statusCode": 200}
 
-            # Move to ANALYTICS_PROCESSING phase
+            # Otherwise, safe to proceed → start analytics
             orchestrator.state.phase = ConversationPhase.ANALYTICS_PROCESSING
             logger.info(f"🧠 Phase updated → ANALYTICS_PROCESSING for {connection_id}")
 
-            # Generate next action
             next_action = orchestrator.get_next_action("Processing complete")
-
-            # Save orchestrator state
             save_orchestrator_state(connection_id, orchestrator)
-
-            # Execute and send back to WebSocket
             return execute_action(connection_id, next_action, event)
 
-        if connection_id not in chat_histories:
-            chat_histories[connection_id] = []
-        
-        logger.info(f"🧠 Current Phase: {orchestrator.state.phase}")
-        logger.info(f"👤 User said (RAW): '{user_msg}'")
-        
-        # ✅ Handle COMPLETED phase gracefully
+        # -------------------------------
+        # 3️⃣ Handle completed conversation
+        # -------------------------------
         if orchestrator.state.phase == ConversationPhase.COMPLETED:
-            logger.info("✅ Conversation already completed, ignoring message")
-            
-            if "animation" in user_msg.lower() and "complete" in user_msg.lower():
-                logger.info("📊 Animation completion notification received")
-                return {"statusCode": 200}
-            
+            logger.info("✅ Conversation already completed, ignoring further input")
             apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])
             apig.post_to_connection(
                 ConnectionId=connection_id,
@@ -1223,40 +1216,68 @@ def handle_send_message(event):
                 }).encode("utf-8")
             )
             return {"statusCode": 200}
-        
-        # ✅ Process normal messages
+
+        # -------------------------------
+        # 4️⃣ Normal user messages
+        # -------------------------------
         processed_input = user_msg
-        
+
         if user_msg and user_msg.strip():
+            # 🔹 The user just sent a message → clear waiting flag
+            orchestrator.state.waiting_for_user = False
+
             understanding = understand_user_response_by_phase(user_msg, orchestrator.state, connection_id)
             logger.info(f"🧠 Understanding result: {understanding}")
-            
-            # Add user message to history (pruning will happen in handle_claude_response)
-            chat_histories[connection_id].append({"role": "user", "content": user_msg})            
-            
+
+            # Add user message to history
+            if connection_id not in chat_histories:
+                chat_histories[connection_id] = []
+            chat_histories[connection_id].append({"role": "user", "content": user_msg})
+
             if understanding.get("understood") and understanding.get("selected_text"):
-                processed_input = understanding["selected_text"] 
+                processed_input = understanding["selected_text"]
                 logger.info(f"✅ Using understood selection: '{processed_input}'")
             else:
                 processed_input = user_msg
                 logger.info(f"✅ Using raw input: '{processed_input}'")
-        
-        # Get next action
+
+        # -------------------------------
+        # 5️⃣ Generate and execute next action
+        # -------------------------------
         action = orchestrator.get_next_action(processed_input)
-        
-        if action.get("action") == "interactive_investigation":
-            action["processed_input"] = processed_input
-            
         save_orchestrator_state(connection_id, orchestrator)
-        return execute_action(connection_id, action, event)
-        
+        response = execute_action(connection_id, action, event)
+
+        # -------------------------------
+        # 6️⃣ Process queued system events (if any)
+        # -------------------------------
+        if orchestrator.state.queued_system_events:
+            next_event = orchestrator.state.queued_system_events.pop(0)
+            logger.info(f"🚀 Processing queued system event after user reply: {next_event}")
+
+            fake_event = dict(event)
+            fake_event["body"] = json.dumps({"message": next_event})
+            handle_send_message(fake_event)
+
+        return response
+
     except Exception as e:
-        logger.error(f"❗ Send message error: {e}")
+        logger.error(f"❗ Send message error: {e}", exc_info=True)
         return {"statusCode": 500}
 
 
 # Fix 4: Add missing handler in execute_action
 def execute_action(connection_id: str, action: Dict[str, Any], event) -> Dict[str, int]:
+
+    # get orchestrator to update its state
+    orchestrator = orchestrators.get(connection_id)
+
+    # if this action is asking the user something, set waiting flag here
+    if action.get("action") == "claude_response":
+        if orchestrator:
+            orchestrator.state.waiting_for_user = True
+            save_orchestrator_state(connection_id, orchestrator)
+
     """Execute actions determined by orchestrator - RESTORED missing handlers"""
     try:
         apig = get_apig_client(event["requestContext"]["domainName"], event["requestContext"]["stage"])

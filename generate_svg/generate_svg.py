@@ -131,7 +131,7 @@ def create_narrow_processing_maps(lat, lng, conn_id, api_key, s3_client, bucket_
     
     # Narrow map parameters - optimized for processing
     zoom = 20  # High zoom for minimal fonts and detailed view
-    size = "640x640"  # Optimal size for processing
+    size = "400x400"  # Optimal size for processing
     scale = 2
     
     # Get roads-only style parameters
